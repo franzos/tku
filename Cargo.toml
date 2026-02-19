@@ -3,6 +3,7 @@ name = "tku"
 version = "0.1.1"
 edition = "2021"
 authors = ["Franz Geffke <mail@gofranz.com>"]
+license = "GPL-3.0-only"
 
 [features]
 default = []
