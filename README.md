@@ -29,6 +29,13 @@ curl -sL https://github.com/franzos/tku/releases/latest/download/tku-x86_64-unkn
 sudo mv tku /usr/local/bin/
 ```
 
+**Homebrew:**
+
+```bash
+brew tap franzos/tap
+brew install tku
+```
+
 **From source:**
 
 ```bash
