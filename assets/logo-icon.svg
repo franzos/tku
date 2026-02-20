@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none">
+  <defs>
+    <linearGradient id="bar1" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#6ee7b7"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+    <linearGradient id="bar2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#93c5fd"/>
+      <stop offset="100%" stop-color="#60a5fa"/>
+    </linearGradient>
+    <linearGradient id="bar3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#c4b5fd"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="bar4" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fbbf24"/>
+      <stop offset="100%" stop-color="#f59e0b"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(20, 0)">
+    <rect x="12" y="62" width="14" height="36" rx="3" fill="url(#bar1)" opacity="0.9"/>
+    <rect x="32" y="38" width="14" height="60" rx="3" fill="url(#bar2)" opacity="0.9"/>
+    <rect x="52" y="50" width="14" height="48" rx="3" fill="url(#bar3)" opacity="0.9"/>
+    <rect x="72" y="24" width="14" height="74" rx="3" fill="url(#bar4)" opacity="0.9"/>
+    <text x="48" y="22" font-family="system-ui, -apple-system, sans-serif" font-size="16" font-weight="600" fill="#a78bfa" text-anchor="middle" opacity="0.7">$</text>
+  </g>
+</svg>
