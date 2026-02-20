@@ -1,7 +1,9 @@
 mod aggregate;
 mod cli;
+mod config;
 mod cost;
 mod dedup;
+mod exchange;
 mod output;
 mod pricing;
 mod providers;
@@ -10,7 +12,7 @@ mod types;
 
 use std::io::Write;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::Datelike;
 use clap::Parser;
 
@@ -40,6 +42,28 @@ fn bar_period_label(period: &cli::BarPeriod) -> &'static str {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let mode = cli.effective_command();
+    let config = config::load_config();
+
+    // Merge: CLI > config > default
+    let pricing_source = cli
+        .pricing_source
+        .clone()
+        .or(config.pricing_source)
+        .unwrap_or_default();
+
+    let currency = cli
+        .currency
+        .clone()
+        .or(config.currency)
+        .unwrap_or_else(|| "USD".to_string());
+
+    let currency = currency.to_uppercase();
+    if currency.len() != 3 || !currency.chars().all(|c| c.is_ascii_uppercase()) {
+        bail!(
+            "Invalid currency code: '{}'. Expected 3-letter ISO 4217 code (e.g. EUR, GBP).",
+            currency
+        );
+    }
 
     let is_bar = matches!(mode, cli::Command::Bar { .. });
 
@@ -113,6 +137,8 @@ fn main() -> Result<()> {
         records
     };
 
+    let exchange = exchange::load_exchange_rate(&currency, cli.offline);
+
     if let cli::Command::Bar {
         ref period,
         ref template,
@@ -121,14 +147,28 @@ fn main() -> Result<()> {
     } = mode
     {
         if records.is_empty() {
-            output::print_bar(None, template, warn, critical, bar_period_label(period));
+            output::print_bar(
+                None,
+                template,
+                warn,
+                critical,
+                bar_period_label(period),
+                &exchange,
+            );
             return Ok(());
         }
 
-        let pricing = pricing::load_pricing(cli.offline)?;
+        let pricing = pricing::load_pricing(&pricing_source, cli.offline)?;
         let buckets = aggregate::aggregate(&records, &mode, &pricing);
         let bucket = buckets.values().next();
-        output::print_bar(bucket, template, warn, critical, bar_period_label(period));
+        output::print_bar(
+            bucket,
+            template,
+            warn,
+            critical,
+            bar_period_label(period),
+            &exchange,
+        );
         return Ok(());
     }
 
@@ -139,7 +179,7 @@ fn main() -> Result<()> {
 
     eprintln!("Found {} usage records.", records.len());
 
-    let pricing = pricing::load_pricing(cli.offline)?;
+    let pricing = pricing::load_pricing(&pricing_source, cli.offline)?;
 
     let unpriced = pricing.unpriced_models(&records);
     if !unpriced.is_empty() {
@@ -151,8 +191,10 @@ fn main() -> Result<()> {
     let columns = cli::resolve_columns(cli.columns);
 
     match cli.format {
-        cli::OutputFormat::Json => output::print_json(&buckets),
-        cli::OutputFormat::Table => output::print_table(&buckets, &columns, cli.breakdown),
+        cli::OutputFormat::Json => output::print_json(&buckets, &exchange),
+        cli::OutputFormat::Table => {
+            output::print_table(&buckets, &columns, cli.breakdown, &exchange)
+        }
     }
 
     Ok(())

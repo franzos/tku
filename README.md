@@ -85,6 +85,8 @@ tku --breakdown
 | `--format table\|json` | Output format (default: table) |
 | `--columns <cols>` | Columns to display (see below) |
 | `--breakdown` | Per-model breakdown within each period |
+| `--pricing-source <source>` | Pricing source: `litellm` (default), `openrouter`, `llmprices` |
+| `--currency <CODE>` | Currency for cost display (ISO 4217, e.g. `EUR`, `GBP`) |
 | `--offline` | Use cached pricing only |
 | `--cli` | Suppress progress output (for scripting) |
 
@@ -113,15 +115,15 @@ The `bar` subcommand outputs JSON for waybar, i3bar, or polybar:
 
 ```bash
 tku bar
-# {"text":"$34.58","tooltip":"Today: $34.58\n  opus-4-6: $29.95\n  sonnet-4-5: $3.49","class":"normal"}
+# {"text":"$34.58","tooltip":"Today: $34.58\n  opus-4-6: $29.95\n  sonnet-4-5: $3.49","class":"normal","currency":"USD"}
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--period today\|week\|month` | Timeframe (default: today) |
 | `--template "{cost}"` | Format string. Placeholders: `{cost}`, `{input}`, `{output}`, `{models}`, `{projects}` |
-| `--warn <amount>` | Cost threshold for `"warning"` class |
-| `--critical <amount>` | Cost threshold for `"critical"` class |
+| `--warn <amount>` | Cost threshold for `"warning"` class (in display currency) |
+| `--critical <amount>` | Cost threshold for `"critical"` class (in display currency) |
 
 **Waybar config:**
 
@@ -165,9 +167,32 @@ Benchmarked on ~3,900 session files, ~80K usage records:
 
 Both backends perform equally well for repeated runs. Bitcode is the default because it has a faster cold start and smaller cache footprint. SQLite may be useful if you want to query the cache directly.
 
+## Configuration
+
+Optional config file at `~/.config/tku/config.toml`:
+
+```toml
+pricing_source = "litellm"  # litellm | openrouter | llmprices
+currency = "EUR"             # any ISO 4217 code
+```
+
+Both keys are optional. CLI flags (`--pricing-source`, `--currency`) override config file values.
+
 ## Pricing
 
-Model pricing is fetched from [LiteLLM](https://github.com/BerriAI/litellm) and cached for 24 hours at `~/.cache/tku/pricing.json`. Use `--offline` to skip the fetch and rely on the cached file.
+Three pricing sources are available:
+
+| Source | Description |
+|--------|-------------|
+| `litellm` | [LiteLLM](https://github.com/BerriAI/litellm) model prices (default) |
+| `openrouter` | [OpenRouter](https://openrouter.ai) API pricing |
+| `llmprices` | [LLM Prices](https://llm-prices.com) aggregated pricing |
+
+Pricing data is cached for 24 hours at `~/.cache/tku/pricing-<source>.json`. Use `--offline` to skip the fetch and rely on the cached file.
+
+## Currency
+
+Costs default to USD. Set a different currency via `--currency` or the config file. Exchange rates are fetched from the [Frankfurter API](https://frankfurter.dev) (ECB data, no auth required) and cached for 7 days. On failure, stale cache is used if available, otherwise falls back to USD.
 
 ## Providers
 

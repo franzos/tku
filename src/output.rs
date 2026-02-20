@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, ContentArrangement, Table};
 
 use crate::aggregate::short_model_name;
+use crate::exchange::ExchangeRate;
 use crate::types::AggregatedBucket;
 
 fn format_tokens(n: u64) -> String {
@@ -12,13 +13,6 @@ fn format_tokens(n: u64) -> String {
         format!("{:.1}K", n as f64 / 1_000.0)
     } else {
         n.to_string()
-    }
-}
-
-fn format_cost(cost: Option<f64>) -> String {
-    match cost {
-        Some(c) => format!("${:.2}", c),
-        None => "N/A".to_string(),
     }
 }
 
@@ -37,14 +31,14 @@ fn column_header(col: &str) -> &str {
     }
 }
 
-fn bucket_cell(col: &str, key: &str, bucket: &AggregatedBucket) -> Cell {
+fn bucket_cell(col: &str, key: &str, bucket: &AggregatedBucket, exchange: &ExchangeRate) -> Cell {
     match col {
         "period" => Cell::new(key),
         "input" => Cell::new(format_tokens(bucket.input_tokens)),
         "output" => Cell::new(format_tokens(bucket.output_tokens)),
         "cache_write" => Cell::new(format_tokens(bucket.cache_creation_input_tokens)),
         "cache_read" => Cell::new(format_tokens(bucket.cache_read_input_tokens)),
-        "cost" => Cell::new(format_cost(bucket.cost)),
+        "cost" => Cell::new(exchange.format_cost(bucket.cost)),
         "models" => Cell::new(bucket.models.join(", ")),
         "tools" => Cell::new(bucket.tools.join(", ")),
         "projects" => Cell::new(bucket.projects.join(", ")),
@@ -52,14 +46,18 @@ fn bucket_cell(col: &str, key: &str, bucket: &AggregatedBucket) -> Cell {
     }
 }
 
-fn detail_cell(col: &str, detail: &crate::types::ModelBucketDetail) -> Cell {
+fn detail_cell(
+    col: &str,
+    detail: &crate::types::ModelBucketDetail,
+    exchange: &ExchangeRate,
+) -> Cell {
     match col {
         "period" => Cell::new(format!("  {}", detail.model)),
         "input" => Cell::new(format_tokens(detail.input_tokens)),
         "output" => Cell::new(format_tokens(detail.output_tokens)),
         "cache_write" => Cell::new(format_tokens(detail.cache_creation_input_tokens)),
         "cache_read" => Cell::new(format_tokens(detail.cache_read_input_tokens)),
-        "cost" => Cell::new(format_cost(detail.cost)),
+        "cost" => Cell::new(exchange.format_cost(detail.cost)),
         _ => Cell::new(""),
     }
 }
@@ -68,6 +66,7 @@ pub fn print_table(
     buckets: &BTreeMap<String, AggregatedBucket>,
     columns: &[String],
     breakdown: bool,
+    exchange: &ExchangeRate,
 ) {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
@@ -78,18 +77,26 @@ pub fn print_table(
     let mut totals = AggregatedBucket::default();
 
     for (key, bucket) in buckets {
-        table.add_row(columns.iter().map(|c| bucket_cell(c, key, bucket)));
+        table.add_row(
+            columns
+                .iter()
+                .map(|c| bucket_cell(c, key, bucket, exchange)),
+        );
 
         if breakdown {
             for detail in &bucket.details {
-                table.add_row(columns.iter().map(|c| detail_cell(c, detail)));
+                table.add_row(columns.iter().map(|c| detail_cell(c, detail, exchange)));
             }
         }
 
         totals.accumulate_from(bucket);
     }
 
-    table.add_row(columns.iter().map(|c| bucket_cell(c, "TOTAL", &totals)));
+    table.add_row(
+        columns
+            .iter()
+            .map(|c| bucket_cell(c, "TOTAL", &totals, exchange)),
+    );
 
     println!("{table}");
 }
@@ -100,14 +107,26 @@ pub fn print_bar(
     warn: Option<f64>,
     critical: Option<f64>,
     period_label: &str,
+    exchange: &ExchangeRate,
 ) {
     let Some(bucket) = bucket else {
-        println!(r#"{{"text":"$0.00","tooltip":"No usage","class":"normal"}}"#);
+        let zero = exchange.format_cost(Some(0.0));
+        let output = serde_json::json!({
+            "text": zero,
+            "tooltip": "No usage",
+            "class": "normal",
+            "currency": exchange.code,
+        });
+        println!(
+            "{}",
+            serde_json::to_string(&output).expect("JSON serialization failed")
+        );
         return;
     };
 
     let cost = bucket.cost.unwrap_or(0.0);
-    let cost_str = format!("${:.2}", cost);
+    let converted_cost = exchange.convert(cost);
+    let cost_str = exchange.format_cost(Some(cost));
 
     let text = template
         .replace("{cost}", &cost_str)
@@ -118,7 +137,7 @@ pub fn print_bar(
 
     let mut tooltip = format!("{}: {}", period_label, cost_str);
     for detail in &bucket.details {
-        let detail_cost = format_cost(detail.cost);
+        let detail_cost = exchange.format_cost(detail.cost);
         tooltip.push_str(&format!(
             "\n  {}: {}",
             short_model_name(&detail.model),
@@ -126,9 +145,9 @@ pub fn print_bar(
         ));
     }
 
-    let class = if critical.is_some_and(|t| cost >= t) {
+    let class = if critical.is_some_and(|t| converted_cost >= t) {
         "critical"
-    } else if warn.is_some_and(|t| cost >= t) {
+    } else if warn.is_some_and(|t| converted_cost >= t) {
         "warning"
     } else {
         "normal"
@@ -138,6 +157,7 @@ pub fn print_bar(
         "text": text,
         "tooltip": tooltip,
         "class": class,
+        "currency": exchange.code,
     });
     println!(
         "{}",
@@ -145,7 +165,7 @@ pub fn print_bar(
     );
 }
 
-pub fn print_json(buckets: &BTreeMap<String, AggregatedBucket>) {
+pub fn print_json(buckets: &BTreeMap<String, AggregatedBucket>, exchange: &ExchangeRate) {
     let json: BTreeMap<&str, serde_json::Value> = buckets
         .iter()
         .map(|(key, bucket)| {
@@ -159,7 +179,7 @@ pub fn print_json(buckets: &BTreeMap<String, AggregatedBucket>) {
                         "output_tokens": d.output_tokens,
                         "cache_creation_input_tokens": d.cache_creation_input_tokens,
                         "cache_read_input_tokens": d.cache_read_input_tokens,
-                        "cost": d.cost,
+                        "cost": d.cost.map(|c| exchange.convert(c)),
                     })
                 })
                 .collect();
@@ -167,11 +187,12 @@ pub fn print_json(buckets: &BTreeMap<String, AggregatedBucket>) {
             (
                 key.as_str(),
                 serde_json::json!({
+                    "currency": exchange.code,
                     "input_tokens": bucket.input_tokens,
                     "output_tokens": bucket.output_tokens,
                     "cache_creation_input_tokens": bucket.cache_creation_input_tokens,
                     "cache_read_input_tokens": bucket.cache_read_input_tokens,
-                    "cost": bucket.cost,
+                    "cost": bucket.cost.map(|c| exchange.convert(c)),
                     "models": bucket.models,
                     "projects": bucket.projects,
                     "details": details,

@@ -1,6 +1,8 @@
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand, ValueEnum};
 
+use crate::pricing::PricingSource;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "tku",
@@ -43,6 +45,14 @@ pub struct Cli {
     /// Available: period,input,output,cache_write,cache_read,cost,models,tools,projects
     #[arg(long, global = true, value_delimiter = ',', allow_hyphen_values = true)]
     pub columns: Option<Vec<String>>,
+
+    /// Pricing source: litellm, openrouter, llmprices
+    #[arg(long, global = true)]
+    pub pricing_source: Option<PricingSource>,
+
+    /// Currency code (ISO 4217) for cost display, e.g. EUR, GBP
+    #[arg(long, global = true)]
+    pub currency: Option<String>,
 
     /// Suppress progress output (for scripting)
     #[arg(long, global = true)]
