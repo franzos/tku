@@ -45,8 +45,49 @@ jobs:
             tku-${{ matrix.target }}.tar.gz
             tku-${{ matrix.target }}.tar.gz.sha256
 
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build deb package
+        run: cargo deb
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tku-deb
+          path: target/debian/*.deb
+
+  rpm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Build rpm package
+        run: cargo generate-rpm
+
+      - name: Upload rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tku-rpm
+          path: target/generate-rpm/*.rpm
+
   release:
-    needs: [build]
+    needs: [build, deb, rpm]
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
@@ -62,3 +103,5 @@ jobs:
           files: |
             tku-*.tar.gz
             tku-*.tar.gz.sha256
+            *.deb
+            *.rpm

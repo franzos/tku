@@ -1,9 +1,21 @@
 [package]
 name = "tku"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["Franz Geffke <mail@gofranz.com>"]
 license = "GPL-3.0-only"
+
+[package.metadata.deb]
+maintainer = "Franz Geffke <mail@gofranz.com>"
+section = "utils"
+assets = [
+    ["target/release/tku", "usr/bin/", "755"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/tku", dest = "/usr/bin/tku", mode = "755" },
+]
 
 [features]
 default = []

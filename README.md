@@ -11,37 +11,15 @@ Token usage tracking for Claude Code, Codex and others.
 
 ## Install
 
-**Pre-built binaries:**
+| Method | Command |
+|--------|---------|
+| Homebrew | `brew tap franzos/tap && brew install tku` |
+| Debian/Ubuntu | Download [`.deb`](https://github.com/franzos/tku/releases) — `sudo dpkg -i tku_*_amd64.deb` |
+| Fedora/RHEL | Download [`.rpm`](https://github.com/franzos/tku/releases) — `sudo rpm -i tku-*.x86_64.rpm` |
+| Guix | `guix install -L <panther> tku` ([Panther channel](https://github.com/franzos/panther)) |
+| Cargo | `cargo build --release` |
 
-Download the latest release from [GitHub Releases](https://github.com/franzos/tku/releases) and extract the binary to a directory in your `PATH`:
-
-```bash
-# macOS (Apple Silicon)
-curl -sL https://github.com/franzos/tku/releases/latest/download/tku-aarch64-apple-darwin.tar.gz | tar xz
-sudo mv tku /usr/local/bin/
-
-# macOS (Intel)
-curl -sL https://github.com/franzos/tku/releases/latest/download/tku-x86_64-apple-darwin.tar.gz | tar xz
-sudo mv tku /usr/local/bin/
-
-# Linux (x86_64)
-curl -sL https://github.com/franzos/tku/releases/latest/download/tku-x86_64-unknown-linux-gnu.tar.gz | tar xz
-sudo mv tku /usr/local/bin/
-```
-
-**Homebrew:**
-
-```bash
-brew tap franzos/tap
-brew install tku
-```
-
-**From source:**
-
-```bash
-cargo build --release
-cp target/release/tku ~/.local/bin/
-```
+Pre-built binaries for Linux (x86_64), macOS (Apple Silicon, Intel) on [GitHub Releases](https://github.com/franzos/tku/releases).
 
 ## Quick start
 

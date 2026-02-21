@@ -1,3 +1,8 @@
+## [0.1.3] - 2026-02-21
+
+### Added
+- CI Workflow: Output .deb (Debian,Ubuntu) & .rpm (Fedora,Centos,...) packages
+
 ## [0.1.2] - 2026-02-20
 
 ### Added
