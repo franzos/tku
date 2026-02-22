@@ -1,9 +1,10 @@
 [package]
 name = "tku"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 authors = ["Franz Geffke <mail@gofranz.com>"]
 license = "GPL-3.0-only"
+description = "Track and analyze LLM token usage across providers"
 
 [package.metadata.deb]
 maintainer = "Franz Geffke <mail@gofranz.com>"
