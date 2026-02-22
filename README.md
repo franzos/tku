@@ -48,6 +48,9 @@ tku --tool claude
 # Per-model breakdown within each day
 tku --breakdown
 
+# Bar chart of token usage (last 30 days)
+tku plot
+
 # Live-updating cost monitor (today, compact)
 tku watch
 
@@ -64,6 +67,7 @@ tku watch --full
 | `session` | Aggregate by session, grouped by project |
 | `model` | Aggregate by model |
 | `watch` | Live-updating cost monitor (default: compact single line, today only) |
+| `plot` | Inline bar chart of token usage over time |
 | `bar` | JSON output for status bars (waybar, i3bar, polybar) |
 
 ## Options
@@ -124,6 +128,40 @@ tku watch --full --breakdown --from 2026-02-01
 |------|-------------|
 | `--full` | Show full table instead of compact summary line |
 | `--interval <seconds>` | Minimum time between refreshes (default: 2) |
+
+## Plot
+
+`tku plot` renders an inline bar chart of total token usage over time, then exits. No interactive TUI — it prints the chart and returns to your prompt.
+
+<p align="center">
+  <img src="assets/plot.svg" alt="tku plot" width="720">
+</p>
+
+```bash
+# Last 30 days, daily buckets (default)
+tku plot
+
+# Last 24 hours, 30-minute buckets
+tku plot 1d
+
+# Last 7 days, 6-hour buckets
+tku plot 1w
+
+# Relative window (no clock alignment)
+tku plot 1d --relative
+
+# Combine with filters
+tku plot --project my-project
+tku plot 1w --tool claude
+```
+
+| Period | Range | Buckets | Labels |
+|--------|-------|---------|--------|
+| `1m` (default) | 30 days | 30 daily | Day number, month on 1st |
+| `1w` | 7 days | 28 x 6h | Day name at midnight |
+| `1d` | 24 hours | 48 x 30min | Hour on the hour |
+
+By default, buckets align to the local clock (e.g. `1d` at 08:00 shows 08:00 yesterday through now). Use `--relative` to ignore clock alignment and take the exact last N hours/days.
 
 ## Status bar integration
 
@@ -241,15 +279,15 @@ cargo test
 
 ## Alternatives
 
-| Tool | Language | Providers | Currency | Pricing sources | Watch/live | Status bar | JSON output |
-|------|----------|-----------|----------|-----------------|------------|------------|-------------|
-| **[tku](https://github.com/franzos/tku)** | Rust | Claude Code, Codex, Pi, Amp, OpenCode, Gemini CLI, Droid, OpenClaw, Kimi | Yes (any ISO 4217) | LiteLLM, OpenRouter, LLM Prices | Yes (file-watcher) | Yes (waybar/i3/polybar) | Yes |
-| **[ccusage](https://github.com/ryoppippi/ccusage)** | TypeScript | Claude Code, Codex, Pi, Amp, OpenCode | No | LiteLLM | No | Yes (CC statusline) | Yes |
-| **[better-ccusage](https://github.com/cobra91/better-ccusage)** | TypeScript | Claude Code + Moonshot, MiniMax, Zai, GLM | No | Bundled | Yes (`blocks --live`) | No | Yes |
-| **[toktrack](https://github.com/mag123c/toktrack)** | Rust | Claude Code, Codex, Gemini CLI, OpenCode | No | LiteLLM | No (TUI) | No | Yes |
-| **[tokscale](https://github.com/junhoyeo/tokscale)** | Rust + TS | Claude Code, Codex, Cursor, Gemini CLI, Amp, Pi, OpenCode, Kimi, OpenClaw, Droid | No | LiteLLM + OpenRouter fallback | Yes (auto-refresh) | No | Yes |
-| **[caut](https://github.com/Dicklesworthstone/coding_agent_usage_tracker)** | Rust | 16+ (Codex, Claude, Gemini, Cursor, Copilot, Kiro, ...) | No | Local JSONL + provider APIs | No | No | Yes + Markdown |
-| **[claude-monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor)** | Python | Claude Code only | No | Bundled | Yes (real-time TUI) | No | No |
+| Tool | Language | Providers | Currency | Pricing sources | Watch/live | Plot | Status bar | JSON output |
+|------|----------|-----------|----------|-----------------|------------|------|------------|-------------|
+| **[tku](https://github.com/franzos/tku)** | Rust | Claude Code, Codex, Pi, Amp, OpenCode, Gemini CLI, Droid, OpenClaw, Kimi | Yes (any ISO 4217) | LiteLLM, OpenRouter, LLM Prices | Yes (file-watcher) | Yes | Yes (waybar/i3/polybar) | Yes |
+| **[ccusage](https://github.com/ryoppippi/ccusage)** | TypeScript | Claude Code, Codex, Pi, Amp, OpenCode | No | LiteLLM | No | No | Yes (CC statusline) | Yes |
+| **[better-ccusage](https://github.com/cobra91/better-ccusage)** | TypeScript | Claude Code + Moonshot, MiniMax, Zai, GLM | No | Bundled | Yes (`blocks --live`) | No | No | Yes |
+| **[toktrack](https://github.com/mag123c/toktrack)** | Rust | Claude Code, Codex, Gemini CLI, OpenCode | No | LiteLLM | No (TUI) | No | No | Yes |
+| **[tokscale](https://github.com/junhoyeo/tokscale)** | Rust + TS | Claude Code, Codex, Cursor, Gemini CLI, Amp, Pi, OpenCode, Kimi, OpenClaw, Droid | No | LiteLLM + OpenRouter fallback | Yes (auto-refresh) | No | No | Yes |
+| **[caut](https://github.com/Dicklesworthstone/coding_agent_usage_tracker)** | Rust | 16+ (Codex, Claude, Gemini, Cursor, Copilot, Kiro, ...) | No | Local JSONL + provider APIs | No | No | No | Yes + Markdown |
+| **[claude-monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor)** | Python | Claude Code only | No | Bundled | Yes (real-time TUI) | No | No | No |
 
 ## Acknowledgements
 

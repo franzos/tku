@@ -32,6 +32,7 @@ pub fn bucket_key(record: &UsageRecord, mode: &Command) -> String {
         Command::Model => record.model.clone(),
         Command::Watch { .. } => "watch".to_string(),
         Command::Bar { .. } => "bar".to_string(),
+        Command::Plot { .. } => "plot".to_string(),
     }
 }
 

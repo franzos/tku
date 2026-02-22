@@ -117,6 +117,15 @@ pub enum Command {
         #[arg(long, default_value = "2")]
         interval: u64,
     },
+    /// Show a bar chart of token usage over time
+    Plot {
+        /// Period: 1d, 1w, 1m (default: 1m)
+        #[arg(default_value = "1m")]
+        period: GraphPeriod,
+        /// Use relative time window (last N hours/days from now)
+        #[arg(long)]
+        relative: bool,
+    },
     /// Output JSON for status bars (waybar, i3bar, polybar)
     Bar {
         /// Timeframe to summarize
@@ -138,6 +147,20 @@ pub enum Command {
 pub enum BarPeriod {
     Today,
     Week,
+    Month,
+}
+
+#[derive(ValueEnum, Debug, Clone, PartialEq)]
+#[value(rename_all = "verbatim")]
+pub enum GraphPeriod {
+    /// Last 24 hours (30-min buckets)
+    #[value(name = "1d")]
+    Day,
+    /// Last 7 days (6-hour buckets)
+    #[value(name = "1w")]
+    Week,
+    /// Last 30 days (1-day buckets)
+    #[value(name = "1m")]
     Month,
 }
 

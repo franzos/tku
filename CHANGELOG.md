@@ -1,6 +1,7 @@
 ## [0.1.4] - 2026-02-22
 
 ### Added
+- `tku plot` — inline bar chart of token usage over time (1d/1w/1m periods)
 - `tku watch` — live-updating cost monitor with file watcher (inotify/FSEvents/kqueue)
 - Gemini CLI provider (`~/.gemini/tmp/*/chats/`)
 - Droid (Factory) provider (`~/.factory/sessions/`)

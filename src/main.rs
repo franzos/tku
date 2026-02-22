@@ -4,6 +4,7 @@ mod config;
 mod cost;
 mod dedup;
 mod exchange;
+mod graph;
 mod output;
 mod pricing;
 mod providers;
@@ -68,8 +69,17 @@ fn main() -> Result<()> {
 
     let is_bar = matches!(mode, cli::Command::Bar { .. });
     let is_watch = matches!(mode, cli::Command::Watch { .. });
+    let is_plot = matches!(mode, cli::Command::Plot { .. });
 
-    let date_range = if let cli::Command::Bar { ref period, .. } = mode {
+    let date_range = if let cli::Command::Plot { ref period, .. } = mode {
+        let today = chrono::Local::now().date_naive();
+        let days_back = match period {
+            cli::GraphPeriod::Day => 1,
+            cli::GraphPeriod::Week => 7,
+            cli::GraphPeriod::Month => 30,
+        };
+        Some((today - chrono::Duration::days(days_back), today))
+    } else if let cli::Command::Bar { ref period, .. } = mode {
         Some(bar_date_range(period))
     } else if is_watch && cli.from.is_none() && cli.to.is_none() {
         let today = chrono::Local::now().date_naive();
@@ -89,7 +99,7 @@ fn main() -> Result<()> {
 
     let mut store = storage::default_storage();
 
-    let show_progress = !cli.cli && !is_bar;
+    let show_progress = !cli.cli && !is_bar && !is_plot;
     let progress_cb = |current: usize, total: usize| {
         eprint!("\x1b[2K\rScanning sessions... {current}/{total}");
         let _ = std::io::stderr().flush();
@@ -145,6 +155,14 @@ fn main() -> Result<()> {
     } else {
         records
     };
+
+    if let cli::Command::Plot {
+        ref period,
+        relative,
+    } = mode
+    {
+        return graph::render(&records, period, relative);
+    }
 
     let exchange = exchange::load_exchange_rate(&currency, cli.offline);
 

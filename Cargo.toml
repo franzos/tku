@@ -1,6 +1,6 @@
 [package]
 name = "tku"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["Franz Geffke <mail@gofranz.com>"]
 license = "GPL-3.0-only"
@@ -35,4 +35,6 @@ rayon = "1"
 toml = "0.8"
 notify = "7"
 ureq = { version = "3", features = ["rustls"] }
+ratatui = "0.29"
+crossterm = "0.28"
 walkdir = "2"
