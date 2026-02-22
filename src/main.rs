@@ -9,6 +9,7 @@ mod pricing;
 mod providers;
 mod storage;
 mod types;
+mod watch;
 
 use std::io::Write;
 
@@ -66,9 +67,13 @@ fn main() -> Result<()> {
     }
 
     let is_bar = matches!(mode, cli::Command::Bar { .. });
+    let is_watch = matches!(mode, cli::Command::Watch { .. });
 
     let date_range = if let cli::Command::Bar { ref period, .. } = mode {
         Some(bar_date_range(period))
+    } else if is_watch && cli.from.is_none() && cli.to.is_none() {
+        let today = chrono::Local::now().date_naive();
+        Some((today, today))
     } else {
         match (cli.from, cli.to) {
             (Some(f), Some(t)) => Some((f, t)),
@@ -77,6 +82,10 @@ fn main() -> Result<()> {
             (None, None) => None,
         }
     };
+
+    if is_watch {
+        return watch::run(&mode, &cli, &pricing_source, &currency, date_range);
+    }
 
     let mut store = storage::default_storage();
 

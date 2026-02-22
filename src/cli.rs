@@ -108,6 +108,15 @@ pub enum Command {
     Session,
     /// Aggregate by model
     Model,
+    /// Live-updating cost monitor
+    Watch {
+        /// Show full table instead of compact summary line
+        #[arg(long)]
+        full: bool,
+        /// Minimum seconds between refreshes (debounce)
+        #[arg(long, default_value = "2")]
+        interval: u64,
+    },
     /// Output JSON for status bars (waybar, i3bar, polybar)
     Bar {
         /// Timeframe to summarize

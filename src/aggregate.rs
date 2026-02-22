@@ -30,6 +30,7 @@ pub fn bucket_key(record: &UsageRecord, mode: &Command) -> String {
         Command::Monthly => record.timestamp.format("%Y-%m").to_string(),
         Command::Session => format!("{} | {}", record.project, record.session_id),
         Command::Model => record.model.clone(),
+        Command::Watch { .. } => "watch".to_string(),
         Command::Bar { .. } => "bar".to_string(),
     }
 }

@@ -47,6 +47,12 @@ tku --tool claude
 
 # Per-model breakdown within each day
 tku --breakdown
+
+# Live-updating cost monitor (today, compact)
+tku watch
+
+# Live-updating full table
+tku watch --full
 ```
 
 ## Commands
@@ -57,6 +63,7 @@ tku --breakdown
 | `monthly` | Aggregate by month |
 | `session` | Aggregate by session, grouped by project |
 | `model` | Aggregate by model |
+| `watch` | Live-updating cost monitor (default: compact single line, today only) |
 | `bar` | JSON output for status bars (waybar, i3bar, polybar) |
 
 ## Options
@@ -93,6 +100,30 @@ tku --columns -cache_write,-cache_read
 # Explicit list (replaces defaults)
 tku --columns period,cost,models
 ```
+
+## Watch mode
+
+`tku watch` monitors provider session files and displays a running cost counter. Refreshes on file changes (via inotify/FSEvents/kqueue), debounced to avoid rapid redraws.
+
+```bash
+# Compact single-line output (default)
+tku watch
+
+# Full table, redrawn on each update
+tku watch --full
+
+# Custom refresh interval (seconds)
+tku watch --interval 5
+
+# Combine with filters
+tku watch --tool claude --currency EUR
+tku watch --full --breakdown --from 2026-02-01
+```
+
+| Flag | Description |
+|------|-------------|
+| `--full` | Show full table instead of compact summary line |
+| `--interval <seconds>` | Minimum time between refreshes (default: 2) |
 
 ## Status bar integration
 

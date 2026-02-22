@@ -16,6 +16,10 @@ impl Provider for ClaudeProvider {
         "claude"
     }
 
+    fn root_dirs(&self) -> Vec<PathBuf> {
+        compute_roots()
+    }
+
     fn discover_and_parse(
         &self,
         storage: &mut dyn Storage,

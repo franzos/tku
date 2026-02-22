@@ -16,11 +16,21 @@ use crate::types::UsageRecord;
 
 pub trait Provider {
     fn name(&self) -> &str;
+    fn root_dirs(&self) -> Vec<PathBuf>;
     fn discover_and_parse(
         &self,
         storage: &mut dyn Storage,
         progress: Option<&dyn Fn(usize, usize)>,
     );
+}
+
+/// Collect all provider root directories for file watching.
+pub fn all_watch_paths() -> Vec<PathBuf> {
+    all_providers()
+        .iter()
+        .flat_map(|p| p.root_dirs())
+        .filter(|p| p.exists())
+        .collect()
 }
 
 pub fn all_providers() -> Vec<Box<dyn Provider>> {
