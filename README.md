@@ -1,6 +1,6 @@
 # TKU - Token Usage CLI
 
-Token usage tracking for Claude Code, Codex and others.
+Token usage tracking for Claude Code, Codex, Gemini CLI and others.
 
 <p align="center">
   <img src="assets/logo.svg" alt="tku" width="480">
@@ -73,7 +73,7 @@ tku watch --full
 | `--from <YYYY-MM-DD>` | Start date filter |
 | `--to <YYYY-MM-DD>` | End date filter |
 | `--project <name>` | Filter by project name (substring match) |
-| `--tool <name>` | Filter by tool (claude, codex, pi, amp, opencode) |
+| `--tool <name>` | Filter by tool (claude, codex, pi, amp, opencode, gemini, droid, openclaw, kimi) |
 | `--format table\|json` | Output format (default: table) |
 | `--columns <cols>` | Columns to display (see below) |
 | `--breakdown` | Per-model breakdown within each period |
@@ -218,7 +218,11 @@ Currently supported:
 - **OpenAI Codex CLI** — scans `~/.codex/sessions/**/*.jsonl` (override with `CODEX_HOME`)
 - **Pi-agent** — scans `~/.pi/agent/sessions/**/*.jsonl` (override with `PI_AGENT_DIR`)
 - **Amp** — scans `~/.local/share/amp/threads/**/*.json` (override with `AMP_DATA_DIR`)
-- **OpenCode** — scans `~/.local/share/opencode/storage/message/**/*.json` (override with `OPENCODE_DATA_DIR`)
+- **OpenCode** — scans `~/.local/share/opencode/storage/message/**/*.json` (override with `OPENCODE_DATA_DIR`); SQLite (`opencode.db`) with `--features sqlite`
+- **Gemini CLI** — scans `~/.gemini/tmp/*/chats/session-*.json` (override with `GEMINI_HOME`)
+- **Droid (Factory)** — scans `~/.factory/sessions/*.settings.json` (override with `FACTORY_HOME`)
+- **OpenClaw** — scans `~/.openclaw/agents/**/*.jsonl` (+ legacy: clawdbot, moltbot, moldbot)
+- **Kimi CLI** — scans `~/.kimi/sessions/**/wire.jsonl` (override with `KIMI_HOME`)
 
 The provider architecture is designed so adding a new provider is a single file in `src/providers/`.
 
@@ -234,6 +238,18 @@ cargo build --release --features sqlite
 # Run tests
 cargo test
 ```
+
+## Alternatives
+
+| Tool | Language | Providers | Currency | Pricing sources | Watch/live | Status bar | JSON output |
+|------|----------|-----------|----------|-----------------|------------|------------|-------------|
+| **[tku](https://github.com/franzos/tku)** | Rust | Claude Code, Codex, Pi, Amp, OpenCode, Gemini CLI, Droid, OpenClaw, Kimi | Yes (any ISO 4217) | LiteLLM, OpenRouter, LLM Prices | Yes (file-watcher) | Yes (waybar/i3/polybar) | Yes |
+| **[ccusage](https://github.com/ryoppippi/ccusage)** | TypeScript | Claude Code, Codex, Pi, Amp, OpenCode | No | LiteLLM | No | Yes (CC statusline) | Yes |
+| **[better-ccusage](https://github.com/cobra91/better-ccusage)** | TypeScript | Claude Code + Moonshot, MiniMax, Zai, GLM | No | Bundled | Yes (`blocks --live`) | No | Yes |
+| **[toktrack](https://github.com/mag123c/toktrack)** | Rust | Claude Code, Codex, Gemini CLI, OpenCode | No | LiteLLM | No (TUI) | No | Yes |
+| **[tokscale](https://github.com/junhoyeo/tokscale)** | Rust + TS | Claude Code, Codex, Cursor, Gemini CLI, Amp, Pi, OpenCode, Kimi, OpenClaw, Droid | No | LiteLLM + OpenRouter fallback | Yes (auto-refresh) | No | Yes |
+| **[caut](https://github.com/Dicklesworthstone/coding_agent_usage_tracker)** | Rust | 16+ (Codex, Claude, Gemini, Cursor, Copilot, Kiro, ...) | No | Local JSONL + provider APIs | No | No | Yes + Markdown |
+| **[claude-monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor)** | Python | Claude Code only | No | Bundled | Yes (real-time TUI) | No | No |
 
 ## Acknowledgements
 

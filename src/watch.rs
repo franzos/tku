@@ -58,13 +58,7 @@ pub fn run(
     }
 
     // Event loop with debounce
-    loop {
-        // Block until we get an event (or Ctrl+C)
-        match rx.recv() {
-            Ok(()) => {}
-            Err(_) => break,
-        }
-
+    while let Ok(()) = rx.recv() {
         // Debounce: drain any additional events within the interval
         let deadline = Instant::now() + interval;
         loop {

@@ -1,3 +1,13 @@
+## [0.1.4] - 2026-02-22
+
+### Added
+- `tku watch` — live-updating cost monitor with file watcher (inotify/FSEvents/kqueue)
+- Gemini CLI provider (`~/.gemini/tmp/*/chats/`)
+- Droid (Factory) provider (`~/.factory/sessions/`)
+- OpenClaw provider (`~/.openclaw/agents/`, + legacy paths)
+- Kimi CLI provider (`~/.kimi/sessions/`)
+- OpenCode SQLite support (`opencode.db`, behind `--features sqlite`)
+
 ## [0.1.3] - 2026-02-21
 
 ### Added

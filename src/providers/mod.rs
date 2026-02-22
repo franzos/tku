@@ -1,6 +1,10 @@
 pub mod amp;
 pub mod claude;
 pub mod codex;
+pub mod droid;
+pub mod gemini;
+pub mod kimi;
+pub mod openclaw;
 pub mod opencode;
 pub mod pi;
 
@@ -40,6 +44,10 @@ pub fn all_providers() -> Vec<Box<dyn Provider>> {
         Box::new(pi::PiProvider),
         Box::new(amp::AmpProvider),
         Box::new(opencode::OpenCodeProvider),
+        Box::new(gemini::GeminiProvider),
+        Box::new(droid::DroidProvider),
+        Box::new(openclaw::OpenClawProvider),
+        Box::new(kimi::KimiProvider),
     ]
 }
 
