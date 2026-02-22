@@ -158,7 +158,11 @@ fn extract_record(
     let timestamp_str = timestamp_val?.as_str()?;
     let timestamp: DateTime<Utc> = timestamp_str.parse().ok()?;
 
-    let model = message.get("model")?.as_str()?.to_string();
+    let model = message.get("model")?.as_str()?;
+    if model == "<synthetic>" {
+        return None;
+    }
+    let model = model.to_string();
     let message_id = message.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let request_id = request_id_val.and_then(|v| v.as_str()).unwrap_or("");
 
