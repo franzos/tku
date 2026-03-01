@@ -237,10 +237,10 @@ impl Storage for SqliteStorage {
                 model: row.get(4)?,
                 message_id: row.get(5)?,
                 request_id: row.get(6)?,
-                input_tokens: row.get::<_, i64>(7)? as u64,
-                output_tokens: row.get::<_, i64>(8)? as u64,
-                cache_creation_input_tokens: row.get::<_, i64>(9)? as u64,
-                cache_read_input_tokens: row.get::<_, i64>(10)? as u64,
+                input_tokens: row.get::<_, i64>(7)?.max(0) as u64,
+                output_tokens: row.get::<_, i64>(8)?.max(0) as u64,
+                cache_creation_input_tokens: row.get::<_, i64>(9)?.max(0) as u64,
+                cache_read_input_tokens: row.get::<_, i64>(10)?.max(0) as u64,
             })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())

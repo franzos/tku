@@ -119,7 +119,7 @@ pub fn print_bar(
         });
         println!(
             "{}",
-            serde_json::to_string(&output).expect("JSON serialization failed")
+            serde_json::to_string(&output).unwrap_or_default()
         );
         return;
     };
@@ -161,7 +161,7 @@ pub fn print_bar(
     });
     println!(
         "{}",
-        serde_json::to_string(&output).expect("JSON serialization failed")
+        serde_json::to_string(&output).unwrap_or_default()
     );
 }
 
@@ -203,6 +203,6 @@ pub fn print_json(buckets: &BTreeMap<String, AggregatedBucket>, exchange: &Excha
 
     println!(
         "{}",
-        serde_json::to_string_pretty(&json).expect("JSON serialization failed")
+        serde_json::to_string_pretty(&json).unwrap_or_default()
     );
 }

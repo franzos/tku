@@ -1,7 +1,14 @@
-## [0.1.5] - 2026-02-22
+## [0.1.6] - 2026-03-01
+
+### Fixed
+- Safer error handling, bounded HTTP reads, and dedup collision resistance
+- Watch mode loads exchange rate once instead of every refresh
+
+## [0.1.5] - 2026-02-23
 
 ### Changed
-- Bump
+- Cache now retains usage records after source files are deleted (e.g. agent cleanup)
+- New `--prune` flag to manually remove stale cache entries when needed
 
 ## [0.1.4] - 2026-02-22
 

@@ -25,6 +25,7 @@ pub trait Provider {
         &self,
         storage: &mut dyn Storage,
         progress: Option<&dyn Fn(usize, usize)>,
+        prune: bool,
     );
 }
 
@@ -100,12 +101,12 @@ pub(crate) fn discover_and_parse_with<F>(
     files: Vec<DiscoveredFile>,
     storage: &mut dyn Storage,
     progress: Option<&dyn Fn(usize, usize)>,
+    prune: bool,
     parse: F,
 ) where
     F: Fn(&Path) -> Vec<UsageRecord> + Sync,
 {
     let total = files.len();
-    let paths: Vec<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
 
     // Phase 1: filter out cached files (sequential — needs &mut storage)
     let mut cached_count = 0;
@@ -135,7 +136,10 @@ pub(crate) fn discover_and_parse_with<F>(
         storage.insert(name, &file.path, file.mtime, file.size, records);
     }
 
-    storage.prune(name, &paths);
+    if prune {
+        let paths: Vec<PathBuf> = files.iter().map(|f| f.path.clone()).collect();
+        storage.prune(name, &paths);
+    }
 }
 
 /// XDG base directory kind, determining which env var and fallback to use.

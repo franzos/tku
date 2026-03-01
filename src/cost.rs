@@ -31,10 +31,11 @@ pub trait PricingMap {
     fn unpriced_models(&self, records: &[UsageRecord]) -> Vec<String> {
         let mut models: Vec<String> = records
             .iter()
-            .map(|r| r.model.clone())
+            .map(|r| r.model.as_str())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .filter(|m| self.get(m).is_none())
+            .map(|m| m.to_string())
             .collect();
         models.sort();
         models

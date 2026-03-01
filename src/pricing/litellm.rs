@@ -7,8 +7,15 @@ use crate::cost::ModelPricing;
 const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
+const MAX_RESPONSE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+
 pub fn fetch_litellm_json() -> Result<String> {
-    let body = ureq::get(LITELLM_URL).call()?.body_mut().read_to_string()?;
+    let body = ureq::get(LITELLM_URL)
+        .call()?
+        .body_mut()
+        .with_config()
+        .limit(MAX_RESPONSE_BYTES)
+        .read_to_string()?;
     Ok(body)
 }
 

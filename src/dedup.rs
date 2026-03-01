@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 
 use crate::types::UsageRecord;
 
@@ -8,16 +7,8 @@ pub fn dedup(records: Vec<UsageRecord>) -> Vec<UsageRecord> {
     records
         .into_iter()
         .filter(|r| {
-            let h = record_hash(r);
-            seen.insert(h)
+            let key = (&r.provider, &r.message_id, &r.request_id);
+            seen.insert((key.0.clone(), key.1.clone(), key.2.clone()))
         })
         .collect()
-}
-
-fn record_hash(r: &UsageRecord) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    r.provider.hash(&mut hasher);
-    r.message_id.hash(&mut hasher);
-    r.request_id.hash(&mut hasher);
-    hasher.finish()
 }

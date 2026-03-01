@@ -57,6 +57,10 @@ pub struct Cli {
     /// Suppress progress output (for scripting)
     #[arg(long, global = true)]
     pub cli: bool,
+
+    /// Remove cached records for source files that no longer exist
+    #[arg(long, global = true)]
+    pub prune: bool,
 }
 
 pub const DEFAULT_COLUMNS: &[&str] = &[

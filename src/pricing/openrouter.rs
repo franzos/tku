@@ -6,10 +6,14 @@ use crate::cost::ModelPricing;
 
 const OPENROUTER_URL: &str = "https://api.openrouter.ai/api/v1/models";
 
+const MAX_RESPONSE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+
 pub fn fetch_openrouter_json() -> Result<String> {
     let body = ureq::get(OPENROUTER_URL)
         .call()?
         .body_mut()
+        .with_config()
+        .limit(MAX_RESPONSE_BYTES)
         .read_to_string()?;
     Ok(body)
 }

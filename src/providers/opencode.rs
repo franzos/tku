@@ -25,6 +25,7 @@ impl Provider for OpenCodeProvider {
         &self,
         storage: &mut dyn Storage,
         progress: Option<&dyn Fn(usize, usize)>,
+        prune: bool,
     ) {
         let roots = compute_roots();
 
@@ -43,11 +44,7 @@ impl Provider for OpenCodeProvider {
         for db_path in &sqlite_db_paths {
             if let Some(df) = super::discovered_file(db_path) {
                 if !storage.is_cached("opencode", db_path, df.mtime, df.size) {
-                    let db_records: Vec<_> = sqlite_records
-                        .iter()
-                        .filter(|_| true) // all records come from this db
-                        .cloned()
-                        .collect();
+                    let db_records = sqlite_records.clone();
                     storage.insert("opencode", db_path, df.mtime, df.size, db_records);
                 }
             }
@@ -67,7 +64,7 @@ impl Provider for OpenCodeProvider {
             }
         }
 
-        discover_and_parse_with(self.name(), files, storage, progress, |path| {
+        discover_and_parse_with(self.name(), files, storage, progress, prune, |path| {
             // Skip db files in the parse phase — they're handled above
             if path.extension().is_some_and(|ext| ext == "db") {
                 return Vec::new();

@@ -25,10 +25,11 @@ impl Provider for CodexProvider {
         &self,
         storage: &mut dyn Storage,
         progress: Option<&dyn Fn(usize, usize)>,
+        prune: bool,
     ) {
         let roots = compute_roots();
         let files = discover_files(&roots, "jsonl");
-        discover_and_parse_with(self.name(), files, storage, progress, |path| {
+        discover_and_parse_with(self.name(), files, storage, progress, prune, |path| {
             let session_id = session_id_from_path(path);
             let project = project_from_session_id(&session_id);
             parse_jsonl_file(path, &session_id, &project)
@@ -206,7 +207,7 @@ fn extract_token_event(
         })
         .map(|s| s.to_string())
         .or_else(|| last_model.clone())
-        .unwrap_or_else(|| "gpt-5".to_string());
+        .unwrap_or_else(|| "unknown".to_string());
 
     // Delta calculation: prefer last_token_usage, fallback to total_token_usage subtraction
     let (input, output, cached) = if let Some(last) = info.get("last_token_usage") {

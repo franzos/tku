@@ -11,29 +11,26 @@ use crate::cost::PricingMap;
 use crate::exchange::ExchangeRate;
 
 pub fn run(
-    mode: &Command,
+    full: bool,
+    watch_interval: u64,
     cli: &cli::Cli,
     pricing_source: &crate::pricing::PricingSource,
     currency: &str,
     date_range: Option<(chrono::NaiveDate, chrono::NaiveDate)>,
 ) -> Result<()> {
-    let (full, interval) = match mode {
-        Command::Watch { full, interval } => (*full, *interval),
-        _ => unreachable!(),
-    };
-
-    let interval = Duration::from_secs(interval);
+    let interval = Duration::from_secs(watch_interval);
     let label = match date_range {
         Some((from, to)) if from == to => format!("{from}"),
         Some((from, to)) => format!("{from} — {to}"),
         None => "All time".to_string(),
     };
 
-    // Load pricing once upfront (respects --offline on first fetch, then reused)
+    // Load pricing and exchange rate once upfront
     let pricing = crate::pricing::load_pricing(pricing_source, cli.offline)?;
+    let exchange = crate::exchange::load_exchange_rate(currency, cli.offline);
 
     // Initial render
-    render(cli, &pricing, currency, date_range, full, &label)?;
+    render(cli, &pricing, &exchange, date_range, full, &label)?;
 
     // Setup file watcher
     let (tx, rx) = mpsc::channel();
@@ -73,7 +70,7 @@ pub fn run(
             }
         }
 
-        render(cli, &pricing, currency, date_range, full, &label)?;
+        render(cli, &pricing, &exchange, date_range, full, &label)?;
     }
 
     Ok(())
@@ -86,61 +83,50 @@ fn scan_and_filter(
     let mut store = crate::storage::default_storage();
 
     for provider in crate::providers::all_providers() {
-        provider.discover_and_parse(store.as_mut(), None);
+        provider.discover_and_parse(store.as_mut(), None, cli.prune);
     }
 
     store.flush();
     let all_records = store.drain_all();
     let records = crate::dedup::dedup(all_records);
 
-    let records: Vec<_> = if let Some((from, to)) = date_range {
-        records
-            .into_iter()
-            .filter(|r| {
+    let proj_needle = cli.project.as_ref().map(|p| p.to_lowercase());
+    let tool_needle = cli.tool.as_ref().map(|t| t.to_lowercase());
+
+    records
+        .into_iter()
+        .filter(|r| match date_range {
+            Some((from, to)) => {
                 let date = r.timestamp.date_naive();
                 date >= from && date <= to
-            })
-            .collect()
-    } else {
-        records
-    };
-
-    let records: Vec<_> = if let Some(ref proj) = cli.project {
-        let needle = proj.to_lowercase();
-        records
-            .into_iter()
-            .filter(|r| r.project.to_lowercase().contains(&needle))
-            .collect()
-    } else {
-        records
-    };
-
-    if let Some(ref tool) = cli.tool {
-        let needle = tool.to_lowercase();
-        records
-            .into_iter()
-            .filter(|r| r.provider.to_lowercase() == needle)
-            .collect()
-    } else {
-        records
-    }
+            }
+            None => true,
+        })
+        .filter(|r| match &proj_needle {
+            Some(needle) => r.project.to_lowercase().contains(needle),
+            None => true,
+        })
+        .filter(|r| match &tool_needle {
+            Some(needle) => r.provider.to_lowercase() == *needle,
+            None => true,
+        })
+        .collect()
 }
 
 fn render(
     cli: &cli::Cli,
     pricing: &dyn PricingMap,
-    currency: &str,
+    exchange: &ExchangeRate,
     date_range: Option<(chrono::NaiveDate, chrono::NaiveDate)>,
     full: bool,
     label: &str,
 ) -> Result<()> {
     let records = scan_and_filter(cli, date_range);
-    let exchange = crate::exchange::load_exchange_rate(currency, cli.offline);
 
     if full {
-        render_full(&records, cli, pricing, &exchange)?;
+        render_full(&records, cli, pricing, exchange)?;
     } else {
-        render_compact(&records, pricing, &exchange, label)?;
+        render_compact(&records, pricing, exchange, label)?;
     }
 
     Ok(())

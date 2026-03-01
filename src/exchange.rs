@@ -86,7 +86,12 @@ fn fetch_rate(currency: &str) -> Result<f64> {
         "https://api.frankfurter.dev/v1/latest?base=USD&symbols={}",
         currency
     );
-    let body = ureq::get(&url).call()?.body_mut().read_to_string()?;
+    let body = ureq::get(&url)
+        .call()?
+        .body_mut()
+        .with_config()
+        .limit(1024 * 1024) // 1 MB
+        .read_to_string()?;
     let resp: FrankfurterResponse = serde_json::from_str(&body)?;
     resp.rates
         .get(currency)
@@ -123,7 +128,9 @@ fn save_cached_rate(currency: &str, rate: f64) {
         code: currency.to_string(),
         rate,
     };
-    let _ = fs::write(&path, serde_json::to_string(&cached).unwrap_or_default());
+    if let Ok(data) = serde_json::to_string(&cached) {
+        let _ = fs::write(&path, data);
+    }
 }
 
 pub fn load_exchange_rate(currency: &str, offline: bool) -> ExchangeRate {

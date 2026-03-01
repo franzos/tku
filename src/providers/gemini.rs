@@ -26,10 +26,11 @@ impl Provider for GeminiProvider {
         &self,
         storage: &mut dyn Storage,
         progress: Option<&dyn Fn(usize, usize)>,
+        prune: bool,
     ) {
         let roots = compute_roots();
         let files = discover_files(&roots, "json");
-        discover_and_parse_with(self.name(), files, storage, progress, |path| {
+        discover_and_parse_with(self.name(), files, storage, progress, prune, |path| {
             parse_session_file(path)
         });
     }

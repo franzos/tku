@@ -1,7 +1,7 @@
 use std::io::stdout;
 
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Duration, Local, Timelike};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, Timelike};
 use crossterm::execute;
 use ratatui::{
     backend::CrosstermBackend,
@@ -18,6 +18,25 @@ struct BucketSpec {
     labels: Vec<String>,
 }
 
+/// Truncate a local datetime to the start of its hour.
+fn truncate_to_hour(dt: DateTime<Local>) -> DateTime<Local> {
+    let time = NaiveTime::from_hms_opt(dt.hour(), 0, 0).unwrap_or_default();
+    dt.date_naive()
+        .and_time(time)
+        .and_local_timezone(Local)
+        .latest()
+        .unwrap_or(dt)
+}
+
+/// Truncate a local datetime to the start of its day.
+fn truncate_to_day(dt: DateTime<Local>) -> DateTime<Local> {
+    dt.date_naive()
+        .and_time(NaiveTime::default())
+        .and_local_timezone(Local)
+        .latest()
+        .unwrap_or(dt)
+}
+
 fn build_buckets(period: &GraphPeriod, relative: bool) -> BucketSpec {
     let now = Local::now();
 
@@ -28,14 +47,7 @@ fn build_buckets(period: &GraphPeriod, relative: bool) -> BucketSpec {
             let start = if relative {
                 now - Duration::hours(24)
             } else {
-                // Align to midnight yesterday, same time
-                (now - Duration::days(1))
-                    .with_minute(0)
-                    .unwrap()
-                    .with_second(0)
-                    .unwrap()
-                    .with_nanosecond(0)
-                    .unwrap()
+                truncate_to_hour(now - Duration::days(1))
             };
 
             let mut boundaries = Vec::with_capacity(total_buckets + 1);
@@ -68,15 +80,7 @@ fn build_buckets(period: &GraphPeriod, relative: bool) -> BucketSpec {
             let start = if relative {
                 now - Duration::days(7)
             } else {
-                (now - Duration::days(7))
-                    .with_hour(0)
-                    .unwrap()
-                    .with_minute(0)
-                    .unwrap()
-                    .with_second(0)
-                    .unwrap()
-                    .with_nanosecond(0)
-                    .unwrap()
+                truncate_to_day(now - Duration::days(7))
             };
 
             let mut boundaries = Vec::with_capacity(total_buckets + 1);
@@ -109,15 +113,7 @@ fn build_buckets(period: &GraphPeriod, relative: bool) -> BucketSpec {
             let start = if relative {
                 now - Duration::days(30)
             } else {
-                (now - Duration::days(29))
-                    .with_hour(0)
-                    .unwrap()
-                    .with_minute(0)
-                    .unwrap()
-                    .with_second(0)
-                    .unwrap()
-                    .with_nanosecond(0)
-                    .unwrap()
+                truncate_to_day(now - Duration::days(29))
             };
 
             let mut boundaries = Vec::with_capacity(total_buckets + 1);

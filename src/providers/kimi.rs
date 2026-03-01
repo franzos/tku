@@ -24,11 +24,12 @@ impl Provider for KimiProvider {
         &self,
         storage: &mut dyn Storage,
         progress: Option<&dyn Fn(usize, usize)>,
+        prune: bool,
     ) {
         let roots = compute_roots();
         let config_model = read_config_model();
         let files = discover_files(&roots, "jsonl");
-        discover_and_parse_with(self.name(), files, storage, progress, |path| {
+        discover_and_parse_with(self.name(), files, storage, progress, prune, |path| {
             let session_id = session_id_from_path(path);
             let project = project_from_path(path);
             parse_wire_file(path, &session_id, &project, &config_model)

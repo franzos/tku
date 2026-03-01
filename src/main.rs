@@ -27,7 +27,8 @@ fn bar_date_range(period: &cli::BarPeriod) -> (chrono::NaiveDate, chrono::NaiveD
         cli::BarPeriod::Today => (today, today),
         cli::BarPeriod::Week => (today - chrono::Duration::days(6), today),
         cli::BarPeriod::Month => {
-            let first = chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap();
+            let first = chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
+                .unwrap_or(today);
             (first, today)
         }
     }
@@ -68,7 +69,6 @@ fn main() -> Result<()> {
     }
 
     let is_bar = matches!(mode, cli::Command::Bar { .. });
-    let is_watch = matches!(mode, cli::Command::Watch { .. });
     let is_plot = matches!(mode, cli::Command::Plot { .. });
 
     let date_range = if let cli::Command::Plot { ref period, .. } = mode {
@@ -81,20 +81,20 @@ fn main() -> Result<()> {
         Some((today - chrono::Duration::days(days_back), today))
     } else if let cli::Command::Bar { ref period, .. } = mode {
         Some(bar_date_range(period))
-    } else if is_watch && cli.from.is_none() && cli.to.is_none() {
+    } else if matches!(mode, cli::Command::Watch { .. }) && cli.from.is_none() && cli.to.is_none() {
         let today = chrono::Local::now().date_naive();
         Some((today, today))
     } else {
         match (cli.from, cli.to) {
             (Some(f), Some(t)) => Some((f, t)),
             (Some(f), None) => Some((f, chrono::Utc::now().date_naive())),
-            (None, Some(t)) => Some((chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(), t)),
+            (None, Some(t)) => Some((chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap_or(t), t)),
             (None, None) => None,
         }
     };
 
-    if is_watch {
-        return watch::run(&mode, &cli, &pricing_source, &currency, date_range);
+    if let cli::Command::Watch { full, interval } = mode {
+        return watch::run(full, interval, &cli, &pricing_source, &currency, date_range);
     }
 
     let mut store = storage::default_storage();
@@ -112,6 +112,7 @@ fn main() -> Result<()> {
             } else {
                 None
             },
+            cli.prune,
         );
     }
     if show_progress {
@@ -124,37 +125,27 @@ fn main() -> Result<()> {
 
     let records = dedup::dedup(all_records);
 
-    let records: Vec<_> = if let Some((from, to)) = date_range {
-        records
-            .into_iter()
-            .filter(|r| {
+    let proj_needle = cli.project.as_ref().map(|p| p.to_lowercase());
+    let tool_needle = cli.tool.as_ref().map(|t| t.to_lowercase());
+
+    let records: Vec<_> = records
+        .into_iter()
+        .filter(|r| match date_range {
+            Some((from, to)) => {
                 let date = r.timestamp.date_naive();
                 date >= from && date <= to
-            })
-            .collect()
-    } else {
-        records
-    };
-
-    let records: Vec<_> = if let Some(ref proj) = cli.project {
-        let needle = proj.to_lowercase();
-        records
-            .into_iter()
-            .filter(|r| r.project.to_lowercase().contains(&needle))
-            .collect()
-    } else {
-        records
-    };
-
-    let records: Vec<_> = if let Some(ref tool) = cli.tool {
-        let needle = tool.to_lowercase();
-        records
-            .into_iter()
-            .filter(|r| r.provider.to_lowercase() == needle)
-            .collect()
-    } else {
-        records
-    };
+            }
+            None => true,
+        })
+        .filter(|r| match &proj_needle {
+            Some(needle) => r.project.to_lowercase().contains(needle),
+            None => true,
+        })
+        .filter(|r| match &tool_needle {
+            Some(needle) => r.provider.to_lowercase() == *needle,
+            None => true,
+        })
+        .collect();
 
     if let cli::Command::Plot {
         ref period,
