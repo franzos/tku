@@ -42,9 +42,14 @@ impl Provider for DroidProvider {
             })
             .collect();
 
-        discover_and_parse_with(self.name(), settings_files, storage, progress, prune, |path| {
-            parse_settings_file(path)
-        });
+        discover_and_parse_with(
+            self.name(),
+            settings_files,
+            storage,
+            progress,
+            prune,
+            parse_settings_file,
+        );
     }
 }
 

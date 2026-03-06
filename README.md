@@ -48,6 +48,9 @@ tku --tool claude
 # Per-model breakdown within each day
 tku --breakdown
 
+# Subscription usage overview (Claude Max/Pro)
+tku sub
+
 # Bar chart of token usage (last 30 days)
 tku plot
 
@@ -68,6 +71,7 @@ tku watch --full
 | `model` | Aggregate by model |
 | `watch` | Live-updating cost monitor (default: compact single line, today only) |
 | `plot` | Inline bar chart of token usage over time |
+| `subscription` (`sub`) | Claude Max/Pro subscription usage overview |
 | `bar` | JSON output for status bars (waybar, i3bar, polybar) |
 
 ## Options
@@ -162,6 +166,37 @@ tku plot 1w --tool claude
 | `1d` | 24 hours | 48 x 30min | Hour on the hour |
 
 By default, buckets align to the local clock (e.g. `1d` at 08:00 shows 08:00 yesterday through now). Use `--relative` to ignore clock alignment and take the exact last N hours/days.
+
+## Subscription
+
+`tku sub` shows a 4-week overview of your Claude Max/Pro subscription usage. It fetches live utilization % from the Anthropic OAuth API and combines it with locally computed costs. Requires Claude Code credentials (`~/.claude/.credentials.json`) — other providers are not currently supported.
+
+```bash
+# Show subscription overview
+tku sub
+
+# With currency conversion
+tku sub --currency EUR
+
+# Offline (cached snapshots only, no API call)
+tku sub --offline
+```
+
+```
+Claude Max (20x) — 4% used, resets Mar 13, 6:00am
+
+┌─────────────────┬───────┬─────────┬────────────────┐
+│ Period          ┆ Usage ┆ Cost    ┆ Overage        │
+╞═════════════════╪═══════╪═════════╪════════════════╡
+│ Feb 13 → Feb 20 ┆ —     ┆ $796.71 ┆ —              │
+│ Feb 20 → Feb 27 ┆ —     ┆ $664.14 ┆ —              │
+│ Feb 27 → Mar 6  ┆ —     ┆ $981.66 ┆ —              │
+│ Mar 6 → Mar 13  ┆ 4%    ┆ $44.41  ┆ $0.00 / $42.50 │
+│   └─ 5h window  ┆ 4%    ┆         ┆                │
+└─────────────────┴───────┴─────────┴────────────────┘
+```
+
+Usage % for the current week is fetched live; previous weeks show the last captured snapshot (saved each time you run `tku sub`). Cost is always computed from local session records. Requires Claude Code OAuth credentials at `~/.claude/.credentials.json`.
 
 ## Status bar integration
 

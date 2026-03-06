@@ -9,6 +9,7 @@ mod output;
 mod pricing;
 mod providers;
 mod storage;
+mod subscription;
 mod types;
 mod watch;
 
@@ -27,8 +28,8 @@ fn bar_date_range(period: &cli::BarPeriod) -> (chrono::NaiveDate, chrono::NaiveD
         cli::BarPeriod::Today => (today, today),
         cli::BarPeriod::Week => (today - chrono::Duration::days(6), today),
         cli::BarPeriod::Month => {
-            let first = chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1)
-                .unwrap_or(today);
+            let first =
+                chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
             (first, today)
         }
     }
@@ -70,6 +71,7 @@ fn main() -> Result<()> {
 
     let is_bar = matches!(mode, cli::Command::Bar { .. });
     let is_plot = matches!(mode, cli::Command::Plot { .. });
+    let is_sub = matches!(mode, cli::Command::Subscription { .. });
 
     let date_range = if let cli::Command::Plot { ref period, .. } = mode {
         let today = chrono::Local::now().date_naive();
@@ -81,6 +83,12 @@ fn main() -> Result<()> {
         Some((today - chrono::Duration::days(days_back), today))
     } else if let cli::Command::Bar { ref period, .. } = mode {
         Some(bar_date_range(period))
+    } else if matches!(mode, cli::Command::Subscription { .. })
+        && cli.from.is_none()
+        && cli.to.is_none()
+    {
+        let today = chrono::Local::now().date_naive();
+        Some((today - chrono::Duration::days(35), today))
     } else if matches!(mode, cli::Command::Watch { .. }) && cli.from.is_none() && cli.to.is_none() {
         let today = chrono::Local::now().date_naive();
         Some((today, today))
@@ -99,7 +107,7 @@ fn main() -> Result<()> {
 
     let mut store = storage::default_storage();
 
-    let show_progress = !cli.cli && !is_bar && !is_plot;
+    let show_progress = !cli.cli && !is_bar && !is_plot && !is_sub;
     let progress_cb = |current: usize, total: usize| {
         eprint!("\x1b[2K\rScanning sessions... {current}/{total}");
         let _ = std::io::stderr().flush();
@@ -124,6 +132,12 @@ fn main() -> Result<()> {
     let all_records = store.drain_all();
 
     let records = dedup::dedup(all_records);
+
+    if let cli::Command::Subscription { live } = mode {
+        let exchange = exchange::load_exchange_rate(&currency, cli.offline);
+        let pricing = pricing::load_pricing(&pricing_source, cli.offline)?;
+        return subscription::run(&exchange, &records, &pricing, cli.offline, live);
+    }
 
     let proj_needle = cli.project.as_ref().map(|p| p.to_lowercase());
     let tool_needle = cli.tool.as_ref().map(|t| t.to_lowercase());

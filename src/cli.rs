@@ -130,6 +130,13 @@ pub enum Command {
         #[arg(long)]
         relative: bool,
     },
+    /// Show Claude Max/Pro subscription usage overview
+    #[command(visible_alias = "sub")]
+    Subscription {
+        /// Force live API fetch instead of using estimated usage
+        #[arg(long)]
+        live: bool,
+    },
     /// Output JSON for status bars (waybar, i3bar, polybar)
     Bar {
         /// Timeframe to summarize

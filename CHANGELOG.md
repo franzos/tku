@@ -1,3 +1,8 @@
+## [0.1.7] - 2026-03-06
+
+### Added
+- `tku subscription` (`tku sub`) — subscription usage overview with weekly breakdown
+
 ## [0.1.6] - 2026-03-01
 
 ### Fixed

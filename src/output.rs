@@ -117,10 +117,7 @@ pub fn print_bar(
             "class": "normal",
             "currency": exchange.code,
         });
-        println!(
-            "{}",
-            serde_json::to_string(&output).unwrap_or_default()
-        );
+        println!("{}", serde_json::to_string(&output).unwrap_or_default());
         return;
     };
 
@@ -159,10 +156,7 @@ pub fn print_bar(
         "class": class,
         "currency": exchange.code,
     });
-    println!(
-        "{}",
-        serde_json::to_string(&output).unwrap_or_default()
-    );
+    println!("{}", serde_json::to_string(&output).unwrap_or_default());
 }
 
 pub fn print_json(buckets: &BTreeMap<String, AggregatedBucket>, exchange: &ExchangeRate) {
