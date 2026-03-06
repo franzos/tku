@@ -137,9 +137,25 @@ tku watch --full --breakdown --from 2026-02-01
 
 `tku plot` renders an inline bar chart of total token usage over time, then exits. No interactive TUI — it prints the chart and returns to your prompt.
 
-<p align="center">
-  <img src="assets/plot.svg" alt="tku plot" width="720">
-</p>
+```
+┌Token usage — last 30 days (daily buckets)──────────────────────────────────────┐
+│                                                                ███             │
+│                                                                ███             │
+│▅▅▅                                                             ███             │
+│███                             ▁▁▁                             ███             │
+│███                         ▆▆▆ ███                             ███             │
+│███                         ███ ███                             ███     ▅▅▅  ···│
+│███                     ███ ███ ███ ▁▁▁                     ▇▇▇ ███     ███  ···│
+│███                 ▆▆▆ ███ ███ ███ ███ ▅▅▅             ▇▇▇ ███ ███     ███  ···│
+│███                 ███ ███ ███ ███ ███ ███             ███ ███ ███ ▆▆▆ ███  ···│
+│███     ▅▅▅         ███ ███ ███ ███ ███ ███ ███         ███ ███ ███ ███ ███  ···│
+│███     ███         ███ ███ ███ ███ ███ ███ ███ ▂▂▂     ███ ███ ███ ███ ███  ···│
+│███ ▁▁▁ ███ ▁▁▁ ▆▆▆ ███ ███ ███ ███ ███ ███ ███ ███ ▃▃▃ ███ ███ ███ ███ ███  ···│
+│███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███  ···│
+│███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███ ███  ···│
+│Feb  6   7   8   9  10  11  12  13  14  15  16  17  18  19  20  21  22  23   ···│
+└────────────────────────────────────────────────────────────────────────────────┘
+```
 
 ```bash
 # Last 30 days, daily buckets (default)
@@ -183,17 +199,14 @@ tku sub --offline
 ```
 
 ```
-Claude Max (20x) — 4% used, resets Mar 13, 6:00am
-
-┌─────────────────┬───────┬─────────┬────────────────┐
-│ Period          ┆ Usage ┆ Cost    ┆ Overage        │
-╞═════════════════╪═══════╪═════════╪════════════════╡
-│ Feb 13 → Feb 20 ┆ —     ┆ $796.71 ┆ —              │
-│ Feb 20 → Feb 27 ┆ —     ┆ $664.14 ┆ —              │
-│ Feb 27 → Mar 6  ┆ —     ┆ $981.66 ┆ —              │
-│ Mar 6 → Mar 13  ┆ 4%    ┆ $44.41  ┆ $0.00 / $42.50 │
-│   └─ 5h window  ┆ 4%    ┆         ┆                │
-└─────────────────┴───────┴─────────┴────────────────┘
+┌─────────────────┬───────┬─────────┬────────┬─────────┐
+│ Period          ┆ Usage ┆ Cost    ┆ $/1%   ┆ Overage │
+╞═════════════════╪═══════╪═════════╪════════╪═════════╡
+│ Feb 13 → Feb 20 ┆ —     ┆ $79.71  ┆ —      ┆ —       │
+│ Feb 20 → Feb 27 ┆ —     ┆ $66.45  ┆ —      ┆ —       │
+│ Feb 27 → Mar 6  ┆ —     ┆ $98.22  ┆ —      ┆ —       │
+│ Mar 6 → Mar 13  ┆ ~4%   ┆ $5.28   ┆ $1.25  ┆ —       │
+└─────────────────┴───────┴─────────┴────────┴─────────┘
 ```
 
 Usage % for the current week is fetched live; previous weeks show the last captured snapshot (saved each time you run `tku sub`). Cost is always computed from local session records. Requires Claude Code OAuth credentials at `~/.claude/.credentials.json`.
