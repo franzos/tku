@@ -327,15 +327,12 @@ cargo test
 
 ## Alternatives
 
-| Tool | Language | Providers | Currency | Pricing sources | Watch/live | Plot | Status bar | JSON output |
-|------|----------|-----------|----------|-----------------|------------|------|------------|-------------|
-| **[tku](https://github.com/franzos/tku)** | Rust | Claude Code, Codex, Pi, Amp, OpenCode, Gemini CLI, Droid, OpenClaw, Kimi | Yes (any ISO 4217) | LiteLLM, OpenRouter, LLM Prices | Yes (file-watcher) | Yes | Yes (waybar/i3/polybar) | Yes |
-| **[ccusage](https://github.com/ryoppippi/ccusage)** | TypeScript | Claude Code, Codex, Pi, Amp, OpenCode | No | LiteLLM | No | No | Yes (CC statusline) | Yes |
-| **[better-ccusage](https://github.com/cobra91/better-ccusage)** | TypeScript | Claude Code + Moonshot, MiniMax, Zai, GLM | No | Bundled | Yes (`blocks --live`) | No | No | Yes |
-| **[toktrack](https://github.com/mag123c/toktrack)** | Rust | Claude Code, Codex, Gemini CLI, OpenCode | No | LiteLLM | No (TUI) | No | No | Yes |
-| **[tokscale](https://github.com/junhoyeo/tokscale)** | Rust + TS | Claude Code, Codex, Cursor, Gemini CLI, Amp, Pi, OpenCode, Kimi, OpenClaw, Droid | No | LiteLLM + OpenRouter fallback | Yes (auto-refresh) | No | No | Yes |
-| **[caut](https://github.com/Dicklesworthstone/coding_agent_usage_tracker)** | Rust | 16+ (Codex, Claude, Gemini, Cursor, Copilot, Kiro, ...) | No | Local JSONL + provider APIs | No | No | No | Yes + Markdown |
-| **[claude-monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor)** | Python | Claude Code only | No | Bundled | Yes (real-time TUI) | No | No | No |
+- **[ccusage](https://github.com/ryoppippi/ccusage)** — TypeScript, the original inspiration for tku
+- **[better-ccusage](https://github.com/cobra91/better-ccusage)** — TypeScript, adds Chinese provider support
+- **[toktrack](https://github.com/mag123c/toktrack)** — Rust, interactive TUI
+- **[tokscale](https://github.com/junhoyeo/tokscale)** — Rust + TS, widest provider coverage
+- **[caut](https://github.com/Dicklesworthstone/coding_agent_usage_tracker)** — Rust, 16+ providers including Cursor and Copilot
+- **[claude-monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor)** — Python, real-time TUI for Claude Code
 
 ## Acknowledgements
 
