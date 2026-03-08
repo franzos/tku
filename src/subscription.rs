@@ -246,6 +246,55 @@ pub fn run(
     } else {
         eprintln!("{} (offline — showing cached data)", tier_label);
     }
+
+    // Pace projection bar
+    if let Some(pct) = current_pct {
+        if pct > 0.0 {
+            let now = Utc::now();
+            let elapsed = now.signed_duration_since(cycle_start);
+            let elapsed_h = elapsed.num_minutes() as f64 / 60.0;
+            let rate_per_h = pct / elapsed_h;
+            let cycle_remaining_h =
+                resets_at.signed_duration_since(now).num_minutes() as f64 / 60.0;
+            let projected = (pct + rate_per_h * cycle_remaining_h).min(200.0);
+
+            const BAR_W: usize = 30;
+            let used_w = ((pct / 100.0) * BAR_W as f64).round() as usize;
+            let proj_w = if projected > pct {
+                (((projected - pct) / 100.0) * BAR_W as f64).round() as usize
+            } else {
+                0
+            };
+            let used_w = used_w.min(BAR_W);
+            let proj_w = proj_w.min(BAR_W - used_w);
+            let free_w = BAR_W - used_w - proj_w;
+
+            let bar = format!(
+                "{}{}{}",
+                "█".repeat(used_w),
+                "▒".repeat(proj_w),
+                "░".repeat(free_w),
+            );
+
+            if pct >= 100.0 {
+                eprintln!("{} ▸ at capacity", bar);
+            } else if projected >= 100.0 {
+                eprintln!(
+                    "{} ▸ hits 100% in {}",
+                    bar,
+                    format_duration_short((100.0 - pct) / rate_per_h)
+                );
+            } else {
+                eprintln!(
+                    "{} ▸ ~{:.0}% at reset, {} left",
+                    bar,
+                    projected,
+                    format_duration_short(cycle_remaining_h)
+                );
+            }
+        }
+    }
+
     eprintln!();
 
     // Table
@@ -553,6 +602,21 @@ fn format_tier(sub_type: &str, tier: &str) -> String {
         plan.to_string()
     } else {
         format!("{plan} ({multiplier})")
+    }
+}
+
+fn format_duration_short(hours: f64) -> String {
+    let total_minutes = (hours * 60.0).round() as i64;
+    let days = total_minutes / (24 * 60);
+    let remaining = total_minutes % (24 * 60);
+    let h = remaining / 60;
+    let m = remaining % 60;
+    match (days, h, m) {
+        (0, 0, m) => format!("{m}m"),
+        (0, h, 0) => format!("{h}h"),
+        (0, h, m) => format!("{h}h {m}m"),
+        (d, 0, _) => format!("{d}d"),
+        (d, h, _) => format!("{d}d {h}h"),
     }
 }
 

@@ -1,3 +1,8 @@
+## [0.1.8] - 2026-03-08
+
+### Added
+- Pace projection bar for subscription usage (estimated % at reset)
+
 ## [0.1.7] - 2026-03-06
 
 ### Added
