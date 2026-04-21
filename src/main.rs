@@ -133,10 +133,10 @@ fn main() -> Result<()> {
 
     let records = dedup::dedup(all_records);
 
-    if let cli::Command::Subscription { live } = mode {
+    if let cli::Command::Subscription { live, plan } = mode {
         let exchange = exchange::load_exchange_rate(&currency, cli.offline);
         let pricing = pricing::load_pricing(&pricing_source, cli.offline)?;
-        return subscription::run(&exchange, &records, &pricing, cli.offline, live);
+        return subscription::run(&exchange, &records, &pricing, cli.offline, live, plan);
     }
 
     let proj_needle = cli.project.as_ref().map(|p| p.to_lowercase());

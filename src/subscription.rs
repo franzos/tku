@@ -101,6 +101,7 @@ pub fn run(
     pricing: &dyn PricingMap,
     offline: bool,
     live: bool,
+    plan: bool,
 ) -> Result<()> {
     let creds = match load_credentials() {
         Ok(c) => c,
@@ -211,6 +212,10 @@ pub fn run(
     // Save snapshot for current cycle when we got live data
     if let Some(w) = &seven_day {
         save_snapshot(resets_at, w.utilization, current_cost, &mut store);
+    }
+
+    if plan {
+        return run_plan_mode(&oauth, &store, resets_at, exchange);
     }
 
     let cycles = compute_cycles(resets_at, 4);
@@ -617,6 +622,300 @@ fn format_duration_short(hours: f64) -> String {
         (0, h, m) => format!("{h}h {m}m"),
         (d, 0, _) => format!("{d}d"),
         (d, h, _) => format!("{d}d {h}h"),
+    }
+}
+
+// --- Plan recommendation ---
+
+/// Claude subscription plans we can reason about.
+/// Prices are Anthropic's public USD rates as of early 2026; may drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plan {
+    Pro,
+    Max5x,
+    Max20x,
+}
+
+impl Plan {
+    /// Usage capacity expressed in "Pro units" — Anthropic describes
+    /// Max as 5×/20× Pro's weekly limit.
+    fn pro_units(self) -> f64 {
+        match self {
+            Plan::Pro => 1.0,
+            Plan::Max5x => 5.0,
+            Plan::Max20x => 20.0,
+        }
+    }
+
+    fn price_usd(self) -> f64 {
+        match self {
+            Plan::Pro => 20.0,
+            Plan::Max5x => 100.0,
+            Plan::Max20x => 200.0,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Plan::Pro => "Claude Pro",
+            Plan::Max5x => "Claude Max (5x)",
+            Plan::Max20x => "Claude Max (20x)",
+        }
+    }
+
+    fn downgrade(self) -> Option<Plan> {
+        match self {
+            Plan::Pro => None,
+            Plan::Max5x => Some(Plan::Pro),
+            Plan::Max20x => Some(Plan::Max5x),
+        }
+    }
+
+    fn upgrade(self) -> Option<Plan> {
+        match self {
+            Plan::Pro => Some(Plan::Max5x),
+            Plan::Max5x => Some(Plan::Max20x),
+            Plan::Max20x => None,
+        }
+    }
+}
+
+fn detect_plan(oauth: &OAuthCredentials) -> Option<Plan> {
+    let sub = oauth.subscription_type.as_deref()?;
+    let tier = oauth.rate_limit_tier.as_deref().unwrap_or("");
+    match sub {
+        "pro" => Some(Plan::Pro),
+        "max" if tier.contains("20x") => Some(Plan::Max20x),
+        "max" if tier.contains("5x") => Some(Plan::Max5x),
+        "max" => Some(Plan::Max5x),
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+enum Recommendation {
+    Stay,
+    Downgrade(Plan),
+    Upgrade(Plan),
+}
+
+/// Project a utilization % from `from` to `to`, scaled by Pro-unit capacity.
+fn project_pct(pct: f64, from: Plan, to: Plan) -> f64 {
+    pct * from.pro_units() / to.pro_units()
+}
+
+/// Decide whether to recommend a plan change.
+/// - Upgrade: at least 2 of the recent cycles hit ≥95%, or avg ≥85%.
+/// - Downgrade: peak cycle projected onto the lower plan stays ≤85%.
+/// - Otherwise: stay.
+fn recommend(current: Plan, utilizations: &[f64]) -> Recommendation {
+    if utilizations.is_empty() {
+        return Recommendation::Stay;
+    }
+    let avg = utilizations.iter().sum::<f64>() / utilizations.len() as f64;
+    let max = utilizations.iter().cloned().fold(0.0_f64, f64::max);
+    let near_cap = utilizations.iter().filter(|&&x| x >= 95.0).count();
+
+    if let Some(higher) = current.upgrade() {
+        if near_cap >= 2 || avg >= 85.0 {
+            return Recommendation::Upgrade(higher);
+        }
+    }
+
+    if let Some(lower) = current.downgrade() {
+        if project_pct(max, current, lower) <= 85.0 {
+            return Recommendation::Downgrade(lower);
+        }
+    }
+
+    Recommendation::Stay
+}
+
+fn run_plan_mode(
+    oauth: &OAuthCredentials,
+    store: &SnapshotStore,
+    current_cycle_end: DateTime<Utc>,
+    exchange: &ExchangeRate,
+) -> Result<()> {
+    let Some(current) = detect_plan(oauth) else {
+        eprintln!(
+            "Unsupported subscription type: {:?}",
+            oauth.subscription_type
+        );
+        eprintln!("Plan recommendations only cover Claude Pro and Max (5x / 20x).");
+        std::process::exit(1);
+    };
+
+    // Use completed cycles only — exclude the in-progress current cycle.
+    // Snapshots for past cycles retain the last captured utilization for that week.
+    let target_end = round_to_minute(current_cycle_end);
+    let mut completed: Vec<&CycleSnapshot> = store
+        .snapshots
+        .iter()
+        .filter(|s| round_to_minute(s.cycle_end) != target_end)
+        .collect();
+    completed.sort_by_key(|s| s.cycle_end);
+    let recent: Vec<&CycleSnapshot> = completed.iter().rev().take(4).rev().copied().collect();
+
+    eprintln!(
+        "{} — {}/month",
+        current.label(),
+        exchange.format_cost(Some(current.price_usd()))
+    );
+    eprintln!();
+
+    if recent.len() < 2 {
+        eprintln!(
+            "Not enough data for a recommendation ({} completed cycle{} captured).",
+            recent.len(),
+            if recent.len() == 1 { "" } else { "s" }
+        );
+        eprintln!("Run `tku sub` over a few weekly cycles first — recommendations need");
+        eprintln!("at least 2 completed cycles to be meaningful.");
+        return Ok(());
+    }
+
+    let utilizations: Vec<f64> = recent.iter().map(|s| s.utilization).collect();
+    let avg = utilizations.iter().sum::<f64>() / utilizations.len() as f64;
+    let max = utilizations.iter().cloned().fold(0.0_f64, f64::max);
+    let rec = recommend(current, &utilizations);
+
+    match rec {
+        Recommendation::Downgrade(to) => {
+            let savings = current.price_usd() - to.price_usd();
+            let proj_avg = project_pct(avg, current, to);
+            let proj_max = project_pct(max, current, to);
+            eprintln!(
+                "▸ Recommend: downgrade to {} — save ~{}/month",
+                to.label(),
+                exchange.format_cost(Some(savings))
+            );
+            eprintln!();
+            eprintln!(
+                "  {}-cycle average was {:.0}% (peak {:.0}%). On {}, this projects to",
+                recent.len(),
+                avg,
+                max,
+                to.label()
+            );
+            eprintln!(
+                "  ~{:.0}% avg (~{:.0}% peak) — comfortable headroom.",
+                proj_avg, proj_max
+            );
+        }
+        Recommendation::Upgrade(to) => {
+            let extra = to.price_usd() - current.price_usd();
+            eprintln!(
+                "▸ Recommend: upgrade to {} — +{}/month",
+                to.label(),
+                exchange.format_cost(Some(extra))
+            );
+            eprintln!();
+            let near_cap = utilizations.iter().filter(|&&x| x >= 95.0).count();
+            if near_cap >= 2 {
+                eprintln!(
+                    "  You've hit ≥95% utilization in {} of the last {} cycles.",
+                    near_cap,
+                    recent.len()
+                );
+            } else {
+                eprintln!(
+                    "  {}-cycle average is {:.0}% — consistently near capacity.",
+                    recent.len(),
+                    avg
+                );
+            }
+            eprintln!(
+                "  {} offers {:.0}× more headroom for the same workload.",
+                to.label(),
+                to.pro_units() / current.pro_units()
+            );
+        }
+        Recommendation::Stay => {
+            eprintln!("▸ Recommend: stay on {}", current.label());
+            eprintln!();
+            eprintln!(
+                "  {}-cycle average was {:.0}% (peak {:.0}%).",
+                recent.len(),
+                avg,
+                max
+            );
+            if let Some(lower) = current.downgrade() {
+                let proj_max = project_pct(max, current, lower);
+                eprintln!(
+                    "  Downgrading to {} would push peak to ~{:.0}% — too tight.",
+                    lower.label(),
+                    proj_max
+                );
+            } else {
+                eprintln!("  Utilization is in a comfortable range for this plan.");
+            }
+        }
+    }
+
+    eprintln!();
+
+    // Cycle table
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    let mut header = vec![Cell::new("Period"), Cell::new(current.label())];
+    if let Some(lower) = current.downgrade() {
+        header.push(Cell::new(format!("on {}", lower.label())));
+        if let Some(lower2) = lower.downgrade() {
+            header.push(Cell::new(format!("on {}", lower2.label())));
+        }
+    }
+    if let Some(higher) = current.upgrade() {
+        header.push(Cell::new(format!("on {}", higher.label())));
+    }
+    table.set_header(header);
+
+    for snap in &recent {
+        let start = snap.cycle_end - Duration::days(7);
+        let period_label = format!(
+            "{} → {}",
+            start.format("%b %-d"),
+            snap.cycle_end.format("%b %-d")
+        );
+        let pct = snap.utilization;
+        let mut row = vec![Cell::new(&period_label), Cell::new(format!("{:.0}%", pct))];
+        if let Some(lower) = current.downgrade() {
+            row.push(Cell::new(format_projection(project_pct(
+                pct, current, lower,
+            ))));
+            if let Some(lower2) = lower.downgrade() {
+                row.push(Cell::new(format_projection(project_pct(
+                    pct, current, lower2,
+                ))));
+            }
+        }
+        if let Some(higher) = current.upgrade() {
+            row.push(Cell::new(format_projection(project_pct(
+                pct, current, higher,
+            ))));
+        }
+        table.add_row(row);
+    }
+
+    println!("{table}");
+
+    eprintln!();
+    eprintln!(
+        "Based on {} completed weekly cycle{}. Seasonal patterns or",
+        recent.len(),
+        if recent.len() == 1 { "" } else { "s" }
+    );
+    eprintln!("upcoming projects may shift your actual needs.");
+
+    Ok(())
+}
+
+fn format_projection(pct: f64) -> String {
+    if pct > 100.0 {
+        format!(">100% (~{:.0}%)", pct)
+    } else {
+        format!("~{:.0}%", pct)
     }
 }
 

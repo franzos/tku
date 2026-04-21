@@ -136,6 +136,9 @@ pub enum Command {
         /// Force live API fetch instead of using estimated usage
         #[arg(long)]
         live: bool,
+        /// Recommend whether to upgrade or downgrade your plan
+        #[arg(long)]
+        plan: bool,
     },
     /// Output JSON for status bars (waybar, i3bar, polybar)
     Bar {
