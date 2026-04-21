@@ -1,3 +1,8 @@
+## [0.1.9] - 2026-04-21
+
+### Added
+- `tku sub --plan` — recommends whether to upgrade, downgrade, or stay on your Claude plan based on recent weekly cycles
+
 ## [0.1.8] - 2026-03-08
 
 ### Added
