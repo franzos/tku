@@ -34,6 +34,7 @@ pub fn bucket_key(record: &UsageRecord, mode: &Command) -> String {
         Command::Bar { .. } => "bar".to_string(),
         Command::Plot { .. } => "plot".to_string(),
         Command::Subscription { .. } => "subscription".to_string(),
+        Command::Account { .. } => "account".to_string(),
     }
 }
 

@@ -1,3 +1,10 @@
+## [0.1.10] - 2026-04-21
+
+### Added
+- `tku account` — stash multiple Claude credentials and swap between them (add/use/list/current/rename/remove)
+- `--account <name>` filter on all reports to scope records to a specific account
+- Per-account subscription snapshot history (separate cycle data per `organizationUuid`)
+
 ## [0.1.9] - 2026-04-21
 
 ### Added

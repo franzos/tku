@@ -51,6 +51,16 @@ tku --breakdown
 # Subscription usage overview (Claude Max/Pro)
 tku sub
 
+# Upgrade/downgrade recommendation based on your usage history
+tku sub --plan
+
+# Manage multiple Claude accounts
+tku account list
+tku account use work
+
+# Filter any report to one account
+tku monthly --account work
+
 # Bar chart of token usage (last 30 days)
 tku plot
 
@@ -72,6 +82,7 @@ tku watch --full
 | `watch` | Live-updating cost monitor (default: compact single line, today only) |
 | `plot` | Inline bar chart of token usage over time |
 | `subscription` (`sub`) | Claude Max/Pro subscription usage overview |
+| `account` | Manage stashed Claude accounts (add/use/list/current/rename/remove) |
 | `bar` | JSON output for status bars (waybar, i3bar, polybar) |
 
 ## Options
@@ -82,6 +93,7 @@ tku watch --full
 | `--to <YYYY-MM-DD>` | End date filter |
 | `--project <name>` | Filter by project name (substring match) |
 | `--tool <name>` | Filter by tool (claude, codex, pi, amp, opencode, gemini, droid, openclaw, kimi) |
+| `--account <name>` | Filter records to a stashed Claude account (see [Accounts](#accounts)) |
 | `--format table\|json` | Output format (default: table) |
 | `--columns <cols>` | Columns to display (see below) |
 | `--breakdown` | Per-model breakdown within each period |
@@ -213,6 +225,71 @@ Claude Pro — 45% used, resets Mar 13, 3:00pm
 ```
 
 Usage % for the current week is fetched live; previous weeks show the last captured snapshot (saved each time you run `tku sub`). Cost is always computed from local session records. Requires Claude Code OAuth credentials at `~/.claude/.credentials.json`.
+
+### Plan recommendation
+
+`tku sub --plan` compares your recent utilization against the equivalent load on adjacent plans and recommends stay / upgrade / downgrade. It uses completed weekly cycles only (at least 2 needed; 4 for stable output) and projects your historical usage onto Pro / Max (5x) / Max (20x) by scaling through Anthropic's Pro-unit capacities.
+
+```bash
+tku sub --plan
+```
+
+```
+Claude Max (20x) — $200.00/month
+
+▸ Recommend: stay on Claude Max (20x)
+
+  4-cycle average was 32% (peak 58%).
+  Downgrading to Claude Max (5x) would push peak to ~232% — too tight.
+
+┌─────────────────┬──────────────────┬────────────────────┬────────────────┐
+│ Period          ┆ Claude Max (20x) ┆ on Claude Max (5x) ┆ on Claude Pro  │
+╞═════════════════╪══════════════════╪════════════════════╪════════════════╡
+│ Mar 20 → Mar 27 ┆ 22%              ┆ ~88%               ┆ >100% (~440%)  │
+│ Mar 27 → Apr 3  ┆ 58%              ┆ >100% (~232%)      ┆ >100% (~1160%) │
+│ Apr 3 → Apr 10  ┆ 31%              ┆ >100% (~124%)      ┆ >100% (~620%)  │
+│ Apr 10 → Apr 17 ┆ 17%              ┆ ~68%               ┆ >100% (~340%)  │
+└─────────────────┴──────────────────┴────────────────────┴────────────────┘
+```
+
+Rules: recommend **upgrade** when ≥2 recent cycles hit ≥95% or 4-cycle average is ≥85%; **downgrade** when the peak cycle projected onto the lower plan stays ≤85%; otherwise **stay**. Plan prices are hardcoded USD ($20 / $100 / $200) but display respects `--currency`. Takes these recommendations with a grain of salt — seasonal patterns or upcoming projects will shift your actual needs.
+
+## Accounts
+
+If you use Claude Code with more than one account (personal + work, say), `tku account` stashes each account's credentials separately and swaps them on demand. Only `~/.claude/.credentials.json` is swapped — skills, `CLAUDE.md`, hooks, and settings stay shared.
+
+```bash
+tku account list                  # show registered accounts
+tku account add work              # stash current creds under "work"
+tku account use work              # swap "work" in
+tku account current               # show what's active
+tku account rename work main
+tku account remove work
+```
+
+```
+Accounts (claude):
+  * work                 org: 653801d5  Claude Max (20x)
+    personal             org: 7b2cd8a9  Claude Max (5x)
+
+* = currently active
+```
+
+**Per-account reports.** Every swap is logged with a timestamp. `--account <name>` on any report filters records to times that account was active:
+
+```bash
+tku monthly --account work
+tku sub --plan --account personal
+```
+
+Stashed credentials live at `~/.config/tku/accounts/claude/<name>.credentials.json` (mode 0600, atomic write). The registry + switch log are at `~/.config/tku/accounts/claude/registry.json`.
+
+**Notes**:
+- On first run with existing Claude Code credentials, tku auto-registers your current account as `default` and backfills attribution to the earliest record timestamp.
+- If you swap credentials outside tku (manual `cp`, `claude /login`, etc.), tku detects the change on next run and appends an "implicit" switch entry with a warning. Attribution in that window is best-effort.
+- After `tku account use`, Claude Code refreshes the access token itself on next launch if needed. No re-login unless the refresh token itself has expired.
+- Claude Code occasionally rewrites `.credentials.json` without the `organizationUuid` field after a token refresh — tku falls back to the latest switch-log entry in that case.
+- Only Claude accounts are supported for now. Codex and others may follow.
 
 ## Status bar integration
 

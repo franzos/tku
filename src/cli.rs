@@ -40,6 +40,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub tool: Option<String>,
 
+    /// Filter records to a specific account (requires prior `tku account add`).
+    /// For now only Claude accounts are supported.
+    #[arg(long, global = true)]
+    pub account: Option<String>,
+
     /// Columns to display (comma-separated).
     /// Use +col to add, -col to remove from defaults, or plain names to replace.
     /// Available: period,input,output,cache_write,cache_read,cost,models,tools,projects
@@ -140,6 +145,11 @@ pub enum Command {
         #[arg(long)]
         plan: bool,
     },
+    /// Manage Claude accounts (stash credentials, swap, attribute usage per account)
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
+    },
     /// Output JSON for status bars (waybar, i3bar, polybar)
     Bar {
         /// Timeframe to summarize
@@ -155,6 +165,22 @@ pub enum Command {
         #[arg(long)]
         critical: Option<f64>,
     },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum AccountAction {
+    /// Register the currently-active credentials under a name
+    Add { name: String },
+    /// Swap in stashed credentials (overwrites ~/.claude/.credentials.json)
+    Use { name: String },
+    /// List registered accounts
+    List,
+    /// Show the currently-active account
+    Current,
+    /// Rename an account
+    Rename { old: String, new: String },
+    /// Remove an account (deletes stashed credentials; switch log is preserved)
+    Remove { name: String },
 }
 
 #[derive(ValueEnum, Debug, Clone, PartialEq)]

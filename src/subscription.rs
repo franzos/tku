@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 
 use anyhow::{bail, Context, Result};
@@ -53,6 +54,8 @@ struct ExtraUsage {
 struct Credentials {
     #[serde(rename = "claudeAiOauth")]
     claude_ai_oauth: Option<OAuthCredentials>,
+    #[serde(rename = "organizationUuid")]
+    organization_uuid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,8 +72,36 @@ struct OAuthCredentials {
 
 // --- Snapshot persistence ---
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+/// Current on-disk format (v2): a version tag plus a map of
+/// `organization_uuid → snapshots`. This lets us keep separate cycle
+/// histories per account when the user swaps credentials.
+#[derive(Debug, Serialize, Deserialize)]
+struct OnDiskStore {
+    version: u32,
+    #[serde(default)]
+    accounts: BTreeMap<String, AccountSnapshots>,
+}
+
+impl OnDiskStore {
+    fn default_v2() -> Self {
+        Self {
+            version: 2,
+            accounts: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct AccountSnapshots {
+    #[serde(default)]
+    snapshots: Vec<CycleSnapshot>,
+}
+
+/// Per-account view that the rest of the module operates on.
+/// Loaded from / saved into a single slot in the on-disk `OnDiskStore`.
+#[derive(Debug, Default)]
 struct SnapshotStore {
+    org_uuid: String,
     snapshots: Vec<CycleSnapshot>,
 }
 
@@ -122,6 +153,19 @@ pub fn run(
         }
     };
 
+    // `organizationUuid` is not always present in `.credentials.json` — Claude
+    // Code drops it when refreshing the access token. Fall back to the most
+    // recent active account in our registry so snapshots don't get stranded
+    // under an "unknown" key.
+    let org_uuid = creds
+        .organization_uuid
+        .or_else(|| {
+            crate::accounts::load_registry("claude")
+                .latest_switch()
+                .map(|s| s.org_uuid.clone())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
     let now_ms = Utc::now().timestamp_millis() as u64;
     if now_ms > oauth.expires_at {
         eprintln!("Claude OAuth token expired. Run Claude Code to refresh your session.");
@@ -132,7 +176,7 @@ pub fn run(
     let claude_records: Vec<&UsageRecord> =
         records.iter().filter(|r| r.provider == "claude").collect();
 
-    let mut store = load_snapshots();
+    let mut store = load_snapshots(&org_uuid);
 
     // Try to determine cycle boundaries from existing snapshots first
     let cached_cycle = current_cycle_from_snapshots(&store);
@@ -479,14 +523,66 @@ fn snapshot_path() -> Option<std::path::PathBuf> {
     ProjectDirs::from("", "", "tku").map(|d| d.cache_dir().join("subscription-claude.json"))
 }
 
-fn load_snapshots() -> SnapshotStore {
+/// Parse the on-disk store, transparently migrating v1 (flat `snapshots`)
+/// to v2 (per-org map). All legacy snapshots are attributed to `migration_org`
+/// — correct for single-account users (99% case); multi-account users who
+/// swapped manually before tku had account support have already-conflated
+/// data that can't be retroactively split.
+fn parse_on_disk(data: &str, migration_org: &str) -> OnDiskStore {
+    #[derive(Deserialize)]
+    struct V2Probe {
+        version: u32,
+        #[serde(default)]
+        accounts: BTreeMap<String, AccountSnapshots>,
+    }
+    if let Ok(v2) = serde_json::from_str::<V2Probe>(data) {
+        if v2.version >= 2 {
+            return OnDiskStore {
+                version: v2.version,
+                accounts: v2.accounts,
+            };
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct V1 {
+        snapshots: Vec<CycleSnapshot>,
+    }
+    if let Ok(v1) = serde_json::from_str::<V1>(data) {
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            migration_org.to_string(),
+            AccountSnapshots {
+                snapshots: v1.snapshots,
+            },
+        );
+        return OnDiskStore {
+            version: 2,
+            accounts,
+        };
+    }
+
+    OnDiskStore::default_v2()
+}
+
+fn load_snapshots(org_uuid: &str) -> SnapshotStore {
     let Some(path) = snapshot_path() else {
-        return SnapshotStore::default();
+        return SnapshotStore {
+            org_uuid: org_uuid.to_string(),
+            snapshots: Vec::new(),
+        };
     };
-    let Ok(data) = fs::read_to_string(&path) else {
-        return SnapshotStore::default();
-    };
-    serde_json::from_str(&data).unwrap_or_default()
+    let data = fs::read_to_string(&path).unwrap_or_default();
+    let on_disk = parse_on_disk(&data, org_uuid);
+    let snapshots = on_disk
+        .accounts
+        .get(org_uuid)
+        .map(|a| a.snapshots.clone())
+        .unwrap_or_default();
+    SnapshotStore {
+        org_uuid: org_uuid.to_string(),
+        snapshots,
+    }
 }
 
 fn save_snapshot(
@@ -519,14 +615,24 @@ fn save_snapshot(
         });
     }
 
-    // Keep only last 12 snapshots
+    // Keep only last 12 snapshots per account
     store.snapshots.sort_by_key(|s| s.cycle_end);
     if store.snapshots.len() > 12 {
         let excess = store.snapshots.len() - 12;
         store.snapshots.drain(..excess);
     }
 
-    if let Ok(data) = serde_json::to_string_pretty(&store) {
+    // Re-read + merge so we don't clobber other accounts' data on write.
+    let existing_data = fs::read_to_string(&path).unwrap_or_default();
+    let mut on_disk = parse_on_disk(&existing_data, &store.org_uuid);
+    on_disk.accounts.insert(
+        store.org_uuid.clone(),
+        AccountSnapshots {
+            snapshots: store.snapshots.clone(),
+        },
+    );
+
+    if let Ok(data) = serde_json::to_string_pretty(&on_disk) {
         let _ = fs::write(&path, data);
     }
 }
@@ -934,4 +1040,97 @@ fn format_overage(extra: Option<&ExtraUsage>, exchange: &ExchangeRate) -> String
         exchange.format_cost(Some(used)),
         exchange.format_cost(Some(limit))
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const V1_SAMPLE: &str = r#"{
+        "snapshots": [
+            {
+                "cycle_end": "2026-04-01T10:00:00Z",
+                "utilization": 18.0,
+                "captured_at": "2026-03-28T10:00:00Z",
+                "cost_at_calibration": 42.5
+            },
+            {
+                "cycle_end": "2026-04-08T10:00:00Z",
+                "utilization": 22.0,
+                "captured_at": "2026-04-05T10:00:00Z",
+                "cost_at_calibration": 51.0
+            }
+        ]
+    }"#;
+
+    const V2_SAMPLE: &str = r#"{
+        "version": 2,
+        "accounts": {
+            "org-aaa": {
+                "snapshots": [
+                    {
+                        "cycle_end": "2026-04-01T10:00:00Z",
+                        "utilization": 18.0,
+                        "captured_at": "2026-03-28T10:00:00Z",
+                        "cost_at_calibration": 42.5
+                    }
+                ]
+            },
+            "org-bbb": {
+                "snapshots": []
+            }
+        }
+    }"#;
+
+    #[test]
+    fn migrates_v1_to_v2_under_current_org() {
+        let store = parse_on_disk(V1_SAMPLE, "org-abc-123");
+        assert_eq!(store.version, 2);
+        assert_eq!(store.accounts.len(), 1);
+        let bucket = store
+            .accounts
+            .get("org-abc-123")
+            .expect("v1 snapshots should migrate under migration_org key");
+        assert_eq!(bucket.snapshots.len(), 2);
+        assert_eq!(bucket.snapshots[0].utilization, 18.0);
+        assert_eq!(bucket.snapshots[0].cost_at_calibration, Some(42.5));
+        assert_eq!(bucket.snapshots[1].utilization, 22.0);
+    }
+
+    #[test]
+    fn preserves_v2_format_ignoring_migration_org() {
+        let store = parse_on_disk(V2_SAMPLE, "org-should-be-ignored");
+        assert_eq!(store.version, 2);
+        assert_eq!(store.accounts.len(), 2);
+        assert!(store.accounts.contains_key("org-aaa"));
+        assert!(store.accounts.contains_key("org-bbb"));
+        assert!(!store.accounts.contains_key("org-should-be-ignored"));
+        assert_eq!(store.accounts["org-aaa"].snapshots.len(), 1);
+        assert_eq!(store.accounts["org-bbb"].snapshots.len(), 0);
+    }
+
+    #[test]
+    fn handles_empty_input() {
+        let store = parse_on_disk("", "org-abc");
+        assert_eq!(store.version, 2);
+        assert!(store.accounts.is_empty());
+    }
+
+    #[test]
+    fn handles_corrupt_input() {
+        let store = parse_on_disk("not valid json", "org-abc");
+        assert_eq!(store.version, 2);
+        assert!(store.accounts.is_empty());
+    }
+
+    #[test]
+    fn migration_roundtrips_through_v2() {
+        // v1 → parse → serialize → parse again should land on identical v2 content.
+        let store = parse_on_disk(V1_SAMPLE, "org-abc-123");
+        let serialized = serde_json::to_string_pretty(&store).expect("serialize");
+        let reparsed = parse_on_disk(&serialized, "org-should-not-matter-now");
+        assert_eq!(reparsed.version, 2);
+        assert_eq!(reparsed.accounts.len(), 1);
+        assert_eq!(reparsed.accounts["org-abc-123"].snapshots.len(), 2);
+    }
 }

@@ -1,3 +1,4 @@
+mod accounts;
 mod aggregate;
 mod cli;
 mod config;
@@ -43,9 +44,59 @@ fn bar_period_label(period: &cli::BarPeriod) -> &'static str {
     }
 }
 
+/// Does this record belong to `account` (per the switch log)?
+/// None account = no filter, always matches.
+fn matches_account(
+    record: &types::UsageRecord,
+    account: Option<&str>,
+    registry: &accounts::Registry,
+) -> bool {
+    let Some(name) = account else {
+        return true;
+    };
+    if record.provider != "claude" {
+        return false;
+    }
+    registry
+        .account_at(record.timestamp)
+        .map(|e| e.name == *name)
+        .unwrap_or(false)
+}
+
+fn apply_account_filter(
+    records: Vec<types::UsageRecord>,
+    account: Option<&str>,
+    registry: &accounts::Registry,
+) -> Vec<types::UsageRecord> {
+    if account.is_none() {
+        return records;
+    }
+    records
+        .into_iter()
+        .filter(|r| matches_account(r, account, registry))
+        .collect()
+}
+
+fn handle_account(action: &cli::AccountAction) -> Result<()> {
+    match action {
+        cli::AccountAction::Add { name } => accounts::add(name),
+        cli::AccountAction::Use { name } => accounts::use_account(name),
+        cli::AccountAction::List => accounts::list(),
+        cli::AccountAction::Current => accounts::current(),
+        cli::AccountAction::Rename { old, new } => accounts::rename(old, new),
+        cli::AccountAction::Remove { name } => accounts::remove(name),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let mode = cli.effective_command();
+
+    // Account management subcommands: handled early; no record scan needed.
+    if let cli::Command::Account { action } = &mode {
+        return handle_account(action);
+    }
+
     let config = config::load_config();
 
     // Merge: CLI > config > default
@@ -133,7 +184,19 @@ fn main() -> Result<()> {
 
     let records = dedup::dedup(all_records);
 
+    // Bootstrap registry + detect implicit credential swaps on every run.
+    // Uses the full (unfiltered) record set so the bootstrap entry can anchor
+    // to the earliest real usage timestamp.
+    let claude_refs: Vec<&types::UsageRecord> =
+        records.iter().filter(|r| r.provider == "claude").collect();
+    let _ = accounts::ensure_current_account(&claude_refs);
+    drop(claude_refs);
+
+    let account_filter = cli.account.clone();
+    let account_registry = accounts::load_registry("claude");
+
     if let cli::Command::Subscription { live, plan } = mode {
+        let records = apply_account_filter(records, account_filter.as_deref(), &account_registry);
         let exchange = exchange::load_exchange_rate(&currency, cli.offline);
         let pricing = pricing::load_pricing(&pricing_source, cli.offline)?;
         return subscription::run(&exchange, &records, &pricing, cli.offline, live, plan);
@@ -159,6 +222,7 @@ fn main() -> Result<()> {
             Some(needle) => r.provider.to_lowercase() == *needle,
             None => true,
         })
+        .filter(|r| matches_account(r, account_filter.as_deref(), &account_registry))
         .collect();
 
     if let cli::Command::Plot {
