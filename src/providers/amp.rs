@@ -4,17 +4,17 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use super::{
-    compute_provider_roots, discover_and_parse_with, discover_files, HomeFallback, Provider,
-    XdgBase,
+    compute_provider_roots, discover_and_parse_with, discover_files, HomeFallback,
+    Provider as ProviderDriver, XdgBase,
 };
 use crate::storage::Storage;
-use crate::types::UsageRecord;
+use crate::types::{Provider, UsageRecord};
 
 pub struct AmpProvider;
 
-impl Provider for AmpProvider {
-    fn name(&self) -> &str {
-        "amp"
+impl ProviderDriver for AmpProvider {
+    fn id(&self) -> Provider {
+        Provider::Amp
     }
 
     fn root_dirs(&self) -> Vec<PathBuf> {
@@ -161,7 +161,7 @@ fn extract_ledger_event(
         .to_string();
 
     Some(UsageRecord {
-        provider: "amp".to_string(),
+        provider: Provider::Amp,
         session_id: thread_id.to_string(),
         timestamp,
         project: "amp".to_string(),

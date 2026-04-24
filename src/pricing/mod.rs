@@ -9,10 +9,11 @@ use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::atomic_write::atomic_write;
 use crate::cost::{ModelPricing, PricingMap};
+use crate::paths;
 
 const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 
@@ -46,7 +47,7 @@ impl PricingMap for CachedPricing {
 }
 
 fn cache_path(source: &PricingSource) -> Option<PathBuf> {
-    ProjectDirs::from("", "", "tku").map(|d| d.cache_dir().join(format!("pricing-{}.json", source)))
+    paths::pricing_cache_file(&source.to_string())
 }
 
 fn cache_is_fresh(path: &PathBuf) -> bool {
@@ -100,12 +101,17 @@ pub fn load_pricing(source: &PricingSource, offline: bool) -> Result<CachedPrici
         fetch_raw(source).context(format!("Failed to fetch pricing data from {}", source))?;
     let map = parse_raw(source, &data).context("Failed to parse pricing data")?;
 
-    // Write cache
+    // Write cache atomically — tmp + fsync + rename, so a concurrent reader
+    // never sees a partial file.
     if let Some(ref path) = cache {
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!("warning: failed to create pricing cache dir: {e}");
+            }
         }
-        let _ = fs::write(path, &data);
+        if let Err(e) = atomic_write(path, data.as_bytes(), None) {
+            eprintln!("warning: failed to save pricing cache: {e}");
+        }
     }
 
     Ok(CachedPricing { map })

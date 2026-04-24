@@ -13,13 +13,15 @@
 //!   tku and append an "implicit" switch entry with a soft warning.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
-use directories::{BaseDirs, ProjectDirs};
+use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::atomic_write::atomic_write;
+use crate::paths;
 use crate::types::UsageRecord;
 
 const TOOL_CLAUDE: &str = "claude";
@@ -106,20 +108,57 @@ impl Registry {
 
 // --- Paths ---
 
-fn accounts_dir(tool: &str) -> Option<PathBuf> {
-    ProjectDirs::from("", "", "tku").map(|d| d.config_dir().join("accounts").join(tool))
-}
-
 fn registry_path(tool: &str) -> Option<PathBuf> {
-    accounts_dir(tool).map(|d| d.join("registry.json"))
+    paths::registry_file(tool)
 }
 
 fn stashed_creds_path(tool: &str, name: &str) -> Option<PathBuf> {
-    accounts_dir(tool).map(|d| d.join(format!("{name}.credentials.json")))
+    paths::accounts_dir(tool).map(|d| d.join(format!("{name}.credentials.json")))
 }
 
 pub fn claude_creds_path() -> Option<PathBuf> {
     BaseDirs::new().map(|b| b.home_dir().join(".claude").join(".credentials.json"))
+}
+
+/// Replace the user's home-dir prefix with `~` for user-visible paths.
+/// Leaves paths outside `$HOME` untouched. Avoids leaking the username in
+/// error messages that may be shared in bug reports.
+pub(crate) fn redact(path: &Path) -> String {
+    if let Some(base) = BaseDirs::new() {
+        let home = base.home_dir();
+        if let Ok(rest) = path.strip_prefix(home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
+/// Create the credential stash parent dir with `0o700` on Unix so siblings
+/// can't enumerate account names. Falls back to plain `create_dir_all` on
+/// non-Unix targets where mode-at-creation isn't expressible.
+fn create_stash_parent(parent: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        match fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(parent)
+        {
+            Ok(()) => Ok(()),
+            // DirBuilder with recursive=true succeeds even if the dir already
+            // exists — we don't need to special-case that here. Propagate
+            // other errors unchanged.
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(parent)
+    }
 }
 
 // --- Registry I/O ---
@@ -140,16 +179,16 @@ pub fn load_registry(tool: &str) -> Registry {
             if let Err(be) = fs::copy(&path, &backup) {
                 eprintln!(
                     "⚠ Account registry at {} is corrupt ({}). Failed to back up: {}. Starting fresh.",
-                    path.display(),
+                    redact(&path),
                     e,
                     be
                 );
             } else {
                 eprintln!(
                     "⚠ Account registry at {} is corrupt ({}). Backed up to {} and starting fresh.",
-                    path.display(),
+                    redact(&path),
                     e,
-                    backup.display()
+                    redact(&backup)
                 );
             }
             Registry::default()
@@ -160,15 +199,16 @@ pub fn load_registry(tool: &str) -> Registry {
 fn save_registry(tool: &str, registry: &Registry) -> Result<()> {
     let path = registry_path(tool).context("cannot determine registry path")?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", redact(parent)))?;
     }
     let data = serde_json::to_string_pretty(registry).context("serialize registry")?;
-    fs::write(&path, data).with_context(|| format!("write {}", path.display()))?;
+    fs::write(&path, data).with_context(|| format!("write {}", redact(&path)))?;
     Ok(())
 }
 
 // --- Credential inspection ---
 
+#[derive(Debug, Clone)]
 struct CredsInfo {
     /// `organizationUuid` when present. Claude Code drops this field after an
     /// access-token refresh, so we treat it as optional.
@@ -203,42 +243,18 @@ fn read_current_claude_creds_info() -> Option<CredsInfo> {
 }
 
 /// Write `data` to `path` atomically with mode 0600 from the moment of
-/// creation (no post-hoc chmod window). Unix: write to `<path>.tmp` via
-/// `O_CREAT|O_EXCL|mode(0o600)`, fsync, then rename into place.
-#[cfg(unix)]
+/// creation (no post-hoc chmod window).
 fn write_secure(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let tmp = path.with_extension("tmp");
-    // Clean any stale tmp from a previous aborted write. `create_new` below
-    // ensures we refuse to follow a symlink planted in the meantime.
-    let _ = fs::remove_file(&tmp);
-
-    {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)
-}
-
-#[cfg(not(unix))]
-fn write_secure(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    fs::write(path, data)
+    atomic_write(path, data, Some(0o600))
 }
 
 fn stash_creds_file(tool: &str, name: &str, src: &std::path::Path) -> Result<PathBuf> {
     let dst = stashed_creds_path(tool, name).context("cannot determine stash path")?;
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        create_stash_parent(parent).with_context(|| format!("create {}", redact(parent)))?;
     }
-    let data = fs::read(src).with_context(|| format!("read {}", src.display()))?;
-    write_secure(&dst, &data).with_context(|| format!("write {}", dst.display()))?;
+    let data = fs::read(src).with_context(|| format!("read {}", redact(src)))?;
+    write_secure(&dst, &data).with_context(|| format!("write {}", redact(&dst)))?;
     Ok(dst)
 }
 
@@ -368,12 +384,16 @@ fn validate_name(name: &str) -> Result<()> {
 pub fn add(name: &str) -> Result<()> {
     validate_name(name)?;
     let src = claude_creds_path().context("cannot find credentials path")?;
-    if !src.exists() {
-        bail!(
-            "No credentials at {}. Run Claude Code at least once first.",
-            src.display()
-        );
-    }
+
+    // Skip TOCTOU `exists()` check — let `fs::read` surface a missing-file
+    // error with context. Avoids a race where the file disappears between
+    // the existence check and the read.
+    let data = fs::read(&src).with_context(|| {
+        format!(
+            "Cannot read credentials at {}. Run Claude Code at least once first.",
+            redact(&src)
+        )
+    })?;
 
     let info = read_current_claude_creds_info()
         .ok_or_else(|| anyhow!("Credentials file is missing or unparseable"))?;
@@ -400,7 +420,12 @@ pub fn add(name: &str) -> Result<()> {
         );
     }
 
-    stash_creds_file(TOOL_CLAUDE, name, &src)?;
+    // Stash a copy of the bytes we already loaded (avoid re-reading the src).
+    let dst = stashed_creds_path(TOOL_CLAUDE, name).context("cannot determine stash path")?;
+    if let Some(parent) = dst.parent() {
+        create_stash_parent(parent).with_context(|| format!("create {}", redact(parent)))?;
+    }
+    write_secure(&dst, &data).with_context(|| format!("write {}", redact(&dst)))?;
 
     let now = Utc::now();
     registry.accounts.push(Account {
@@ -432,15 +457,15 @@ pub fn use_account(name: &str) -> Result<()> {
     if !src.exists() {
         bail!(
             "Stashed credentials missing: {}. Registry is out of sync.",
-            src.display()
+            redact(&src)
         );
     }
     let dst = claude_creds_path().context("cannot find credentials path")?;
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", redact(parent)))?;
     }
-    let data = fs::read(&src).with_context(|| format!("read {}", src.display()))?;
-    write_secure(&dst, &data).with_context(|| format!("write {}", dst.display()))?;
+    let data = fs::read(&src).with_context(|| format!("read {}", redact(&src)))?;
+    write_secure(&dst, &data).with_context(|| format!("write {}", redact(&dst)))?;
 
     let now = Utc::now();
     registry.switch_log.push(SwitchEntry {
@@ -553,7 +578,7 @@ pub fn rename(old: &str, new: &str) -> Result<()> {
     let new_path = stashed_creds_path(TOOL_CLAUDE, new).context("stash path")?;
     if old_path.exists() {
         fs::rename(&old_path, &new_path)
-            .with_context(|| format!("rename {} → {}", old_path.display(), new_path.display()))?;
+            .with_context(|| format!("rename {} → {}", redact(&old_path), redact(&new_path)))?;
     }
 
     for a in registry.accounts.iter_mut() {
@@ -584,7 +609,7 @@ pub fn remove(name: &str) -> Result<()> {
 
     if let Some(path) = stashed_creds_path(TOOL_CLAUDE, name) {
         if path.exists() {
-            fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+            fs::remove_file(&path).with_context(|| format!("remove {}", redact(&path)))?;
         }
     }
 

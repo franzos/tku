@@ -5,17 +5,17 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use super::{
-    compute_provider_roots, discover_and_parse_with, discover_files, HomeFallback, Provider,
-    XdgBase,
+    compute_provider_roots, discover_and_parse_with, discover_files, HomeFallback,
+    Provider as ProviderDriver, XdgBase,
 };
 use crate::storage::Storage;
-use crate::types::UsageRecord;
+use crate::types::{Provider, UsageRecord};
 
 pub struct GeminiProvider;
 
-impl Provider for GeminiProvider {
-    fn name(&self) -> &str {
-        "gemini"
+impl ProviderDriver for GeminiProvider {
+    fn id(&self) -> Provider {
+        Provider::Gemini
     }
 
     fn root_dirs(&self) -> Vec<PathBuf> {
@@ -141,7 +141,7 @@ fn parse_session_file(path: &Path) -> Vec<UsageRecord> {
         let message_id = format!("gemini:{session_id}:{msg_id_str}");
 
         records.push(UsageRecord {
-            provider: "gemini".to_string(),
+            provider: Provider::Gemini,
             session_id: session_id.clone(),
             timestamp,
             project: project.clone(),

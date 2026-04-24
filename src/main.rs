@@ -1,12 +1,15 @@
 mod accounts;
 mod aggregate;
+mod atomic_write;
 mod cli;
 mod config;
 mod cost;
 mod dedup;
 mod exchange;
 mod graph;
+mod http;
 mod output;
+mod paths;
 mod pricing;
 mod providers;
 mod storage;
@@ -15,6 +18,7 @@ mod types;
 mod watch;
 
 use std::io::Write;
+use std::str::FromStr;
 
 use anyhow::{bail, Result};
 use chrono::Datelike;
@@ -22,6 +26,7 @@ use clap::Parser;
 
 use cli::Cli;
 use cost::PricingMap;
+use types::Provider;
 
 fn bar_date_range(period: &cli::BarPeriod) -> (chrono::NaiveDate, chrono::NaiveDate) {
     let today = chrono::Local::now().date_naive();
@@ -54,7 +59,7 @@ fn matches_account(
     let Some(name) = account else {
         return true;
     };
-    if record.provider != "claude" {
+    if record.provider != Provider::Claude {
         return false;
     }
     registry
@@ -159,6 +164,8 @@ fn main() -> Result<()> {
     let mut store = storage::default_storage();
 
     let show_progress = !cli.cli && !is_bar && !is_plot && !is_sub;
+    // Throttle is applied inside providers::discover_and_parse_with so the
+    // per-file hot path stays tight. This callback itself can be cheap.
     let progress_cb = |current: usize, total: usize| {
         eprint!("\x1b[2K\rScanning sessions... {current}/{total}");
         let _ = std::io::stderr().flush();
@@ -187,8 +194,10 @@ fn main() -> Result<()> {
     // Bootstrap registry + detect implicit credential swaps on every run.
     // Uses the full (unfiltered) record set so the bootstrap entry can anchor
     // to the earliest real usage timestamp.
-    let claude_refs: Vec<&types::UsageRecord> =
-        records.iter().filter(|r| r.provider == "claude").collect();
+    let claude_refs: Vec<&types::UsageRecord> = records
+        .iter()
+        .filter(|r| r.provider == Provider::Claude)
+        .collect();
     let _ = accounts::ensure_current_account(&claude_refs);
     drop(claude_refs);
 
@@ -203,7 +212,17 @@ fn main() -> Result<()> {
     }
 
     let proj_needle = cli.project.as_ref().map(|p| p.to_lowercase());
-    let tool_needle = cli.tool.as_ref().map(|t| t.to_lowercase());
+    // Parse the `--tool` string into a typed Provider up front. Three states:
+    //   None           → no --tool flag, keep all records
+    //   Some(Ok(p))    → filter to this provider
+    //   Some(Err(()))  → --tool was set but name doesn't map to a Provider,
+    //                    so no records should match (loud-fail alternative
+    //                    would be bail! here; we keep the pre-refactor
+    //                    silent-drop semantics).
+    let tool_needle: Option<Result<Provider, ()>> = cli
+        .tool
+        .as_ref()
+        .map(|t| Provider::from_str(t).map_err(|_| ()));
 
     let records: Vec<_> = records
         .into_iter()
@@ -218,9 +237,10 @@ fn main() -> Result<()> {
             Some(needle) => r.project.to_lowercase().contains(needle),
             None => true,
         })
-        .filter(|r| match &tool_needle {
-            Some(needle) => r.provider.to_lowercase() == *needle,
+        .filter(|r| match tool_needle {
             None => true,
+            Some(Ok(needle)) => r.provider == needle,
+            Some(Err(())) => false,
         })
         .filter(|r| matches_account(r, account_filter.as_deref(), &account_registry))
         .collect();

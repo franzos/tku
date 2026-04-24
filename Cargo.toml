@@ -1,6 +1,6 @@
 [package]
 name = "tku"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 authors = ["Franz Geffke <mail@gofranz.com>"]
 license = "GPL-3.0-only"
@@ -39,3 +39,13 @@ ureq = { version = "3", features = ["rustls"] }
 ratatui = "0.29"
 crossterm = "0.28"
 walkdir = "2"
+
+# Trim the release binary and speed up cold-start. `lto = "thin"` +
+# codegen-units = 1 gives noticeably better inlining across crate boundaries
+# without the full-LTO build-time cost. `strip = true` drops debug symbols
+# from the shipped artifact. Deliberately not setting `panic = "abort"` —
+# that changes unwind semantics and we use anyhow throughout.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -10,7 +10,8 @@ const LITELLM_URL: &str =
 const MAX_RESPONSE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 
 pub fn fetch_litellm_json() -> Result<String> {
-    let body = ureq::get(LITELLM_URL)
+    let body = crate::http::agent()
+        .get(LITELLM_URL)
         .call()?
         .body_mut()
         .with_config()

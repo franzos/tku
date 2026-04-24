@@ -1,4 +1,3 @@
-#[cfg(not(feature = "sqlite"))]
 pub mod bitcode_store;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_store;
@@ -39,7 +38,13 @@ pub trait Storage {
 pub fn default_storage() -> Box<dyn Storage> {
     #[cfg(feature = "sqlite")]
     {
-        Box::new(sqlite_store::SqliteStorage::open())
+        match sqlite_store::SqliteStorage::open() {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                eprintln!("warning: sqlite cache unavailable ({e}); falling back to bitcode cache");
+                Box::new(bitcode_store::BitcodeStorage::new())
+            }
+        }
     }
     #[cfg(not(feature = "sqlite"))]
     {

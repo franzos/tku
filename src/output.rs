@@ -101,6 +101,38 @@ pub fn print_table(
     println!("{table}");
 }
 
+/// Waybar CSS class for the bar widget. Stringified for JSON consumers
+/// (waybar keys CSS rules on these literal names; do not rename).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BarClass {
+    Normal,
+    Warning,
+    Critical,
+}
+
+impl BarClass {
+    fn as_str(&self) -> &'static str {
+        match self {
+            BarClass::Normal => "normal",
+            BarClass::Warning => "warning",
+            BarClass::Critical => "critical",
+        }
+    }
+
+    /// Pick a class from a cost and its optional warn/critical thresholds.
+    /// Critical wins over warning; either threshold being `None` disables it.
+    /// Matches waybar's semantics: `>=` on the threshold trips the class.
+    fn from_cost(cost: f64, warn: Option<f64>, critical: Option<f64>) -> Self {
+        if critical.is_some_and(|t| cost >= t) {
+            BarClass::Critical
+        } else if warn.is_some_and(|t| cost >= t) {
+            BarClass::Warning
+        } else {
+            BarClass::Normal
+        }
+    }
+}
+
 pub fn print_bar(
     bucket: Option<&AggregatedBucket>,
     template: &str,
@@ -142,13 +174,7 @@ pub fn print_bar(
         ));
     }
 
-    let class = if critical.is_some_and(|t| converted_cost >= t) {
-        "critical"
-    } else if warn.is_some_and(|t| converted_cost >= t) {
-        "warning"
-    } else {
-        "normal"
-    };
+    let class = BarClass::from_cost(converted_cost, warn, critical).as_str();
 
     let output = serde_json::json!({
         "text": text,
@@ -199,4 +225,66 @@ pub fn print_json(buckets: &BTreeMap<String, AggregatedBucket>, exchange: &Excha
         "{}",
         serde_json::to_string_pretty(&json).unwrap_or_default()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bar_class_as_str_is_stable() {
+        // These literal names are keyed by waybar CSS — renaming breaks users.
+        assert_eq!(BarClass::Normal.as_str(), "normal");
+        assert_eq!(BarClass::Warning.as_str(), "warning");
+        assert_eq!(BarClass::Critical.as_str(), "critical");
+    }
+
+    #[test]
+    fn from_cost_picks_critical_when_over_critical_threshold() {
+        assert_eq!(
+            BarClass::from_cost(10.0, Some(5.0), Some(10.0)),
+            BarClass::Critical
+        );
+        assert_eq!(
+            BarClass::from_cost(11.0, Some(5.0), Some(10.0)),
+            BarClass::Critical
+        );
+    }
+
+    #[test]
+    fn from_cost_picks_warning_when_over_warn_but_under_critical() {
+        assert_eq!(
+            BarClass::from_cost(5.0, Some(5.0), Some(10.0)),
+            BarClass::Warning
+        );
+        assert_eq!(
+            BarClass::from_cost(7.5, Some(5.0), Some(10.0)),
+            BarClass::Warning
+        );
+    }
+
+    #[test]
+    fn from_cost_picks_normal_under_both_thresholds() {
+        assert_eq!(
+            BarClass::from_cost(4.99, Some(5.0), Some(10.0)),
+            BarClass::Normal
+        );
+        assert_eq!(BarClass::from_cost(0.0, None, None), BarClass::Normal);
+    }
+
+    #[test]
+    fn from_cost_handles_missing_thresholds() {
+        // critical alone
+        assert_eq!(
+            BarClass::from_cost(100.0, None, Some(10.0)),
+            BarClass::Critical
+        );
+        // warn alone
+        assert_eq!(
+            BarClass::from_cost(100.0, Some(10.0), None),
+            BarClass::Warning
+        );
+        // neither
+        assert_eq!(BarClass::from_cost(100.0, None, None), BarClass::Normal);
+    }
 }

@@ -1,3 +1,20 @@
+## [0.1.11] - 2026-04-24
+
+### Changed
+- Smaller, faster release binary (`lto = "thin"`, `strip = true`, single codegen unit)
+- Provider is now a typed enum; unknown `--tool` names drop to zero matches instead of matching everything
+- Progress output throttled — no more TTY flush storms on warm runs
+- Centralised path resolution with `TKU_HOME` override for isolated runs
+
+### Fixed
+- Atomic cache and credential writes (tmp + fsync + rename)
+- Bounded JSONL reads (500 MB file / 16 MB line cap)
+- Bitcode cache size guard falls back to re-parsing on corruption
+- Credential stash dir created `0o700` on Unix
+- Sqlite open failure falls back to bitcode cache instead of panicking
+- Shared HTTPS-only `ureq` agent with bounded redirects
+- Home-dir prefix redacted in user-visible paths
+
 ## [0.1.10] - 2026-04-21
 
 ### Added

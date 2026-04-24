@@ -4,17 +4,17 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 
 use super::{
-    compute_provider_roots, discover_and_parse_with, discover_files, HomeFallback, Provider,
-    XdgBase,
+    compute_provider_roots, discover_and_parse_with, discover_files, HomeFallback,
+    Provider as ProviderDriver, XdgBase,
 };
 use crate::storage::Storage;
-use crate::types::UsageRecord;
+use crate::types::{Provider, UsageRecord};
 
 pub struct CodexProvider;
 
-impl Provider for CodexProvider {
-    fn name(&self) -> &str {
-        "codex"
+impl ProviderDriver for CodexProvider {
+    fn id(&self) -> Provider {
+        Provider::Codex
     }
 
     fn root_dirs(&self) -> Vec<PathBuf> {
@@ -261,7 +261,7 @@ fn extract_token_event(
     let message_id = format!("codex:{session_id}:{timestamp}:{input}:{output}");
 
     Some(UsageRecord {
-        provider: "codex".to_string(),
+        provider: Provider::Codex,
         session_id: session_id.to_string(),
         timestamp,
         project: project.to_string(),

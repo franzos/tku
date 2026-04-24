@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
-use directories::ProjectDirs;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
 use super::Storage;
-use crate::types::UsageRecord;
+use crate::paths;
+use crate::types::{Provider, UsageRecord};
 
 const SCHEMA_VERSION: i64 = 2;
 
@@ -13,36 +15,32 @@ pub struct SqliteStorage {
     conn: Connection,
 }
 
-fn db_path() -> Option<PathBuf> {
-    ProjectDirs::from("", "", "tku").map(|d| d.cache_dir().join("records.db"))
-}
-
 impl SqliteStorage {
-    pub fn open() -> Self {
-        let conn = match db_path() {
+    pub fn open() -> Result<Self> {
+        let conn = match paths::sqlite_db_file() {
             Some(path) => {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                Connection::open(&path).expect("Failed to open sqlite database")
+                Connection::open(&path).context("Failed to open sqlite database")?
             }
-            None => Connection::open_in_memory().expect("Failed to open in-memory sqlite"),
+            None => Connection::open_in_memory().context("Failed to open in-memory sqlite")?,
         };
 
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
-            .expect("Failed to set sqlite pragmas");
+            .context("Failed to set sqlite pragmas")?;
 
         // Migrate if schema is outdated (this is a cache — safe to drop and recreate)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap_or(0);
+            .context("Failed to query sqlite schema version")?;
 
         if version < SCHEMA_VERSION {
             conn.execute_batch(
                 "DROP TABLE IF EXISTS records;
                  DROP TABLE IF EXISTS files;",
             )
-            .expect("Failed to drop old tables");
+            .context("Failed to drop old tables")?;
         }
 
         conn.execute_batch(&format!(
@@ -74,9 +72,9 @@ impl SqliteStorage {
 
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))
-        .expect("Failed to initialize sqlite schema");
+        .context("Failed to initialize sqlite schema")?;
 
-        Self { conn }
+        Ok(Self { conn })
     }
 }
 
@@ -132,28 +130,38 @@ impl Storage for SqliteStorage {
         }
         let file_id = tx.last_insert_rowid();
 
-        for r in &records {
-            if let Err(e) = tx.execute(
-                "INSERT INTO records (
-                    file_id, session_id, timestamp, project, model,
-                    message_id, request_id, input_tokens, output_tokens,
-                    cache_creation_input_tokens, cache_read_input_tokens
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    file_id,
-                    r.session_id,
-                    r.timestamp.to_rfc3339(),
-                    r.project,
-                    r.model,
-                    r.message_id,
-                    r.request_id,
-                    r.input_tokens as i64,
-                    r.output_tokens as i64,
-                    r.cache_creation_input_tokens as i64,
-                    r.cache_read_input_tokens as i64,
-                ],
-            ) {
-                eprintln!("tku: sqlite insert record failed: {e}");
+        // Prepare the per-row insert once and reuse it across `records`.
+        // `prepare_cached` additionally keeps the compiled statement around for
+        // the next `insert()` call on this connection — matters when many
+        // provider files land in the same process run.
+        match tx.prepare_cached(
+            "INSERT INTO records (
+                file_id, session_id, timestamp, project, model,
+                message_id, request_id, input_tokens, output_tokens,
+                cache_creation_input_tokens, cache_read_input_tokens
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        ) {
+            Ok(mut stmt) => {
+                for r in &records {
+                    if let Err(e) = stmt.execute(params![
+                        file_id,
+                        r.session_id,
+                        r.timestamp.to_rfc3339(),
+                        r.project,
+                        r.model,
+                        r.message_id,
+                        r.request_id,
+                        r.input_tokens as i64,
+                        r.output_tokens as i64,
+                        r.cache_creation_input_tokens as i64,
+                        r.cache_read_input_tokens as i64,
+                    ]) {
+                        eprintln!("tku: sqlite insert record failed: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("tku: sqlite prepare_cached failed: {e}");
             }
         }
 
@@ -229,8 +237,19 @@ impl Storage for SqliteStorage {
                     Box::new(e),
                 )
             })?;
+            let provider_str: String = row.get(0)?;
+            let provider = Provider::from_str(&provider_str).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    )),
+                )
+            })?;
             Ok(UsageRecord {
-                provider: row.get(0)?,
+                provider,
                 session_id: row.get(1)?,
                 timestamp,
                 project: row.get(3)?,

@@ -9,7 +9,8 @@ const LLMPRICES_URL: &str = "https://www.llm-prices.com/current-v1.json";
 const MAX_RESPONSE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 
 pub fn fetch_llmprices_json() -> Result<String> {
-    let body = ureq::get(LLMPRICES_URL)
+    let body = crate::http::agent()
+        .get(LLMPRICES_URL)
         .call()?
         .body_mut()
         .with_config()

@@ -4,17 +4,17 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::{
-    compute_provider_roots, discover_and_parse_with, discover_files, HomeFallback, Provider,
-    XdgBase,
+    compute_provider_roots, discover_and_parse_with, discover_files_with, DiscoveredFile,
+    HomeFallback, Provider as ProviderDriver, XdgBase,
 };
 use crate::storage::Storage;
-use crate::types::UsageRecord;
+use crate::types::{Provider, UsageRecord};
 
 pub struct OpenCodeProvider;
 
-impl Provider for OpenCodeProvider {
-    fn name(&self) -> &str {
-        "opencode"
+impl ProviderDriver for OpenCodeProvider {
+    fn id(&self) -> Provider {
+        Provider::OpenCode
     }
 
     fn root_dirs(&self) -> Vec<PathBuf> {
@@ -29,8 +29,11 @@ impl Provider for OpenCodeProvider {
     ) {
         let roots = compute_roots();
 
-        // Pre-load session metadata for project resolution
-        let session_projects = load_session_projects(&roots);
+        // Single walk per storage root. We want the session/*.json to seed the
+        // sessionID → project map, and the message/*.json as parse targets;
+        // classify by parent dir name rather than walking both subtrees twice.
+        let (session_files, message_files) = discover_session_and_message(&roots);
+        let session_projects = build_session_projects(&session_files);
 
         // Parse SQLite db(s), collect all message IDs for dedup against JSON files
         let (sqlite_records, sqlite_db_paths) = collect_sqlite_records(&roots, &session_projects);
@@ -43,18 +46,17 @@ impl Provider for OpenCodeProvider {
         #[cfg(feature = "sqlite")]
         for db_path in &sqlite_db_paths {
             if let Some(df) = super::discovered_file(db_path) {
-                if !storage.is_cached("opencode", db_path, df.mtime, df.size) {
+                if !storage.is_cached(self.name(), db_path, df.mtime, df.size) {
                     let db_records = sqlite_records.clone();
-                    storage.insert("opencode", db_path, df.mtime, df.size, db_records);
+                    storage.insert(self.name(), db_path, df.mtime, df.size, db_records);
                 }
             }
         }
 
         let _ = &sqlite_db_paths; // suppress unused warning without sqlite
 
-        let message_roots: Vec<PathBuf> = roots.iter().map(|r| r.join("message")).collect();
         #[allow(unused_mut)]
-        let mut files = discover_files(&message_roots, "json");
+        let mut files = message_files;
 
         // Include db paths in the file list so prune doesn't remove them
         #[cfg(feature = "sqlite")]
@@ -80,6 +82,54 @@ impl Provider for OpenCodeProvider {
             }
         });
     }
+}
+
+/// Walk each storage root once and split `*.json` files into `session/` and
+/// `message/` buckets by parent directory name.
+fn discover_session_and_message(roots: &[PathBuf]) -> (Vec<DiscoveredFile>, Vec<DiscoveredFile>) {
+    // We walk via discover_files_with so the size/mtime metadata pickup and the
+    // follow_links(false) policy stay in one place.
+    let mut session = Vec::new();
+    let mut message = Vec::new();
+    let all = discover_files_with(roots, |p| p.extension().is_some_and(|e| e == "json"));
+    for df in all {
+        match classify_storage_file(&df.path) {
+            Some(StorageKind::Session) => session.push(df),
+            Some(StorageKind::Message) => message.push(df),
+            None => {}
+        }
+    }
+    (session, message)
+}
+
+enum StorageKind {
+    Session,
+    Message,
+}
+
+/// Classify `.../<root>/session/...json` vs `.../<root>/message/...json`.
+/// The opencode layout nests one level deep under each bucket (session IDs
+/// live in subdirs), so we walk up ancestors until we hit `session` or
+/// `message`.
+fn classify_storage_file(path: &Path) -> Option<StorageKind> {
+    for ancestor in path.ancestors() {
+        match ancestor.file_name().and_then(|n| n.to_str()) {
+            Some("session") => return Some(StorageKind::Session),
+            Some("message") => return Some(StorageKind::Message),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn build_session_projects(session_files: &[DiscoveredFile]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for f in session_files {
+        if let Some((session_id, project)) = parse_session_file(&f.path) {
+            map.insert(session_id, project);
+        }
+    }
+    map
 }
 
 /// Always parse SQLite dbs to get records + paths (for dedup and prune).
@@ -127,27 +177,6 @@ fn compute_roots() -> Vec<PathBuf> {
             subpaths: &["opencode", "storage"],
         }],
     )
-}
-
-/// Load all session files and build a sessionID -> project name map.
-fn load_session_projects(storage_roots: &[PathBuf]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-
-    for root in storage_roots {
-        let session_dir = root.join("session");
-        if !session_dir.exists() {
-            continue;
-        }
-
-        let files = discover_files(&[session_dir], "json");
-        for file in files {
-            if let Some((session_id, project)) = parse_session_file(&file.path) {
-                map.insert(session_id, project);
-            }
-        }
-    }
-
-    map
 }
 
 fn parse_session_file(path: &Path) -> Option<(String, String)> {
@@ -274,7 +303,7 @@ fn extract_record_from_data(
     }
 
     Some(UsageRecord {
-        provider: "opencode".to_string(),
+        provider: Provider::OpenCode,
         session_id: session_id.to_string(),
         timestamp,
         project: String::new(), // filled in by caller
@@ -335,7 +364,7 @@ fn extract_record(
         .unwrap_or_else(|| "opencode".to_string());
 
     Some(UsageRecord {
-        provider: "opencode".to_string(),
+        provider: Provider::OpenCode,
         session_id,
         timestamp,
         project,

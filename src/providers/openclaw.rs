@@ -4,17 +4,17 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::{
-    compute_provider_roots, discover_and_parse_with, discover_files, HomeFallback, Provider,
-    XdgBase,
+    compute_provider_roots, discover_and_parse_with, discover_files, HomeFallback,
+    Provider as ProviderDriver, XdgBase,
 };
 use crate::storage::Storage;
-use crate::types::UsageRecord;
+use crate::types::{Provider, UsageRecord};
 
 pub struct OpenClawProvider;
 
-impl Provider for OpenClawProvider {
-    fn name(&self) -> &str {
-        "openclaw"
+impl ProviderDriver for OpenClawProvider {
+    fn id(&self) -> Provider {
+        Provider::OpenClaw
     }
 
     fn root_dirs(&self) -> Vec<PathBuf> {
@@ -169,7 +169,7 @@ fn extract_message(
     let message_id = format!("openclaw:{session_id}:{timestamp}:{input}:{output}");
 
     Some(UsageRecord {
-        provider: "openclaw".to_string(),
+        provider: Provider::OpenClaw,
         session_id: session_id.to_string(),
         timestamp,
         project: project.to_string(),

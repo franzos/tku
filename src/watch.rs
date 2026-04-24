@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -9,6 +10,7 @@ use crate::aggregate::short_model_name;
 use crate::cli::{self, Command};
 use crate::cost::PricingMap;
 use crate::exchange::ExchangeRate;
+use crate::types::Provider;
 
 pub fn run(
     full: bool,
@@ -91,7 +93,12 @@ fn scan_and_filter(
     let records = crate::dedup::dedup(all_records);
 
     let proj_needle = cli.project.as_ref().map(|p| p.to_lowercase());
-    let tool_needle = cli.tool.as_ref().map(|t| t.to_lowercase());
+    // Matches main.rs: three-state filter so an unknown --tool name drops all
+    // records rather than matching everything.
+    let tool_needle: Option<Result<Provider, ()>> = cli
+        .tool
+        .as_ref()
+        .map(|t| Provider::from_str(t).map_err(|_| ()));
 
     records
         .into_iter()
@@ -106,9 +113,10 @@ fn scan_and_filter(
             Some(needle) => r.project.to_lowercase().contains(needle),
             None => true,
         })
-        .filter(|r| match &tool_needle {
-            Some(needle) => r.provider.to_lowercase() == *needle,
+        .filter(|r| match tool_needle {
             None => true,
+            Some(Ok(needle)) => r.provider == needle,
+            Some(Err(())) => false,
         })
         .collect()
 }

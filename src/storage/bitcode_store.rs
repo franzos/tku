@@ -2,11 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 use super::Storage;
+use crate::atomic_write::atomic_write;
+use crate::paths;
 use crate::types::UsageRecord;
+
+/// Hard ceiling on bitcode cache file size. Matches the JSONL provider cap:
+/// a cache larger than this is almost certainly corrupted or hostile, and
+/// loading it into memory would OOM the process. Graceful-degrade: treat
+/// as if no cache exists and re-parse from source.
+const MAX_CACHE_BYTES: u64 = 500 * 1024 * 1024;
 
 /// One file per provider: `~/.cache/tku/{provider}.bin`
 ///
@@ -30,10 +37,6 @@ struct CachedFile {
     records: Vec<UsageRecord>,
 }
 
-fn cache_dir() -> Option<PathBuf> {
-    ProjectDirs::from("", "", "tku").map(|d| d.cache_dir().to_path_buf())
-}
-
 impl BitcodeStorage {
     pub fn new() -> Self {
         Self {
@@ -46,10 +49,20 @@ impl BitcodeStorage {
         self.providers
             .entry(provider.to_string())
             .or_insert_with(|| {
-                let Some(dir) = cache_dir() else {
+                let Some(path) = paths::bitcode_cache_file(provider) else {
                     return ProviderCache::default();
                 };
-                let path = dir.join(format!("{provider}.bin"));
+                // Pre-flight size check. `fs::read` allocates a Vec sized to
+                // the file; a corrupted/hostile multi-GB file would OOM.
+                if let Ok(meta) = fs::metadata(&path) {
+                    if meta.len() > MAX_CACHE_BYTES {
+                        eprintln!(
+                            "tku: skipping oversize {provider} cache ({} bytes); will re-parse from source",
+                            meta.len()
+                        );
+                        return ProviderCache::default();
+                    }
+                }
                 let Ok(data) = fs::read(&path) else {
                     return ProviderCache::default();
                 };
@@ -102,7 +115,9 @@ impl Storage for BitcodeStorage {
     }
 
     fn flush(&self) {
-        let Some(dir) = cache_dir() else { return };
+        let Some(dir) = paths::cache_dir() else {
+            return;
+        };
         if let Err(e) = fs::create_dir_all(&dir) {
             eprintln!("tku: failed to create cache dir: {e}");
             return;
@@ -119,7 +134,10 @@ impl Storage for BitcodeStorage {
                     continue;
                 }
             };
-            if let Err(e) = fs::write(dir.join(format!("{name}.bin")), data) {
+            let Some(path) = paths::bitcode_cache_file(name) else {
+                continue;
+            };
+            if let Err(e) = atomic_write(&path, &data, None) {
                 eprintln!("tku: failed to write {name} cache: {e}");
             }
         }

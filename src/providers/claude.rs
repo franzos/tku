@@ -4,16 +4,16 @@ use chrono::{DateTime, Utc};
 
 use super::{
     compute_provider_roots, discover_and_parse_with, discover_files, parse_jsonl_lines,
-    HomeFallback, Provider, XdgBase,
+    HomeFallback, Provider as ProviderDriver, XdgBase,
 };
 use crate::storage::Storage;
-use crate::types::UsageRecord;
+use crate::types::{Provider, UsageRecord};
 
 pub struct ClaudeProvider;
 
-impl Provider for ClaudeProvider {
-    fn name(&self) -> &str {
-        "claude"
+impl ProviderDriver for ClaudeProvider {
+    fn id(&self) -> Provider {
+        Provider::Claude
     }
 
     fn root_dirs(&self) -> Vec<PathBuf> {
@@ -174,7 +174,7 @@ fn extract_record(
         .unwrap_or_else(|| project.to_string());
 
     Some(UsageRecord {
-        provider: "claude".to_string(),
+        provider: Provider::Claude,
         session_id: session_id.to_string(),
         timestamp,
         project,

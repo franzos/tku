@@ -4,16 +4,16 @@ use chrono::{DateTime, Utc};
 
 use super::{
     compute_provider_roots, discover_and_parse_with, discover_files, parse_jsonl_lines,
-    HomeFallback, Provider, XdgBase,
+    HomeFallback, Provider as ProviderDriver, XdgBase,
 };
 use crate::storage::Storage;
-use crate::types::UsageRecord;
+use crate::types::{Provider, UsageRecord};
 
 pub struct PiProvider;
 
-impl Provider for PiProvider {
-    fn name(&self) -> &str {
-        "pi"
+impl ProviderDriver for PiProvider {
+    fn id(&self) -> Provider {
+        Provider::Pi
     }
 
     fn root_dirs(&self) -> Vec<PathBuf> {
@@ -129,7 +129,7 @@ fn extract_record(
     let message_id = format!("pi:{session_id}:{timestamp}:{input}:{output}");
 
     Some(UsageRecord {
-        provider: "pi".to_string(),
+        provider: Provider::Pi,
         session_id: session_id.to_string(),
         timestamp,
         project: project.to_string(),

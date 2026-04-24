@@ -5,17 +5,17 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use super::{
-    compute_provider_roots, discover_and_parse_with, discover_files, HomeFallback, Provider,
-    XdgBase,
+    compute_provider_roots, discover_and_parse_with, discover_files_with, HomeFallback,
+    Provider as ProviderDriver, XdgBase,
 };
 use crate::storage::Storage;
-use crate::types::UsageRecord;
+use crate::types::{Provider, UsageRecord};
 
 pub struct DroidProvider;
 
-impl Provider for DroidProvider {
-    fn name(&self) -> &str {
-        "droid"
+impl ProviderDriver for DroidProvider {
+    fn id(&self) -> Provider {
+        Provider::Droid
     }
 
     fn root_dirs(&self) -> Vec<PathBuf> {
@@ -29,22 +29,17 @@ impl Provider for DroidProvider {
         prune: bool,
     ) {
         let roots = compute_roots();
-        let files = discover_files(&roots, "json");
-
-        // Only process *.settings.json files
-        let settings_files: Vec<_> = files
-            .into_iter()
-            .filter(|f| {
-                f.path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with(".settings.json"))
-            })
-            .collect();
+        // Filter at walk time instead of post-processing the full json set —
+        // droid only ever cares about `*.settings.json`.
+        let files = discover_files_with(&roots, |p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".settings.json"))
+        });
 
         discover_and_parse_with(
             self.name(),
-            settings_files,
+            files,
             storage,
             progress,
             prune,
@@ -172,7 +167,7 @@ fn parse_settings_file(path: &Path) -> Vec<UsageRecord> {
     let message_id = format!("droid:{session_id}:{timestamp}:{input}:{output}");
 
     vec![UsageRecord {
-        provider: "droid".to_string(),
+        provider: Provider::Droid,
         session_id,
         timestamp,
         project: "droid".to_string(),

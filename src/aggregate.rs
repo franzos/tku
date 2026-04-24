@@ -71,7 +71,9 @@ pub fn aggregate(
         );
 
         state.projects.insert(r.project.clone());
-        state.tools.insert(r.provider.clone());
+        // `tools` is a Vec<String> on AggregatedBucket for display; convert
+        // from the typed enum at insertion time.
+        state.tools.insert(r.provider.as_str().to_string());
 
         // Per-model detail
         let detail = state

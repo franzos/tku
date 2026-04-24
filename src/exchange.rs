@@ -2,7 +2,9 @@ use std::fs;
 use std::time::SystemTime;
 
 use anyhow::Result;
-use directories::ProjectDirs;
+
+use crate::atomic_write::atomic_write;
+use crate::paths;
 
 const CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
@@ -59,10 +61,6 @@ fn currency_symbol(code: &str) -> &str {
     }
 }
 
-fn cache_path() -> Option<std::path::PathBuf> {
-    ProjectDirs::from("", "", "tku").map(|d| d.cache_dir().join("exchange.json"))
-}
-
 fn cache_is_fresh(path: &std::path::PathBuf) -> bool {
     let Ok(meta) = fs::metadata(path) else {
         return false;
@@ -86,7 +84,8 @@ fn fetch_rate(currency: &str) -> Result<f64> {
         "https://api.frankfurter.dev/v1/latest?base=USD&symbols={}",
         currency
     );
-    let body = ureq::get(&url)
+    let body = crate::http::agent()
+        .get(&url)
         .call()?
         .body_mut()
         .with_config()
@@ -106,7 +105,7 @@ struct CachedRate {
 }
 
 fn load_cached_rate(currency: &str, require_fresh: bool) -> Option<f64> {
-    let path = cache_path()?;
+    let path = paths::exchange_cache_file()?;
     if require_fresh && !cache_is_fresh(&path) {
         return None;
     }
@@ -120,16 +119,27 @@ fn load_cached_rate(currency: &str, require_fresh: bool) -> Option<f64> {
 }
 
 fn save_cached_rate(currency: &str, rate: f64) {
-    let Some(path) = cache_path() else { return };
+    let Some(path) = paths::exchange_cache_file() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!("warning: failed to create exchange cache dir: {e}");
+        }
     }
     let cached = CachedRate {
         code: currency.to_string(),
         rate,
     };
-    if let Ok(data) = serde_json::to_string(&cached) {
-        let _ = fs::write(&path, data);
+    match serde_json::to_string(&cached) {
+        Ok(data) => {
+            if let Err(e) = atomic_write(&path, data.as_bytes(), None) {
+                eprintln!("warning: failed to save exchange rate cache: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: failed to serialize exchange rate: {e}");
+        }
     }
 }
 

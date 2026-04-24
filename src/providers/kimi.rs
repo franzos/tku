@@ -4,16 +4,16 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use super::{
     compute_provider_roots, discover_and_parse_with, discover_files, parse_jsonl_lines,
-    HomeFallback, Provider, XdgBase,
+    HomeFallback, Provider as ProviderDriver, XdgBase,
 };
 use crate::storage::Storage;
-use crate::types::UsageRecord;
+use crate::types::{Provider, UsageRecord};
 
 pub struct KimiProvider;
 
-impl Provider for KimiProvider {
-    fn name(&self) -> &str {
-        "kimi"
+impl ProviderDriver for KimiProvider {
+    fn id(&self) -> Provider {
+        Provider::Kimi
     }
 
     fn root_dirs(&self) -> Vec<PathBuf> {
@@ -163,7 +163,7 @@ fn extract_record(
         .unwrap_or_else(|| format!("kimi:{session_id}:{timestamp}:{input}:{output}"));
 
     Some(UsageRecord {
-        provider: "kimi".to_string(),
+        provider: Provider::Kimi,
         session_id: session_id.to_string(),
         timestamp,
         project: project.to_string(),

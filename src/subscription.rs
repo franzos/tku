@@ -4,12 +4,15 @@ use std::fs;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, ContentArrangement, Table};
-use directories::{BaseDirs, ProjectDirs};
+use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
+use crate::accounts::redact;
+use crate::atomic_write::atomic_write;
 use crate::cost::PricingMap;
 use crate::exchange::ExchangeRate;
-use crate::types::UsageRecord;
+use crate::paths;
+use crate::types::{Provider, UsageRecord};
 
 const USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const ANTHROPIC_BETA: &str = "oauth-2025-04-20";
@@ -117,7 +120,7 @@ struct CycleSnapshot {
 }
 
 /// Whether the current % value came from the API or was estimated locally.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageSource {
     Live,
     Estimated,
@@ -173,8 +176,10 @@ pub fn run(
     }
 
     // Filter records to Claude only
-    let claude_records: Vec<&UsageRecord> =
-        records.iter().filter(|r| r.provider == "claude").collect();
+    let claude_records: Vec<&UsageRecord> = records
+        .iter()
+        .filter(|r| r.provider == Provider::Claude)
+        .collect();
 
     let mut store = load_snapshots(&org_uuid);
 
@@ -222,8 +227,12 @@ pub fn run(
     let usage = if needs_fetch {
         match fetch_usage(&oauth.access_token) {
             Ok(u) => Some(u),
-            Err(e) => {
-                eprintln!("Warning: failed to fetch usage: {e}");
+            Err(_) => {
+                // Opaque message — don't interpolate the underlying error
+                // chain, which can include the request URL and other details
+                // we'd rather not echo to stderr by default. Detailed
+                // diagnostics belong behind a future `--verbose` flag.
+                eprintln!("usage: failed to fetch usage (check credentials / network)");
                 None
             }
         }
@@ -266,7 +275,7 @@ pub fn run(
 
     // Resolve current week's utilization + source
     let (current_pct, current_source) = resolve_current_usage(
-        &usage,
+        usage.as_ref(),
         &store,
         resets_at,
         &claude_records,
@@ -457,7 +466,7 @@ fn should_calibrate(last_real_pct: f64, estimated_pct: f64) -> bool {
 
 /// Resolve the current week's utilization and its source.
 fn resolve_current_usage(
-    usage: &Option<UsageResponse>,
+    usage: Option<&UsageResponse>,
     store: &SnapshotStore,
     cycle_end: DateTime<Utc>,
     records: &[&UsageRecord],
@@ -465,7 +474,7 @@ fn resolve_current_usage(
     current_cost: Option<f64>,
 ) -> (Option<f64>, UsageSource) {
     // Live data takes priority
-    if let Some(ref u) = usage {
+    if let Some(u) = usage {
         if let Some(ref w) = u.seven_day {
             return (Some(w.utilization), UsageSource::Live);
         }
@@ -501,12 +510,13 @@ fn load_credentials() -> Result<Credentials> {
     let base = BaseDirs::new().context("Cannot determine home directory")?;
     let path = base.home_dir().join(".claude").join(".credentials.json");
     let data =
-        fs::read_to_string(&path).with_context(|| format!("Cannot read {}", path.display()))?;
+        fs::read_to_string(&path).with_context(|| format!("Cannot read {}", redact(&path)))?;
     serde_json::from_str(&data).context("Failed to parse credentials")
 }
 
 fn fetch_usage(access_token: &str) -> Result<UsageResponse> {
-    let body = ureq::get(USAGE_API_URL)
+    let body = crate::http::agent()
+        .get(USAGE_API_URL)
         .header("Authorization", &format!("Bearer {access_token}"))
         .header("anthropic-beta", ANTHROPIC_BETA)
         .call()
@@ -520,7 +530,7 @@ fn fetch_usage(access_token: &str) -> Result<UsageResponse> {
 }
 
 fn snapshot_path() -> Option<std::path::PathBuf> {
-    ProjectDirs::from("", "", "tku").map(|d| d.cache_dir().join("subscription-claude.json"))
+    paths::subscription_snapshot_file("claude")
 }
 
 /// Parse the on-disk store, transparently migrating v1 (flat `snapshots`)
@@ -593,7 +603,9 @@ fn save_snapshot(
 ) {
     let Some(path) = snapshot_path() else { return };
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!("warning: failed to create snapshot dir: {e}");
+        }
     }
 
     let target = round_to_minute(cycle_end);
@@ -632,8 +644,17 @@ fn save_snapshot(
         },
     );
 
-    if let Ok(data) = serde_json::to_string_pretty(&on_disk) {
-        let _ = fs::write(&path, data);
+    match serde_json::to_string_pretty(&on_disk) {
+        Ok(data) => {
+            // Sensitive-class data (cycle utilization per account) — mode 0600 on
+            // Unix so other users on a shared host can't read it.
+            if let Err(e) = atomic_write(&path, data.as_bytes(), Some(0o600)) {
+                eprintln!("warning: failed to save snapshot: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: failed to serialize snapshot: {e}");
+        }
     }
 }
 
