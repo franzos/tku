@@ -51,6 +51,9 @@ tku --breakdown
 # Subscription usage overview (Claude Max/Pro)
 tku sub
 
+# One-row-per-account overview across all registered Claude accounts
+tku sub --all
+
 # Upgrade/downgrade recommendation based on your usage history
 tku sub --plan
 
@@ -226,6 +229,25 @@ Claude Pro — 45% used, resets Mar 13, 3:00pm
 
 Usage % for the current week is fetched live; previous weeks show the last captured snapshot (saved each time you run `tku sub`). Cost is always computed from local session records. Requires Claude Code OAuth credentials at `~/.claude/.credentials.json`.
 
+### Multi-account overview
+
+If you have more than one Claude account stashed (see [Accounts](#accounts)), `tku sub --all` shows a single-row-per-account summary. Live usage % is fetched only for the active account — inactive accounts fall back to the last captured snapshot, since their stashed tokens may have expired and we don't want to spam the API per-account on every run.
+
+```
+┌─────────────────────────────────────────┬──────────────────┬───────┬─────┬─────────────────┬────────┐
+│ Account                                 ┆ Plan             ┆ 7-day ┆ 5h  ┆ Resets          ┆ Cost   │
+╞═════════════════════════════════════════╪══════════════════╪═══════╪═════╪═════════════════╪════════╡
+│ * work                                  ┆ Claude Max (20x) ┆ 32%   ┆ 8%  ┆ Mar 13, 3:00pm  ┆ $55.28 │
+│   personal                              ┆ Claude Max (5x)  ┆ ~41%  ┆ —   ┆ Mar 11, 9:00am  ┆ $12.04 │
+│   (token expired — `tku account use`    ┆                  ┆       ┆     ┆                 ┆        │
+│    to refresh)                          ┆                  ┆       ┆     ┆                 ┆        │
+│ TOTAL                                   ┆                  ┆       ┆     ┆                 ┆ $67.32 │
+└─────────────────────────────────────────┴──────────────────┴───────┴─────┴─────────────────┴────────┘
+* = currently active. Run `tku sub --account <name>` for full details.
+```
+
+`~` prefixes a usage value reconstructed from a snapshot rather than fetched live. `--all` and `--account` are mutually exclusive.
+
 ### Plan recommendation
 
 `tku sub --plan` compares your recent utilization against the equivalent load on adjacent plans and recommends stay / upgrade / downgrade. It uses completed weekly cycles only (at least 2 needed; 4 for stable output) and projects your historical usage onto Pro / Max (5x) / Max (20x) by scaling through Anthropic's Pro-unit capacities.
@@ -256,7 +278,7 @@ Rules: recommend **upgrade** when ≥2 recent cycles hit ≥95% or 4-cycle avera
 
 ## Accounts
 
-If you use Claude Code with more than one account (personal + work, say), `tku account` keeps a labeled copy of each login and swaps them on demand. Only `~/.claude/.credentials.json` is swapped — skills, `CLAUDE.md`, hooks, and settings stay shared.
+If you use Claude Code with more than one account (personal + work, say), `tku account` keeps a labeled copy of each login and swaps them on demand. `~/.claude/.credentials.json` is swapped, plus a targeted `oauthAccount` patch to `~/.claude.json` so Claude Code's `/status` reflects the swapped identity. Skills, `CLAUDE.md`, hooks, and other settings stay shared.
 
 `tku` doesn't drive the OAuth login itself; Claude Code does. So adding a second account means logging in with the other one through Claude Code first:
 
@@ -299,9 +321,10 @@ Stashed credentials live at `~/.config/tku/accounts/claude/<name>.credentials.js
 
 **Notes**:
 - On first run with existing Claude Code credentials, tku auto-registers your current account as `default` and backfills attribution to the earliest record timestamp.
-- If you swap credentials outside tku (manual `cp`, `claude /login`, etc.), tku detects the change on next run and appends an "implicit" switch entry with a warning. Attribution in that window is best-effort.
+- `tku account add` needs a live access token — it resolves your `organizationUuid` via the Anthropic profile API (modern `.credentials.json` doesn't carry that field). Sign in to Claude Code first if your stash is stale.
 - After `tku account use`, Claude Code refreshes the access token itself on next launch if needed. No re-login unless the refresh token itself has expired.
-- Claude Code occasionally rewrites `.credentials.json` without the `organizationUuid` field after a token refresh — tku falls back to the latest switch-log entry in that case.
+- Long-running `claude` sessions cache their identity in memory and periodically rewrite `~/.claude.json`. If you swap accounts while one is open, that session can race-restore the previous `oauthAccount` blob — quit existing `claude` processes before swapping if you need `/status` to reflect the change immediately.
+- Swapping credentials outside tku (manual `cp`, `claude /login`, etc.) isn't reliably detected on modern creds, since the legacy `organizationUuid` field tku used as a signal is no longer written. Attribution in such windows is best-effort; prefer `tku account use` for clean handoffs.
 - Only Claude accounts are supported for now. Codex and others may follow.
 
 ## Status bar integration
@@ -390,6 +413,8 @@ Pricing data is cached for 24 hours at `~/.cache/tku/pricing-<source>.json`. Use
 Costs default to USD. Set a different currency via `--currency` or the config file. Exchange rates are fetched from the [Frankfurter API](https://frankfurter.dev) (ECB data, no auth required) and cached for 7 days. On failure, stale cache is used if available, otherwise falls back to USD.
 
 ## Providers
+
+Claude Code is the first-class citizen here — it's what I use daily and what gets the most testing. The others are implemented from public info and session-file inspection, but I don't run them regularly, so coverage is best-effort. PRs welcome if something's off.
 
 Currently supported:
 

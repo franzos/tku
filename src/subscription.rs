@@ -66,6 +66,10 @@ struct ProfileResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProfileAccount {
     #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
     has_claude_max: Option<bool>,
     #[serde(default)]
     has_claude_pro: Option<bool>,
@@ -75,6 +79,8 @@ struct ProfileAccount {
 struct ProfileOrganization {
     #[serde(default)]
     pub uuid: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     rate_limit_tier: Option<String>,
     #[serde(default)]
@@ -661,15 +667,47 @@ fn fetch_usage(access_token: &str) -> Result<UsageResponse> {
     serde_json::from_str(&body).context("Failed to parse usage response")
 }
 
-/// Fetch the live organization UUID from the profile API. Used by
-/// `accounts::add` when the creds file doesn't carry `organizationUuid`
-/// (modern Claude Code layouts) and `.claude.json` would be stale.
-pub fn fetch_live_org_uuid(access_token: &str) -> Result<String> {
+/// Identity fields needed to populate the live account's org UUID and
+/// reconstruct `.claude.json:oauthAccount` after a credential swap.
+pub struct AccountIdentity {
+    pub org_uuid: String,
+    pub oauth_account: serde_json::Value,
+}
+
+/// Fetch the live account identity from the profile API. Used by
+/// `accounts::add` to record the org UUID and stash an `oauthAccount` blob
+/// matching Claude Code's `.claude.json` shape, so `accounts::use_account`
+/// can keep that file's identity in sync with the swapped credentials.
+pub fn fetch_account_identity(access_token: &str) -> Result<AccountIdentity> {
     let profile = fetch_profile(access_token)?;
-    profile
+    let account = profile
+        .account
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Profile API did not return account block"))?;
+    let organization = profile
         .organization
-        .and_then(|o| o.uuid)
-        .ok_or_else(|| anyhow::anyhow!("Profile API did not return organization.uuid"))
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Profile API did not return organization block"))?;
+    let org_uuid = organization
+        .uuid
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Profile API did not return organization.uuid"))?;
+    // Claude Code's `.claude.json:oauthAccount` shape. `organizationRole`
+    // and `workspaceRole` aren't returned by the profile endpoint; default
+    // them to safe values — the UI display reads name/email/uuid, and
+    // permission checks happen server-side against the access token.
+    let oauth_account = serde_json::json!({
+        "accountUuid": account.uuid,
+        "emailAddress": account.email,
+        "organizationUuid": org_uuid,
+        "organizationName": organization.name,
+        "organizationRole": "member",
+        "workspaceRole": serde_json::Value::Null,
+    });
+    Ok(AccountIdentity {
+        org_uuid,
+        oauth_account,
+    })
 }
 
 fn fetch_profile(access_token: &str) -> Result<ProfileResponse> {

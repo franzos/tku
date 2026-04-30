@@ -38,6 +38,13 @@ pub struct Account {
     pub subscription_type: Option<String>,
     #[serde(default)]
     pub rate_limit_tier: Option<String>,
+    /// Cached `oauthAccount` blob in the shape Claude Code writes to
+    /// `~/.claude.json`. Populated from the profile API at `add`
+    /// time and re-applied on `use_account` so Claude Code's UI reflects
+    /// the swapped identity (Claude Code only writes this file at first
+    /// onboarding, never on subsequent /login).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_account: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,7 +225,7 @@ struct CredsInfo {
     /// `organizationUuid` from `.credentials.json` when the field is present
     /// in that file (legacy layout). Today's Claude Code doesn't write it
     /// here — `add()` resolves the field via the profile API instead.
-    /// Note: `~/.claude/.claude.json:oauthAccount.organizationUuid` exists
+    /// Note: `~/.claude.json:oauthAccount.organizationUuid` exists
     /// but is only written at first onboarding and isn't refreshed on
     /// subsequent logout/login, so we deliberately don't read from it.
     org_uuid: Option<String>,
@@ -371,6 +378,7 @@ pub fn bootstrap_if_needed_post_scan(claude_records: &[&UsageRecord]) -> Option<
         last_used_at: now,
         subscription_type: info.subscription_type,
         rate_limit_tier: info.rate_limit_tier,
+        oauth_account: None,
     });
     registry.switch_log.push(SwitchEntry {
         at: earliest,
@@ -435,23 +443,19 @@ pub fn add(name: &str) -> Result<()> {
     let info = read_current_claude_creds_info()
         .ok_or_else(|| anyhow!("Credentials file is missing or unparseable"))?;
     // Modern Claude Code creds files don't carry `organizationUuid`, so we
-    // resolve it via the profile API using the live access token. The
-    // alternative (reading `.claude.json:oauthAccount.organizationUuid`)
-    // looks tempting but that file is only written at first onboarding —
-    // it stays pinned to the original account across logout/login cycles.
-    let org_uuid = match info.org_uuid {
-        Some(u) => u,
-        None => {
-            let token = info.access_token.ok_or_else(|| {
-                anyhow!(
-                    "Credentials file has no access token. Sign in to Claude Code first, then try again."
-                )
-            })?;
-            crate::subscription::fetch_live_org_uuid(&token).context(
-                "Could not resolve the live organizationUuid via the Anthropic profile API",
-            )?
-        }
-    };
+    // resolve identity via the profile API using the live access token.
+    // We also stash the resulting `oauthAccount` blob so `use_account` can
+    // keep `.claude.json` in sync with the swapped credentials — Claude
+    // Code only writes that file at first onboarding, never on /login.
+    let token = info.access_token.ok_or_else(|| {
+        anyhow!(
+            "Credentials file has no access token. Sign in to Claude Code first, then try again."
+        )
+    })?;
+    let identity = crate::subscription::fetch_account_identity(&token)
+        .context("Could not fetch account identity from the Anthropic profile API")?;
+    let org_uuid = identity.org_uuid.clone();
+    let oauth_account = Some(identity.oauth_account);
     let sub_type = info.subscription_type;
     let rate_tier = info.rate_limit_tier;
 
@@ -489,6 +493,7 @@ pub fn add(name: &str) -> Result<()> {
         last_used_at: now,
         subscription_type: sub_type,
         rate_limit_tier: rate_tier,
+        oauth_account,
     });
     // Append a switch-log entry so consumers that infer the active account
     // from `latest_switch()` (list, current, subscription keying) see the
@@ -555,8 +560,66 @@ pub fn use_account(name: &str, force: bool) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", redact(parent)))?;
     }
+
+    // Pre-swap migration: if `.claude.json:oauthAccount` matches a registered
+    // account that hasn't had its identity stored yet, capture it now —
+    // before we overwrite the file. This catches the original-onboarding
+    // account, whose stashed access token may already be too old to use the
+    // profile API as a fallback path.
+    if let Some(current_oauth) = read_current_claude_oauth_account() {
+        if let Some(current_org_uuid) = current_oauth
+            .get("organizationUuid")
+            .and_then(|v| v.as_str())
+        {
+            let owned_uuid = current_org_uuid.to_string();
+            if let Some(matching) = registry
+                .accounts
+                .iter_mut()
+                .find(|a| a.org_uuid == owned_uuid && a.oauth_account.is_none())
+            {
+                matching.oauth_account = Some(current_oauth);
+            }
+        }
+    }
+
     let data = fs::read(&src).with_context(|| format!("read {}", redact(&src)))?;
     write_secure(&dst, &data).with_context(|| format!("write {}", redact(&dst)))?;
+
+    // Re-read the (possibly migrated) account record before deciding whether
+    // to backfill via API.
+    let account = registry
+        .find_by_name(name)
+        .cloned()
+        .expect("account existed at top of function");
+
+    // Backfill the `oauthAccount` blob for legacy entries that pre-date the
+    // field. After the creds swap above, the live access token belongs to
+    // this account, so the profile API will identify it correctly. If the
+    // stashed token is expired, this will 401 — we warn and continue.
+    let oauth_account = if account.oauth_account.is_some() {
+        account.oauth_account.clone()
+    } else {
+        match fetch_live_oauth_account_with_creds(&dst) {
+            Ok(blob) => {
+                if let Some(a) = registry.accounts.iter_mut().find(|a| a.name == name) {
+                    a.oauth_account = Some(blob.clone());
+                }
+                Some(blob)
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: could not refresh stored identity for '{name}' (Claude Code's UI will display the previous account until you launch claude once and re-run this command): {e}"
+                );
+                None
+            }
+        }
+    };
+
+    if let Some(blob) = &oauth_account {
+        if let Err(e) = apply_oauth_account_to_claude_config(blob) {
+            eprintln!("warning: could not update ~/.claude.json: {e}");
+        }
+    }
 
     let now = Utc::now();
     registry.switch_log.push(SwitchEntry {
@@ -579,6 +642,56 @@ pub fn use_account(name: &str, force: bool) -> Result<()> {
     eprintln!(
         "Note: any `claude` session already running in another terminal will hit a 401 on its next refresh and need to be re-launched."
     );
+    Ok(())
+}
+
+/// Read the current `oauthAccount` object from `~/.claude.json`,
+/// if present. Used by the pre-swap migration to capture the originally-
+/// onboarded account's identity before it gets overwritten.
+fn read_current_claude_oauth_account() -> Option<serde_json::Value> {
+    let path = BaseDirs::new()?.home_dir().join(".claude.json");
+    let data = fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&data).ok()?;
+    value.get("oauthAccount").cloned()
+}
+
+/// Read the access token from `creds_path` and ask the profile API for the
+/// matching `oauthAccount` blob. Used to backfill legacy registry entries.
+fn fetch_live_oauth_account_with_creds(creds_path: &Path) -> Result<serde_json::Value> {
+    let data =
+        fs::read_to_string(creds_path).with_context(|| format!("read {}", redact(creds_path)))?;
+    let value: serde_json::Value = serde_json::from_str(&data).context("parse credentials file")?;
+    let token = value
+        .pointer("/claudeAiOauth/accessToken")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("credentials file has no access token"))?;
+    Ok(crate::subscription::fetch_account_identity(token)?.oauth_account)
+}
+
+/// Patch `~/.claude.json` so its `oauthAccount` key matches `blob`.
+/// Preserves all other fields (projects, onboarding state, etc). Atomic.
+fn apply_oauth_account_to_claude_config(blob: &serde_json::Value) -> Result<()> {
+    let path = BaseDirs::new()
+        .map(|b| b.home_dir().join(".claude.json"))
+        .ok_or_else(|| anyhow!("cannot determine ~/.claude.json path"))?;
+    let mut value: serde_json::Value = match fs::read_to_string(&path) {
+        Ok(data) => {
+            serde_json::from_str(&data).with_context(|| format!("parse {}", redact(&path)))?
+        }
+        // Missing file is fine — Claude Code will recreate on next launch.
+        // We still write our oauthAccount so the next launch sees the right
+        // identity from the start.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(anyhow!("read {}: {}", redact(&path), e)),
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("oauthAccount".to_string(), blob.clone());
+    } else {
+        bail!("{} is not a JSON object", redact(&path));
+    }
+    let serialized = serde_json::to_string_pretty(&value).context("serialize claude config")?;
+    atomic_write(&path, serialized.as_bytes(), Some(0o644))
+        .with_context(|| format!("write {}", redact(&path)))?;
     Ok(())
 }
 
