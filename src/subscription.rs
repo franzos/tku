@@ -74,6 +74,8 @@ struct ProfileAccount {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProfileOrganization {
     #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
     rate_limit_tier: Option<String>,
     #[serde(default)]
     organization_type: Option<String>,
@@ -657,6 +659,17 @@ fn fetch_usage(access_token: &str) -> Result<UsageResponse> {
         .read_to_string()
         .context("Failed to read usage response")?;
     serde_json::from_str(&body).context("Failed to parse usage response")
+}
+
+/// Fetch the live organization UUID from the profile API. Used by
+/// `accounts::add` when the creds file doesn't carry `organizationUuid`
+/// (modern Claude Code layouts) and `.claude.json` would be stale.
+pub fn fetch_live_org_uuid(access_token: &str) -> Result<String> {
+    let profile = fetch_profile(access_token)?;
+    profile
+        .organization
+        .and_then(|o| o.uuid)
+        .ok_or_else(|| anyhow::anyhow!("Profile API did not return organization.uuid"))
 }
 
 fn fetch_profile(access_token: &str) -> Result<ProfileResponse> {

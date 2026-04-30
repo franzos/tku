@@ -215,17 +215,21 @@ fn save_registry(tool: &str, registry: &Registry) -> Result<()> {
 
 #[derive(Debug, Clone)]
 struct CredsInfo {
-    /// `organizationUuid` when present. Claude Code drops this field after an
-    /// access-token refresh, so we treat it as optional.
+    /// `organizationUuid` from `.credentials.json` when the field is present
+    /// in that file (legacy layout). Today's Claude Code doesn't write it
+    /// here — `add()` resolves the field via the profile API instead.
+    /// Note: `~/.claude/.claude.json:oauthAccount.organizationUuid` exists
+    /// but is only written at first onboarding and isn't refreshed on
+    /// subsequent logout/login, so we deliberately don't read from it.
     org_uuid: Option<String>,
+    access_token: Option<String>,
     subscription_type: Option<String>,
     rate_limit_tier: Option<String>,
 }
 
-/// Read `organizationUuid` from the live Claude credentials file.
-/// Returns None when the file is missing, unparseable, or has been stripped
-/// of the field by a recent token refresh — providers should fall back to
-/// the registry's last-known active account in that case.
+/// Read the live account's org UUID from the creds file. Returns None on
+/// modern Claude Code layouts that don't store the field there — callers
+/// that need a guaranteed UUID must hit the profile API.
 pub fn current_claude_org_uuid() -> Option<String> {
     read_current_claude_creds_info().and_then(|i| i.org_uuid)
 }
@@ -240,6 +244,10 @@ fn read_current_claude_creds_info() -> Option<CredsInfo> {
         .get("organizationUuid")
         .and_then(|v| v.as_str())
         .map(String::from);
+    let access_token = value
+        .pointer("/claudeAiOauth/accessToken")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let subscription_type = value
         .pointer("/claudeAiOauth/subscriptionType")
         .and_then(|v| v.as_str())
@@ -250,6 +258,7 @@ fn read_current_claude_creds_info() -> Option<CredsInfo> {
         .map(String::from);
     Some(CredsInfo {
         org_uuid,
+        access_token,
         subscription_type,
         rate_limit_tier,
     })
@@ -425,12 +434,24 @@ pub fn add(name: &str) -> Result<()> {
 
     let info = read_current_claude_creds_info()
         .ok_or_else(|| anyhow!("Credentials file is missing or unparseable"))?;
-    let org_uuid = info.org_uuid.ok_or_else(|| {
-        anyhow!(
-            "Credentials file has no organizationUuid (Claude Code may have just refreshed the token).\n\
-             Start Claude Code once to regenerate the field, then try again."
-        )
-    })?;
+    // Modern Claude Code creds files don't carry `organizationUuid`, so we
+    // resolve it via the profile API using the live access token. The
+    // alternative (reading `.claude.json:oauthAccount.organizationUuid`)
+    // looks tempting but that file is only written at first onboarding —
+    // it stays pinned to the original account across logout/login cycles.
+    let org_uuid = match info.org_uuid {
+        Some(u) => u,
+        None => {
+            let token = info.access_token.ok_or_else(|| {
+                anyhow!(
+                    "Credentials file has no access token. Sign in to Claude Code first, then try again."
+                )
+            })?;
+            crate::subscription::fetch_live_org_uuid(&token).context(
+                "Could not resolve the live organizationUuid via the Anthropic profile API",
+            )?
+        }
+    };
     let sub_type = info.subscription_type;
     let rate_tier = info.rate_limit_tier;
 
@@ -469,6 +490,24 @@ pub fn add(name: &str) -> Result<()> {
         subscription_type: sub_type,
         rate_limit_tier: rate_tier,
     });
+    // Append a switch-log entry so consumers that infer the active account
+    // from `latest_switch()` (list, current, subscription keying) see the
+    // newly-added account as live. This is correct by construction — `add`
+    // can only register the account that owns the currently-live creds.
+    // Tagged Implicit because the actual swap happened outside tku at an
+    // unknown earlier time; we anchor to `now` since we can't recover it.
+    let needs_switch_entry = registry
+        .latest_switch()
+        .map(|s| s.org_uuid != org_uuid)
+        .unwrap_or(true);
+    if needs_switch_entry {
+        registry.switch_log.push(SwitchEntry {
+            at: now,
+            org_uuid: org_uuid.clone(),
+            name: name.to_string(),
+            source: SwitchSource::Implicit,
+        });
+    }
     save_registry(TOOL_CLAUDE, &registry)?;
 
     eprintln!(
@@ -537,6 +576,9 @@ pub fn use_account(name: &str, force: bool) -> Result<()> {
         short_org(&account.org_uuid)
     );
     eprintln!("Claude Code will refresh the access token on next launch if needed.");
+    eprintln!(
+        "Note: any `claude` session already running in another terminal will hit a 401 on its next refresh and need to be re-launched."
+    );
     Ok(())
 }
 
