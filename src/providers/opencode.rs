@@ -314,6 +314,7 @@ fn extract_record_from_data(
         output_tokens: output,
         cache_creation_input_tokens: cache_write,
         cache_read_input_tokens: cache_read,
+        account_uuid: None,
     })
 }
 
@@ -375,5 +376,6 @@ fn extract_record(
         output_tokens: output,
         cache_creation_input_tokens: cache_write,
         cache_read_input_tokens: cache_read,
+        account_uuid: None,
     })
 }

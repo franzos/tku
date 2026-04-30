@@ -1,3 +1,19 @@
+## [0.1.12] - 2026-04-29
+
+### Added
+- `tku sub --all` — one-row overview across every registered Claude account, with a totals row
+- `tku account use --force` / `remove --force` — safeguards against overwriting an unsaved live login or removing the active account by accident
+
+### Changed
+- Plain-language help for `tku account`, with a walkthrough for the two-account workflow
+
+### Fixed
+- Per-account attribution stays correct after cache rebuilds and credential swaps made outside tku
+- `tku sub --account <name>` now actually scopes to that account (was silently ignored)
+- `--all` and `--account` together are rejected instead of silently picking one
+- Dedup no longer collapses identical message IDs seen under different accounts
+- Atomic registry writes — concurrent `tku` runs can't truncate each other's switch log
+
 ## [0.1.11] - 2026-04-24
 
 ### Changed

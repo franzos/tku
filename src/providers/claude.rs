@@ -28,8 +28,31 @@ impl ProviderDriver for ClaudeProvider {
     ) {
         let roots = compute_roots();
         let files = discover_files(&roots, "jsonl");
+        // Per-record attribution: for each record, look up the account
+        // active at its timestamp via the registry's switch log. This keeps
+        // historical records correctly tagged even when the cache is wiped
+        // (sqlite schema bump, bitcode corruption) and re-parsed under a
+        // different active account than the one that wrote them.
+        //
+        // The registry was already updated with any implicit swap by
+        // `detect_implicit_swap_pre_scan()` in main, so the lookup reflects
+        // the current state. `live_uuid` is a fallback for records whose
+        // timestamps fall before the earliest switch entry (e.g. on the
+        // very first run before bootstrap has anchored to the earliest
+        // record) and for the rare case where the registry has no entries
+        // at all.
+        let registry = crate::accounts::load_registry("claude");
+        let live_uuid = crate::accounts::current_claude_org_uuid()
+            .or_else(|| registry.latest_switch().map(|s| s.org_uuid.clone()));
         discover_and_parse_with(self.name(), files, storage, progress, prune, |path| {
-            parse_jsonl_file(path)
+            let mut records = parse_jsonl_file(path);
+            for r in &mut records {
+                r.account_uuid = registry
+                    .account_at(r.timestamp)
+                    .map(|e| e.org_uuid.clone())
+                    .or_else(|| live_uuid.clone());
+            }
+            records
         });
     }
 }
@@ -197,5 +220,7 @@ fn extract_record(
             .get("cache_read_input_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
+        // Filled in by discover_and_parse via per-record account_at lookup.
+        account_uuid: None,
     })
 }

@@ -256,16 +256,29 @@ Rules: recommend **upgrade** when ≥2 recent cycles hit ≥95% or 4-cycle avera
 
 ## Accounts
 
-If you use Claude Code with more than one account (personal + work, say), `tku account` stashes each account's credentials separately and swaps them on demand. Only `~/.claude/.credentials.json` is swapped — skills, `CLAUDE.md`, hooks, and settings stay shared.
+If you use Claude Code with more than one account (personal + work, say), `tku account` keeps a labeled copy of each login and swaps them on demand. Only `~/.claude/.credentials.json` is swapped — skills, `CLAUDE.md`, hooks, and settings stay shared.
+
+`tku` doesn't drive the OAuth login itself; Claude Code does. So adding a second account means logging in with the other one through Claude Code first:
 
 ```bash
-tku account list                  # show registered accounts
-tku account add work              # stash current creds under "work"
-tku account use work              # swap "work" in
+# already logged into account A via Claude Code
+tku account add work
+
+# log into account B through Claude Code, then save it too
+claude /logout
+claude /login
+tku account add personal
+
+# from now on:
+tku account use work
+tku account use personal
+tku account list                  # show saved accounts
 tku account current               # show what's active
 tku account rename work main
 tku account remove work
 ```
+
+Safeguards: `use` refuses to overwrite a live login that hasn't been saved (pass `--force` to override), and `remove` refuses to delete the currently-active account (same escape hatch).
 
 ```
 Accounts (claude):

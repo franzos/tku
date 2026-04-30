@@ -91,6 +91,14 @@ pub struct UsageRecord {
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// Organization UUID of the Claude account that produced this record,
+    /// captured at scan time from `~/.claude/.credentials.json`. None for
+    /// non-Claude providers, for records cached before this field existed,
+    /// or when credentials weren't readable during the scan. Filtering and
+    /// per-account subscription views fall back to the timestamp-based
+    /// switch log when this is None.
+    #[serde(default)]
+    pub account_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

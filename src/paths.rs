@@ -78,6 +78,12 @@ pub fn subscription_snapshot_file(tool: &str) -> Option<PathBuf> {
     cache_dir().map(|d| d.join(format!("subscription-{tool}.json")))
 }
 
+/// Cached OAuth profile response per Claude org_uuid: `profile-<org>.json`.
+/// Used to detect plan switches without hammering the API on every run.
+pub fn profile_cache_file(org_uuid: &str) -> Option<PathBuf> {
+    cache_dir().map(|d| d.join(format!("profile-{org_uuid}.json")))
+}
+
 // --- Config files ---
 
 pub fn config_file() -> Option<PathBuf> {

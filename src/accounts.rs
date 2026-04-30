@@ -112,7 +112,7 @@ fn registry_path(tool: &str) -> Option<PathBuf> {
     paths::registry_file(tool)
 }
 
-fn stashed_creds_path(tool: &str, name: &str) -> Option<PathBuf> {
+pub fn stashed_creds_path(tool: &str, name: &str) -> Option<PathBuf> {
     paths::accounts_dir(tool).map(|d| d.join(format!("{name}.credentials.json")))
 }
 
@@ -202,7 +202,12 @@ fn save_registry(tool: &str, registry: &Registry) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("create {}", redact(parent)))?;
     }
     let data = serde_json::to_string_pretty(registry).context("serialize registry")?;
-    fs::write(&path, data).with_context(|| format!("write {}", redact(&path)))?;
+    // Atomic write: two concurrent `tku` invocations switching accounts must
+    // not be able to truncate each other's switch-log entries. The registry
+    // also carries the canonical org-UUID → name mapping, so a torn write
+    // here would corrupt attribution for every subsequent run.
+    atomic_write(&path, data.as_bytes(), Some(0o600))
+        .with_context(|| format!("write {}", redact(&path)))?;
     Ok(())
 }
 
@@ -215,6 +220,14 @@ struct CredsInfo {
     org_uuid: Option<String>,
     subscription_type: Option<String>,
     rate_limit_tier: Option<String>,
+}
+
+/// Read `organizationUuid` from the live Claude credentials file.
+/// Returns None when the file is missing, unparseable, or has been stripped
+/// of the field by a recent token refresh — providers should fall back to
+/// the registry's last-known active account in that case.
+pub fn current_claude_org_uuid() -> Option<String> {
+    read_current_claude_creds_info().and_then(|i| i.org_uuid)
 }
 
 fn read_current_claude_creds_info() -> Option<CredsInfo> {
@@ -260,98 +273,113 @@ fn stash_creds_file(tool: &str, name: &str, src: &std::path::Path) -> Result<Pat
 
 // --- Bootstrap / implicit-swap detection ---
 
-/// Runs on every tku invocation. Side effects:
-/// - Bootstraps registry + stashes current creds as "default" on first run.
-/// - Detects credential changes made outside tku; appends an implicit
-///   switch entry and prints a soft warning.
+/// Pre-scan hook: append an implicit-switch entry if the live credentials'
+/// `organizationUuid` no longer matches the most recent switch-log entry.
 ///
-/// Returns the name of the currently-active account, if resolvable.
-pub fn ensure_current_account(claude_records: &[&UsageRecord]) -> Option<String> {
-    let info = read_current_claude_creds_info()?;
-    let mut registry = load_registry(TOOL_CLAUDE);
-
-    // No org UUID in creds means Claude Code refreshed the token and stripped
-    // the field. We can't identify the active account from this alone; defer
-    // to the registry's last-known active account without warning.
-    let Some(current_org) = info.org_uuid else {
-        return registry.latest_switch().map(|s| s.name.clone());
+/// This must run **before** the provider scan so per-record attribution
+/// (which looks up `account_at(timestamp)` for each record) sees a switch
+/// log that already reflects the external swap. Without it, records written
+/// under the new account would still be looked up against an out-of-date
+/// log and get tagged with the previous account.
+///
+/// Skips silently when the registry is empty (deferred to post-scan
+/// bootstrap, which can anchor the bootstrap entry to the earliest record
+/// timestamp instead of to `Utc::now()`).
+pub fn detect_implicit_swap_pre_scan() {
+    let Some(info) = read_current_claude_creds_info() else {
+        return;
     };
-    let sub_type = info.subscription_type;
-    let rate_tier = info.rate_limit_tier;
-
+    // No org UUID in creds (Claude Code dropped it after a refresh) means
+    // we can't tell whether a swap happened — bail without warning.
+    let Some(current_org) = info.org_uuid else {
+        return;
+    };
+    let mut registry = load_registry(TOOL_CLAUDE);
     if registry.accounts.is_empty() {
-        // Bootstrap: first run that sees creds.
-        let earliest = claude_records
-            .iter()
-            .map(|r| r.timestamp)
-            .min()
-            .unwrap_or_else(Utc::now);
-        let now = Utc::now();
-
-        registry.accounts.push(Account {
-            name: "default".to_string(),
-            org_uuid: current_org.clone(),
-            added_at: now,
-            last_used_at: now,
-            subscription_type: sub_type,
-            rate_limit_tier: rate_tier,
-        });
-        registry.switch_log.push(SwitchEntry {
-            at: earliest,
-            org_uuid: current_org.clone(),
-            name: "default".to_string(),
-            source: SwitchSource::Bootstrap,
-        });
-
-        if let Some(creds) = claude_creds_path() {
-            if let Err(e) = stash_creds_file(TOOL_CLAUDE, "default", &creds) {
-                eprintln!("warning: failed to stash credentials for 'default': {e}");
-            }
-        }
-
-        if let Err(e) = save_registry(TOOL_CLAUDE, &registry) {
-            eprintln!("warning: failed to persist account registry: {e}");
-        }
-        return Some("default".to_string());
+        return;
+    }
+    let Some(last) = registry.latest_switch().cloned() else {
+        return;
+    };
+    if last.org_uuid == current_org {
+        return;
     }
 
-    let latest = registry.latest_switch().cloned();
-    match latest {
-        Some(last) if last.org_uuid != current_org => {
-            let known = registry.find_by_org(&current_org).cloned();
-            let name = match &known {
-                Some(a) => a.name.clone(),
-                None => format!("unknown-{}", short_org(&current_org)),
-            };
+    let known = registry.find_by_org(&current_org).cloned();
+    let name = match &known {
+        Some(a) => a.name.clone(),
+        None => format!("unknown-{}", short_org(&current_org)),
+    };
 
-            eprintln!("⚠ Credential change detected outside tku.");
-            eprintln!(
-                "  Previous: {} (org: {})",
-                last.name,
-                short_org(&last.org_uuid)
-            );
-            eprintln!("  Current:  {} (org: {})", name, short_org(&current_org));
-            eprintln!(
-                "  Records between runs are attributed to '{}'. Use `tku account use",
-                last.name
-            );
-            eprintln!("  <name>` next time for precise attribution.");
-            eprintln!();
+    eprintln!("⚠ Credential change detected outside tku.");
+    eprintln!(
+        "  Previous: {} (org: {})",
+        last.name,
+        short_org(&last.org_uuid)
+    );
+    eprintln!("  Current:  {} (org: {})", name, short_org(&current_org));
+    eprintln!(
+        "  Records between runs are attributed to '{}'. Use `tku account use",
+        last.name
+    );
+    eprintln!("  <name>` next time for precise attribution.");
+    eprintln!();
 
-            registry.switch_log.push(SwitchEntry {
-                at: Utc::now(),
-                org_uuid: current_org.clone(),
-                name: name.clone(),
-                source: SwitchSource::Implicit,
-            });
-            if let Err(e) = save_registry(TOOL_CLAUDE, &registry) {
-                eprintln!("warning: failed to persist implicit-swap entry: {e}");
-            }
-            Some(name)
-        }
-        Some(last) => Some(last.name),
-        None => registry.find_by_org(&current_org).map(|a| a.name.clone()),
+    registry.switch_log.push(SwitchEntry {
+        at: Utc::now(),
+        org_uuid: current_org,
+        name,
+        source: SwitchSource::Implicit,
+    });
+    if let Err(e) = save_registry(TOOL_CLAUDE, &registry) {
+        eprintln!("warning: failed to persist implicit-swap entry: {e}");
     }
+}
+
+/// Post-scan bootstrap: register the current credentials as "default" the
+/// first time we see them. Anchors the bootstrap switch entry to the
+/// earliest record timestamp so historical records get attributed correctly
+/// instead of all collapsing to "Utc::now()".
+pub fn bootstrap_if_needed_post_scan(claude_records: &[&UsageRecord]) -> Option<String> {
+    let info = read_current_claude_creds_info()?;
+    let current_org = info.org_uuid?;
+    let mut registry = load_registry(TOOL_CLAUDE);
+    if !registry.accounts.is_empty() {
+        return registry.latest_switch().map(|s| s.name.clone());
+    }
+
+    let earliest = claude_records
+        .iter()
+        .map(|r| r.timestamp)
+        .min()
+        .unwrap_or_else(Utc::now);
+    let now = Utc::now();
+
+    registry.accounts.push(Account {
+        name: "default".to_string(),
+        org_uuid: current_org.clone(),
+        added_at: now,
+        last_used_at: now,
+        subscription_type: info.subscription_type,
+        rate_limit_tier: info.rate_limit_tier,
+    });
+    registry.switch_log.push(SwitchEntry {
+        at: earliest,
+        org_uuid: current_org,
+        name: "default".to_string(),
+        source: SwitchSource::Bootstrap,
+    });
+
+    if let Some(creds) = claude_creds_path() {
+        if let Err(e) = stash_creds_file(TOOL_CLAUDE, "default", &creds) {
+            eprintln!("warning: failed to stash credentials for 'default': {e}");
+        }
+    }
+
+    if let Err(e) = save_registry(TOOL_CLAUDE, &registry) {
+        eprintln!("warning: failed to persist account registry: {e}");
+    }
+    Some("default".to_string())
 }
 
 fn short_org(org: &str) -> String {
@@ -414,9 +442,14 @@ pub fn add(name: &str) -> Result<()> {
     }
     if let Some(existing) = registry.find_by_org(&org_uuid) {
         bail!(
-            "Organization {} is already registered as '{}'.",
+            "This Claude login (org {}) is already saved as '{}'.\n\
+             To save a different account, log out of Claude Code and log back in with the other one first:\n  \
+               claude /logout\n  \
+               claude /login\n  \
+               tku account add {}",
             short_org(&org_uuid),
-            existing.name
+            existing.name,
+            name
         );
     }
 
@@ -446,12 +479,31 @@ pub fn add(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn use_account(name: &str) -> Result<()> {
+pub fn use_account(name: &str, force: bool) -> Result<()> {
     validate_name(name)?;
     let mut registry = load_registry(TOOL_CLAUDE);
     let account = registry.find_by_name(name).cloned().ok_or_else(|| {
         anyhow!("Account '{name}' not found. Run `tku account list` to see available accounts.")
     })?;
+
+    // Refuse to clobber a live login that hasn't been saved — switching would
+    // delete the only copy of those credentials. The implicit-swap detector
+    // catches this *after* the fact; this check stops it from happening.
+    if !force {
+        if let Some(info) = read_current_claude_creds_info() {
+            if let Some(current_org) = info.org_uuid {
+                if current_org != account.org_uuid && registry.find_by_org(&current_org).is_none() {
+                    bail!(
+                        "Current Claude login (org {}) isn't saved — switching would lose it.\n\
+                         Save it first:\n  \
+                           tku account add <name>\n\
+                         Or pass --force to overwrite anyway.",
+                        short_org(&current_org)
+                    );
+                }
+            }
+        }
+    }
 
     let src = stashed_creds_path(TOOL_CLAUDE, name).context("cannot determine stash path")?;
     if !src.exists() {
@@ -597,7 +649,7 @@ pub fn rename(old: &str, new: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn remove(name: &str) -> Result<()> {
+pub fn remove(name: &str, force: bool) -> Result<()> {
     validate_name(name)?;
     let mut registry = load_registry(TOOL_CLAUDE);
     let idx = registry
@@ -605,6 +657,21 @@ pub fn remove(name: &str) -> Result<()> {
         .iter()
         .position(|a| a.name == name)
         .ok_or_else(|| anyhow!("Account '{name}' not found."))?;
+
+    // Removing the live account would delete the only saved copy *and* leave
+    // ~/.claude/.credentials.json in an unsaved state — easy to do by accident.
+    if !force {
+        let target_org = registry.accounts[idx].org_uuid.clone();
+        let active_org = read_current_claude_creds_info().and_then(|i| i.org_uuid);
+        if active_org.as_deref() == Some(target_org.as_str()) {
+            bail!(
+                "'{name}' is the currently-active account. Switch away first with `tku account use <other>`,\n\
+                 or pass --force to remove it anyway (the live credentials file will stay in place but\n\
+                 won't be saved anywhere)."
+            );
+        }
+    }
+
     registry.accounts.remove(idx);
 
     if let Some(path) = stashed_creds_path(TOOL_CLAUDE, name) {

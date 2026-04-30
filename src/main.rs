@@ -49,8 +49,15 @@ fn bar_period_label(period: &cli::BarPeriod) -> &'static str {
     }
 }
 
-/// Does this record belong to `account` (per the switch log)?
+/// Does this record belong to `account`?
 /// None account = no filter, always matches.
+///
+/// Two-stage attribution:
+/// 1. If the record carries an `account_uuid` (tagged at scan time from the
+///    live credentials file), match directly against the registry's
+///    name → uuid mapping. This is the precise path.
+/// 2. If no uuid is set (legacy cache, or creds were unreadable at scan
+///    time), fall back to the timestamp-based switch log via `account_at`.
 fn matches_account(
     record: &types::UsageRecord,
     account: Option<&str>,
@@ -62,34 +69,28 @@ fn matches_account(
     if record.provider != Provider::Claude {
         return false;
     }
+    if let Some(uuid) = record.account_uuid.as_deref() {
+        // Prefer the recorded uuid → name mapping. Fall through to
+        // switch-log lookup only when the uuid isn't yet registered (e.g. an
+        // implicit-detected account the user hasn't named via `account add`).
+        if let Some(a) = registry.find_by_org(uuid) {
+            return a.name == *name;
+        }
+    }
     registry
         .account_at(record.timestamp)
         .map(|e| e.name == *name)
         .unwrap_or(false)
 }
 
-fn apply_account_filter(
-    records: Vec<types::UsageRecord>,
-    account: Option<&str>,
-    registry: &accounts::Registry,
-) -> Vec<types::UsageRecord> {
-    if account.is_none() {
-        return records;
-    }
-    records
-        .into_iter()
-        .filter(|r| matches_account(r, account, registry))
-        .collect()
-}
-
 fn handle_account(action: &cli::AccountAction) -> Result<()> {
     match action {
         cli::AccountAction::Add { name } => accounts::add(name),
-        cli::AccountAction::Use { name } => accounts::use_account(name),
+        cli::AccountAction::Use { name, force } => accounts::use_account(name, *force),
         cli::AccountAction::List => accounts::list(),
         cli::AccountAction::Current => accounts::current(),
         cli::AccountAction::Rename { old, new } => accounts::rename(old, new),
-        cli::AccountAction::Remove { name } => accounts::remove(name),
+        cli::AccountAction::Remove { name, force } => accounts::remove(name, *force),
     }
 }
 
@@ -161,6 +162,12 @@ fn main() -> Result<()> {
         return watch::run(full, interval, &cli, &pricing_source, &currency, date_range);
     }
 
+    // Pre-scan: detect implicit credential swap so the registry's switch log
+    // already reflects any external swap before we tag records. Without
+    // this, per-record account_at(timestamp) lookups would resolve new
+    // records to the previous account.
+    accounts::detect_implicit_swap_pre_scan();
+
     let mut store = storage::default_storage();
 
     let show_progress = !cli.cli && !is_bar && !is_plot && !is_sub;
@@ -191,24 +198,46 @@ fn main() -> Result<()> {
 
     let records = dedup::dedup(all_records);
 
-    // Bootstrap registry + detect implicit credential swaps on every run.
-    // Uses the full (unfiltered) record set so the bootstrap entry can anchor
-    // to the earliest real usage timestamp.
+    // Post-scan bootstrap: register the active credentials as "default" on
+    // first run. Implicit-swap detection already ran pre-scan; this only
+    // fires when the registry is still empty.
     let claude_refs: Vec<&types::UsageRecord> = records
         .iter()
         .filter(|r| r.provider == Provider::Claude)
         .collect();
-    let _ = accounts::ensure_current_account(&claude_refs);
+    let _ = accounts::bootstrap_if_needed_post_scan(&claude_refs);
     drop(claude_refs);
 
     let account_filter = cli.account.clone();
     let account_registry = accounts::load_registry("claude");
 
-    if let cli::Command::Subscription { live, plan } = mode {
-        let records = apply_account_filter(records, account_filter.as_deref(), &account_registry);
+    if let cli::Command::Subscription { live, plan, all } = mode {
+        // `--all` shows every account; `--account <name>` scopes to one.
+        // Combining them is contradictory, so reject the combination instead
+        // of silently picking one (clap can't enforce this directly because
+        // `--account` is global and `--all` is subcommand-local).
+        if all && account_filter.is_some() {
+            bail!("`--all` and `--account` are mutually exclusive");
+        }
         let exchange = exchange::load_exchange_rate(&currency, cli.offline);
         let pricing = pricing::load_pricing(&pricing_source, cli.offline)?;
-        return subscription::run(&exchange, &records, &pricing, cli.offline, live, plan);
+        if all {
+            return subscription::run_all(&exchange, &records, &pricing, cli.offline, live);
+        }
+        // Pass the unfiltered record set into `subscription::run` along with
+        // the `--account` selector. The subscription command needs to load
+        // the matching account's stashed credentials to fetch usage from the
+        // API — filtering records out here would still leave the API call
+        // hitting the wrong account's token.
+        return subscription::run(
+            &exchange,
+            &records,
+            &pricing,
+            cli.offline,
+            live,
+            plan,
+            account_filter.as_deref(),
+        );
     }
 
     let proj_needle = cli.project.as_ref().map(|p| p.to_lowercase());

@@ -178,5 +178,6 @@ fn parse_settings_file(path: &Path) -> Vec<UsageRecord> {
         output_tokens: output,
         cache_creation_input_tokens: cache_creation,
         cache_read_input_tokens: cache_read,
+        account_uuid: None,
     }]
 }

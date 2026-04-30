@@ -15,7 +15,9 @@ use crate::paths;
 use crate::types::{Provider, UsageRecord};
 
 const USAGE_API_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const PROFILE_API_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const ANTHROPIC_BETA: &str = "oauth-2025-04-20";
+const PROFILE_CACHE_TTL_HOURS: i64 = 24;
 
 /// Calibration thresholds — we fetch from the API when the estimated %
 /// crosses one of these, to reconcile the local estimate with truth.
@@ -51,9 +53,41 @@ struct ExtraUsage {
     used_credits: f64,
 }
 
+// --- Profile API response (live plan detection) ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProfileResponse {
+    #[serde(default)]
+    account: Option<ProfileAccount>,
+    #[serde(default)]
+    organization: Option<ProfileOrganization>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProfileAccount {
+    #[serde(default)]
+    has_claude_max: Option<bool>,
+    #[serde(default)]
+    has_claude_pro: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProfileOrganization {
+    #[serde(default)]
+    rate_limit_tier: Option<String>,
+    #[serde(default)]
+    organization_type: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedProfile {
+    captured_at: DateTime<Utc>,
+    profile: ProfileResponse,
+}
+
 // --- OAuth credentials ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct Credentials {
     #[serde(rename = "claudeAiOauth")]
     claude_ai_oauth: Option<OAuthCredentials>,
@@ -61,7 +95,7 @@ struct Credentials {
     organization_uuid: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct OAuthCredentials {
     #[serde(rename = "accessToken")]
     access_token: String,
@@ -117,6 +151,10 @@ struct CycleSnapshot {
     /// Used to estimate current % between API calls.
     #[serde(default)]
     cost_at_calibration: Option<f64>,
+    /// Plan in effect when this snapshot was captured. `None` for legacy
+    /// snapshots written before plan-tagging existed.
+    #[serde(default)]
+    plan: Option<Plan>,
 }
 
 /// Whether the current % value came from the API or was estimated locally.
@@ -136,17 +174,73 @@ pub fn run(
     offline: bool,
     live: bool,
     plan: bool,
+    account: Option<&str>,
 ) -> Result<()> {
-    let creds = match load_credentials() {
-        Ok(c) => c,
-        Err(_) => {
-            eprintln!("Claude Code credentials not found (~/.claude/.credentials.json).");
-            eprintln!("Run Claude Code at least once to create them.");
-            eprintln!();
-            eprintln!("The subscription command currently only supports Claude Max/Pro.");
-            std::process::exit(1);
+    // When `--account` is specified, load that account's stashed credentials
+    // and the org UUID it was registered under. Otherwise fall back to the
+    // currently-active credentials in `~/.claude/.credentials.json`. The
+    // subscription/usage API is per-account: we have to use the matching
+    // OAuth token, or we'd be reporting the wrong account's window.
+    let registry = crate::accounts::load_registry("claude");
+
+    // Plan mode with multiple registered accounts is ambiguous — the
+    // recommendation is per-account, so we refuse to guess.
+    if plan && account.is_none() && registry.accounts.len() > 1 {
+        eprintln!(
+            "Multiple Claude accounts registered. Specify --account <name>, or use `tku sub --all` for an overview."
+        );
+        std::process::exit(1);
+    }
+
+    let (creds, requested_org) = if let Some(name) = account {
+        let acct = registry.find_by_name(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Account '{name}' not found. Run `tku account list` to see available accounts."
+            )
+        })?;
+        // If the requested account is also the currently active one, prefer
+        // the live credentials file. Claude Code refreshes the access token
+        // in `~/.claude/.credentials.json` on each run but never writes back
+        // to the stashed copy — so the stash for the active account drifts
+        // stale and would otherwise fail the expiry check below.
+        //
+        // Match by org_uuid when present; fall back to the latest switch-log
+        // entry, since Claude Code drops `organizationUuid` from creds after
+        // a token refresh and we'd otherwise misidentify the active account.
+        let live_org = crate::accounts::current_claude_org_uuid()
+            .or_else(|| registry.latest_switch().map(|s| s.org_uuid.clone()));
+        let use_live = live_org.as_deref() == Some(acct.org_uuid.as_str());
+        let creds = if use_live {
+            load_credentials().with_context(|| {
+                format!("Cannot load live credentials while account '{name}' is active")
+            })?
+        } else {
+            let path = crate::accounts::stashed_creds_path("claude", name)
+                .ok_or_else(|| anyhow::anyhow!("cannot determine stash path"))?;
+            if !path.exists() {
+                bail!(
+                    "Stashed credentials missing for '{name}': {}. Re-add with `tku account add`.",
+                    redact(&path)
+                );
+            }
+            let data = fs::read_to_string(&path)
+                .with_context(|| format!("Cannot read {}", redact(&path)))?;
+            serde_json::from_str(&data).context("Failed to parse stashed credentials")?
+        };
+        (creds, Some(acct.org_uuid.clone()))
+    } else {
+        match load_credentials() {
+            Ok(c) => (c, None),
+            Err(_) => {
+                eprintln!("Claude Code credentials not found (~/.claude/.credentials.json).");
+                eprintln!("Run Claude Code at least once to create them.");
+                eprintln!();
+                eprintln!("The subscription command currently only supports Claude Max/Pro.");
+                std::process::exit(1);
+            }
         }
     };
+
     let oauth = match creds.claude_ai_oauth {
         Some(o) => o,
         None => {
@@ -156,29 +250,48 @@ pub fn run(
         }
     };
 
-    // `organizationUuid` is not always present in `.credentials.json` — Claude
-    // Code drops it when refreshing the access token. Fall back to the most
-    // recent active account in our registry so snapshots don't get stranded
-    // under an "unknown" key.
-    let org_uuid = creds
-        .organization_uuid
-        .or_else(|| {
-            crate::accounts::load_registry("claude")
-                .latest_switch()
-                .map(|s| s.org_uuid.clone())
-        })
+    // Resolve the org UUID we should key snapshots under. With `--account`,
+    // prefer the registry's registered UUID — stashed creds may have been
+    // refreshed since registration and dropped the field. Without `--account`,
+    // use the live creds, falling back to the registry's latest switch entry
+    // to keep snapshots from getting stranded under an "unknown" key.
+    let org_uuid = requested_org
+        .or(creds.organization_uuid)
+        .or_else(|| registry.latest_switch().map(|s| s.org_uuid.clone()))
         .unwrap_or_else(|| "unknown".to_string());
 
     let now_ms = Utc::now().timestamp_millis() as u64;
     if now_ms > oauth.expires_at {
-        eprintln!("Claude OAuth token expired. Run Claude Code to refresh your session.");
+        if account.is_some() {
+            eprintln!(
+                "Stashed OAuth token for this account has expired. Switch to it with `tku account use <name>` and run Claude Code once to refresh."
+            );
+        } else {
+            eprintln!("Claude OAuth token expired. Run Claude Code to refresh your session.");
+        }
         std::process::exit(1);
     }
 
-    // Filter records to Claude only
+    // Filter records to the right account. Without a filter we keep all
+    // Claude records (single-account behavior). With `--account`, restrict
+    // by the recorded `account_uuid`, falling back to the timestamp-based
+    // switch log for legacy records that pre-date scan-time tagging.
     let claude_records: Vec<&UsageRecord> = records
         .iter()
         .filter(|r| r.provider == Provider::Claude)
+        .filter(|r| match account {
+            None => true,
+            Some(name) => match r.account_uuid.as_deref() {
+                Some(uuid) => registry
+                    .find_by_org(uuid)
+                    .map(|a| a.name == *name)
+                    .unwrap_or(false),
+                None => registry
+                    .account_at(r.timestamp)
+                    .map(|e| e.name == *name)
+                    .unwrap_or(false),
+            },
+        })
         .collect();
 
     let mut store = load_snapshots(&org_uuid);
@@ -262,13 +375,26 @@ pub fn run(
     let cycle_start = resets_at - Duration::days(7);
     let current_cost = cost_in_range(&claude_records, cycle_start, Utc::now(), pricing);
 
+    // Live plan: profile API → cached profile → OAuth claims. Falling back
+    // silently keeps offline runs working; a stale-after-switch state is
+    // bounded by the 24h profile cache.
+    let (live_plan, profile) = resolve_live_plan(&oauth.access_token, &org_uuid, offline);
+    let oauth_plan = detect_plan(&oauth);
+    let resolved_plan = live_plan.or(oauth_plan);
+
     // Save snapshot for current cycle when we got live data
     if let Some(w) = &seven_day {
-        save_snapshot(resets_at, w.utilization, current_cost, &mut store);
+        save_snapshot(
+            resets_at,
+            w.utilization,
+            current_cost,
+            resolved_plan,
+            &mut store,
+        );
     }
 
     if plan {
-        return run_plan_mode(&oauth, &store, resets_at, exchange);
+        return run_plan_mode(&oauth, &store, resets_at, exchange, resolved_plan, &usage);
     }
 
     let cycles = compute_cycles(resets_at, 4);
@@ -283,10 +409,14 @@ pub fn run(
         current_cost,
     );
 
-    // Header
+    // Header. Prefer the live profile's tier label; fall back to OAuth
+    // claims (which can be stale after a plan switch on anthropic.com).
     let sub_type = oauth.subscription_type.as_deref().unwrap_or("unknown");
     let tier = oauth.rate_limit_tier.as_deref().unwrap_or("");
-    let tier_label = format_tier(sub_type, tier);
+    let tier_label = profile
+        .as_ref()
+        .and_then(format_tier_from_profile)
+        .unwrap_or_else(|| format_tier(sub_type, tier));
 
     if let Some(pct) = current_pct {
         let prefix = match current_source {
@@ -529,6 +659,128 @@ fn fetch_usage(access_token: &str) -> Result<UsageResponse> {
     serde_json::from_str(&body).context("Failed to parse usage response")
 }
 
+fn fetch_profile(access_token: &str) -> Result<ProfileResponse> {
+    let body = crate::http::agent()
+        .get(PROFILE_API_URL)
+        .header("Authorization", &format!("Bearer {access_token}"))
+        .header("anthropic-beta", ANTHROPIC_BETA)
+        .call()
+        .context("Failed to call profile API")?
+        .body_mut()
+        .with_config()
+        .limit(1024 * 1024)
+        .read_to_string()
+        .context("Failed to read profile response")?;
+    serde_json::from_str(&body).context("Failed to parse profile response")
+}
+
+fn profile_cache_path(org_uuid: &str) -> Option<std::path::PathBuf> {
+    paths::profile_cache_file(org_uuid)
+}
+
+fn load_cached_profile(org_uuid: &str) -> Option<ProfileResponse> {
+    let path = profile_cache_path(org_uuid)?;
+    let data = fs::read_to_string(&path).ok()?;
+    let cached: CachedProfile = serde_json::from_str(&data).ok()?;
+    let age = Utc::now().signed_duration_since(cached.captured_at);
+    if age > Duration::hours(PROFILE_CACHE_TTL_HOURS) {
+        return None;
+    }
+    Some(cached.profile)
+}
+
+fn save_cached_profile(org_uuid: &str, profile: &ProfileResponse) {
+    let Some(path) = profile_cache_path(org_uuid) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!("warning: failed to create profile cache dir: {e}");
+            return;
+        }
+    }
+    let cached = CachedProfile {
+        captured_at: Utc::now(),
+        profile: profile.clone(),
+    };
+    match serde_json::to_string_pretty(&cached) {
+        Ok(data) => {
+            if let Err(e) = atomic_write(&path, data.as_bytes(), Some(0o600)) {
+                eprintln!("warning: failed to save profile cache: {e}");
+            }
+        }
+        Err(e) => eprintln!("warning: failed to serialize profile cache: {e}"),
+    }
+}
+
+/// Fetch the live plan for an account, with 24h cache. Honors `--offline`
+/// (returns None without touching the network or cache freshness check).
+/// Network failures fall back to a stale cache when present, then None.
+fn resolve_live_plan(
+    access_token: &str,
+    org_uuid: &str,
+    offline: bool,
+) -> (Option<Plan>, Option<ProfileResponse>) {
+    if offline {
+        return (None, None);
+    }
+    if let Some(p) = load_cached_profile(org_uuid) {
+        let plan = plan_from_profile(&p);
+        return (plan, Some(p));
+    }
+    match fetch_profile(access_token) {
+        Ok(p) => {
+            save_cached_profile(org_uuid, &p);
+            let plan = plan_from_profile(&p);
+            (plan, Some(p))
+        }
+        Err(_) => (None, None),
+    }
+}
+
+/// Map a profile response onto a `Plan`. Prefers `organization.rate_limit_tier`
+/// (the source of truth for active tier), falls back to the boolean flags on
+/// `account` for the Pro/Max distinction when tier is missing.
+fn plan_from_profile(p: &ProfileResponse) -> Option<Plan> {
+    if let Some(org) = &p.organization {
+        if let Some(tier) = org.rate_limit_tier.as_deref() {
+            if tier.contains("20x") {
+                return Some(Plan::Max20x);
+            }
+            if tier.contains("5x") || tier.contains("max") {
+                return Some(Plan::Max5x);
+            }
+            if tier.contains("pro") {
+                return Some(Plan::Pro);
+            }
+        }
+        if let Some(t) = org.organization_type.as_deref() {
+            if t == "claude_max" {
+                return Some(Plan::Max5x);
+            }
+            if t == "claude_pro" {
+                return Some(Plan::Pro);
+            }
+        }
+    }
+    if let Some(acc) = &p.account {
+        if acc.has_claude_max == Some(true) {
+            return Some(Plan::Max5x);
+        }
+        if acc.has_claude_pro == Some(true) {
+            return Some(Plan::Pro);
+        }
+    }
+    None
+}
+
+/// Format a tier label from a profile response, mirroring `format_tier` for
+/// OAuth claims. Used when the live profile is the source of truth.
+fn format_tier_from_profile(p: &ProfileResponse) -> Option<String> {
+    let plan = plan_from_profile(p)?;
+    Some(plan.label().to_string())
+}
+
 fn snapshot_path() -> Option<std::path::PathBuf> {
     paths::subscription_snapshot_file("claude")
 }
@@ -595,10 +847,66 @@ fn load_snapshots(org_uuid: &str) -> SnapshotStore {
     }
 }
 
+/// In-memory snapshot mutation, factored out so the fork-on-plan-change
+/// logic is unit-testable without disk I/O. Mid-cycle plan change: if an
+/// existing entry for this cycle has a different tagged plan, fork — leave
+/// the old entry intact and append a new one.
+fn apply_snapshot(
+    snapshots: &mut Vec<CycleSnapshot>,
+    cycle_end: DateTime<Utc>,
+    utilization: f64,
+    cost: Option<f64>,
+    plan: Option<Plan>,
+    now: DateTime<Utc>,
+) {
+    let target = round_to_minute(cycle_end);
+    let existing_idx = snapshots
+        .iter()
+        .position(|s| round_to_minute(s.cycle_end) == target);
+    let should_fork = match (existing_idx, plan) {
+        (Some(i), Some(new_plan)) => matches!(snapshots[i].plan, Some(old) if old != new_plan),
+        _ => false,
+    };
+
+    if should_fork {
+        snapshots.push(CycleSnapshot {
+            cycle_end,
+            utilization,
+            captured_at: now,
+            cost_at_calibration: cost,
+            plan,
+        });
+    } else if let Some(i) = existing_idx {
+        let existing = &mut snapshots[i];
+        existing.cycle_end = cycle_end;
+        existing.utilization = utilization;
+        existing.captured_at = now;
+        existing.cost_at_calibration = cost;
+        if plan.is_some() {
+            existing.plan = plan;
+        }
+    } else {
+        snapshots.push(CycleSnapshot {
+            cycle_end,
+            utilization,
+            captured_at: now,
+            cost_at_calibration: cost,
+            plan,
+        });
+    }
+
+    snapshots.sort_by_key(|s| s.cycle_end);
+    if snapshots.len() > 12 {
+        let excess = snapshots.len() - 12;
+        snapshots.drain(..excess);
+    }
+}
+
 fn save_snapshot(
     cycle_end: DateTime<Utc>,
     utilization: f64,
     cost: Option<f64>,
+    plan: Option<Plan>,
     store: &mut SnapshotStore,
 ) {
     let Some(path) = snapshot_path() else { return };
@@ -608,31 +916,14 @@ fn save_snapshot(
         }
     }
 
-    let target = round_to_minute(cycle_end);
-    if let Some(existing) = store
-        .snapshots
-        .iter_mut()
-        .find(|s| round_to_minute(s.cycle_end) == target)
-    {
-        existing.cycle_end = cycle_end;
-        existing.utilization = utilization;
-        existing.captured_at = Utc::now();
-        existing.cost_at_calibration = cost;
-    } else {
-        store.snapshots.push(CycleSnapshot {
-            cycle_end,
-            utilization,
-            captured_at: Utc::now(),
-            cost_at_calibration: cost,
-        });
-    }
-
-    // Keep only last 12 snapshots per account
-    store.snapshots.sort_by_key(|s| s.cycle_end);
-    if store.snapshots.len() > 12 {
-        let excess = store.snapshots.len() - 12;
-        store.snapshots.drain(..excess);
-    }
+    apply_snapshot(
+        &mut store.snapshots,
+        cycle_end,
+        utilization,
+        cost,
+        plan,
+        Utc::now(),
+    );
 
     // Re-read + merge so we don't clobber other accounts' data on write.
     let existing_data = fs::read_to_string(&path).unwrap_or_default();
@@ -669,10 +960,14 @@ fn round_to_minute(dt: DateTime<Utc>) -> DateTime<Utc> {
 
 fn find_snapshot(store: &SnapshotStore, cycle_end: DateTime<Utc>) -> Option<f64> {
     let target = round_to_minute(cycle_end);
+    // Prefer the most-recently-captured entry for this cycle: when a plan
+    // change forked the cycle into multiple rows, the newer one reflects
+    // current state.
     store
         .snapshots
         .iter()
-        .find(|s| round_to_minute(s.cycle_end) == target)
+        .filter(|s| round_to_minute(s.cycle_end) == target)
+        .max_by_key(|s| s.captured_at)
         .map(|s| s.utilization)
 }
 
@@ -756,7 +1051,8 @@ fn format_duration_short(hours: f64) -> String {
 
 /// Claude subscription plans we can reason about.
 /// Prices are Anthropic's public USD rates as of early 2026; may drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum Plan {
     Pro,
     Max5x,
@@ -863,8 +1159,11 @@ fn run_plan_mode(
     store: &SnapshotStore,
     current_cycle_end: DateTime<Utc>,
     exchange: &ExchangeRate,
+    live_plan: Option<Plan>,
+    usage: &Option<UsageResponse>,
 ) -> Result<()> {
-    let Some(current) = detect_plan(oauth) else {
+    // Live profile is the source of truth; OAuth claims are the fallback.
+    let Some(current) = live_plan.or_else(|| detect_plan(oauth)) else {
         eprintln!(
             "Unsupported subscription type: {:?}",
             oauth.subscription_type
@@ -884,6 +1183,20 @@ fn run_plan_mode(
     completed.sort_by_key(|s| s.cycle_end);
     let recent: Vec<&CycleSnapshot> = completed.iter().rev().take(4).rev().copied().collect();
 
+    // Partition by provenance: native (current plan) drives the heuristic,
+    // foreign goes to the table only (re-projected), unknown is excluded.
+    let native: Vec<&CycleSnapshot> = recent
+        .iter()
+        .copied()
+        .filter(|s| s.plan == Some(current))
+        .collect();
+    let foreign: Vec<&CycleSnapshot> = recent
+        .iter()
+        .copied()
+        .filter(|s| matches!(s.plan, Some(p) if p != current))
+        .collect();
+    let mixed_plans = !foreign.is_empty() || recent.iter().any(|s| s.plan.is_none());
+
     eprintln!(
         "{} — {}/month",
         current.label(),
@@ -891,110 +1204,205 @@ fn run_plan_mode(
     );
     eprintln!();
 
-    if recent.len() < 2 {
-        eprintln!(
-            "Not enough data for a recommendation ({} completed cycle{} captured).",
-            recent.len(),
-            if recent.len() == 1 { "" } else { "s" }
-        );
+    let native_utilizations: Vec<f64> = native.iter().map(|s| s.utilization).collect();
+    let opus_pct = usage
+        .as_ref()
+        .and_then(|u| u.seven_day_opus.as_ref())
+        .map(|w| w.utilization);
+
+    enum Synth {
+        None,
+        Recent,                     // post-switch, no useful data yet
+        Partial { projected: f64 }, // in-progress current cycle, ≥48h
+    }
+
+    let synth = if native.is_empty() {
+        // Post-switch: try the in-progress cycle as a single synthetic point
+        // when we have at least 48h of history on the new plan.
+        let cycle_start = current_cycle_end - Duration::days(7);
+        let elapsed_h = Utc::now().signed_duration_since(cycle_start).num_minutes() as f64 / 60.0;
+        let live_pct = usage
+            .as_ref()
+            .and_then(|u| u.seven_day.as_ref())
+            .map(|w| w.utilization);
+        match (live_pct, elapsed_h >= 48.0) {
+            (Some(pct), true) if pct > 0.0 => {
+                let cycle_remaining_h = current_cycle_end
+                    .signed_duration_since(Utc::now())
+                    .num_minutes() as f64
+                    / 60.0;
+                let rate_per_h = pct / elapsed_h;
+                let projected = (pct + rate_per_h * cycle_remaining_h).min(200.0);
+                Synth::Partial { projected }
+            }
+            _ => Synth::Recent,
+        }
+    } else {
+        Synth::None
+    };
+
+    let (avg, max, rec): (f64, f64, Recommendation) = if !native.is_empty() {
+        let avg = native_utilizations.iter().sum::<f64>() / native_utilizations.len() as f64;
+        let max = native_utilizations.iter().cloned().fold(0.0_f64, f64::max);
+        let mut rec = recommend(current, &native_utilizations);
+        // Opus-share guard: per-snapshot Opus history isn't stored, so we
+        // only block on the live current-cycle figure. If Opus is hot,
+        // Pro's tighter Opus tier would throttle hard; defer the downgrade.
+        if let Recommendation::Downgrade(Plan::Pro) = rec {
+            if let Some(opus) = opus_pct {
+                if opus >= 25.0 {
+                    eprintln!(
+                        "Pro downgrade skipped — Opus usage on current cycle (~{:.0}%) suggests Pro's tier limits would throttle hard.",
+                        opus
+                    );
+                    rec = Recommendation::Stay;
+                }
+            }
+        }
+        (avg, max, rec)
+    } else if let Synth::Partial { projected } = synth {
+        let utils = vec![projected];
+        let mut rec = recommend(current, &utils);
+        if let Recommendation::Downgrade(Plan::Pro) = rec {
+            if let Some(opus) = opus_pct {
+                if opus >= 25.0 {
+                    eprintln!(
+                        "Pro downgrade skipped — Opus usage on current cycle (~{:.0}%) suggests Pro's tier limits would throttle hard.",
+                        opus
+                    );
+                    rec = Recommendation::Stay;
+                }
+            }
+        }
+        (projected, projected, rec)
+    } else {
+        (0.0, 0.0, Recommendation::Stay)
+    };
+
+    // Headline. Special-case the post-switch "no native data, no useful
+    // partial cycle" case — show the table but defer the explanatory note
+    // to *after* the table so the recommendation slot stays visually clean.
+    let recent_switch = native.is_empty() && matches!(synth, Synth::Recent);
+    let mut printed_recommendation = false;
+    if recent_switch {
+        // Note rendered post-table; nothing here.
+    } else {
+        printed_recommendation = true;
+        let cycle_count_label = if native.is_empty() {
+            "1 (partial cycle)".to_string()
+        } else {
+            format!("{}", native.len())
+        };
+        match rec {
+            Recommendation::Downgrade(to) => {
+                let savings = current.price_usd() - to.price_usd();
+                let proj_avg = project_pct(avg, current, to);
+                let proj_max = project_pct(max, current, to);
+                eprintln!(
+                    "▸ Recommend: downgrade to {} — save ~{}/month",
+                    to.label(),
+                    exchange.format_cost(Some(savings))
+                );
+                eprintln!();
+                eprintln!(
+                    "  {}-cycle average was {:.0}% (peak {:.0}%). On {}, this projects to",
+                    cycle_count_label,
+                    avg,
+                    max,
+                    to.label()
+                );
+                eprintln!(
+                    "  ~{:.0}% avg (~{:.0}% peak) — comfortable headroom.",
+                    proj_avg, proj_max
+                );
+            }
+            Recommendation::Upgrade(to) => {
+                let extra = to.price_usd() - current.price_usd();
+                eprintln!(
+                    "▸ Recommend: upgrade to {} — +{}/month",
+                    to.label(),
+                    exchange.format_cost(Some(extra))
+                );
+                eprintln!();
+                let near_cap = native_utilizations.iter().filter(|&&x| x >= 95.0).count();
+                if near_cap >= 2 {
+                    eprintln!(
+                        "  You've hit ≥95% utilization in {} of the last {} cycles.",
+                        near_cap,
+                        native.len()
+                    );
+                } else {
+                    eprintln!(
+                        "  {}-cycle average is {:.0}% — consistently near capacity.",
+                        cycle_count_label, avg
+                    );
+                }
+                eprintln!(
+                    "  {} offers {:.0}× more headroom for the same workload.",
+                    to.label(),
+                    to.pro_units() / current.pro_units()
+                );
+            }
+            Recommendation::Stay => {
+                eprintln!("▸ Recommend: stay on {}", current.label());
+                eprintln!();
+                if native.is_empty() {
+                    eprintln!(
+                        "  Partial-cycle projection: ~{:.0}% on {}.",
+                        max,
+                        current.label()
+                    );
+                } else {
+                    eprintln!(
+                        "  {}-cycle average was {:.0}% (peak {:.0}%).",
+                        cycle_count_label, avg, max
+                    );
+                }
+                if let Some(lower) = current.downgrade() {
+                    let proj_max = project_pct(max, current, lower);
+                    eprintln!(
+                        "  Downgrading to {} would push peak to ~{:.0}% — too tight.",
+                        lower.label(),
+                        proj_max
+                    );
+                } else {
+                    eprintln!("  Utilization is in a comfortable range for this plan.");
+                }
+            }
+        }
+    }
+
+    if native.is_empty() && matches!(synth, Synth::Recent) && recent.len() < 2 && foreign.is_empty()
+    {
+        // Fresh install or genuinely no data — preserve the original guidance.
+        eprintln!();
         eprintln!("Run `tku sub` over a few weekly cycles first — recommendations need");
         eprintln!("at least 2 completed cycles to be meaningful.");
         return Ok(());
     }
 
-    let utilizations: Vec<f64> = recent.iter().map(|s| s.utilization).collect();
-    let avg = utilizations.iter().sum::<f64>() / utilizations.len() as f64;
-    let max = utilizations.iter().cloned().fold(0.0_f64, f64::max);
-    let rec = recommend(current, &utilizations);
-
-    match rec {
-        Recommendation::Downgrade(to) => {
-            let savings = current.price_usd() - to.price_usd();
-            let proj_avg = project_pct(avg, current, to);
-            let proj_max = project_pct(max, current, to);
-            eprintln!(
-                "▸ Recommend: downgrade to {} — save ~{}/month",
-                to.label(),
-                exchange.format_cost(Some(savings))
-            );
-            eprintln!();
-            eprintln!(
-                "  {}-cycle average was {:.0}% (peak {:.0}%). On {}, this projects to",
-                recent.len(),
-                avg,
-                max,
-                to.label()
-            );
-            eprintln!(
-                "  ~{:.0}% avg (~{:.0}% peak) — comfortable headroom.",
-                proj_avg, proj_max
-            );
-        }
-        Recommendation::Upgrade(to) => {
-            let extra = to.price_usd() - current.price_usd();
-            eprintln!(
-                "▸ Recommend: upgrade to {} — +{}/month",
-                to.label(),
-                exchange.format_cost(Some(extra))
-            );
-            eprintln!();
-            let near_cap = utilizations.iter().filter(|&&x| x >= 95.0).count();
-            if near_cap >= 2 {
-                eprintln!(
-                    "  You've hit ≥95% utilization in {} of the last {} cycles.",
-                    near_cap,
-                    recent.len()
-                );
-            } else {
-                eprintln!(
-                    "  {}-cycle average is {:.0}% — consistently near capacity.",
-                    recent.len(),
-                    avg
-                );
-            }
-            eprintln!(
-                "  {} offers {:.0}× more headroom for the same workload.",
-                to.label(),
-                to.pro_units() / current.pro_units()
-            );
-        }
-        Recommendation::Stay => {
-            eprintln!("▸ Recommend: stay on {}", current.label());
-            eprintln!();
-            eprintln!(
-                "  {}-cycle average was {:.0}% (peak {:.0}%).",
-                recent.len(),
-                avg,
-                max
-            );
-            if let Some(lower) = current.downgrade() {
-                let proj_max = project_pct(max, current, lower);
-                eprintln!(
-                    "  Downgrading to {} would push peak to ~{:.0}% — too tight.",
-                    lower.label(),
-                    proj_max
-                );
-            } else {
-                eprintln!("  Utilization is in a comfortable range for this plan.");
-            }
-        }
+    if printed_recommendation {
+        eprintln!();
     }
-
-    eprintln!();
 
     // Cycle table
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
     table.set_content_arrangement(ContentArrangement::Dynamic);
-    let mut header = vec![Cell::new("Period"), Cell::new(current.label())];
-    if let Some(lower) = current.downgrade() {
-        header.push(Cell::new(format!("on {}", lower.label())));
-        if let Some(lower2) = lower.downgrade() {
-            header.push(Cell::new(format!("on {}", lower2.label())));
-        }
+    // Ascending tier order, regardless of which is current. Current keeps a
+    // bare label; others get an "on " prefix so the user can still spot it.
+    const TIER_ORDER: [Plan; 3] = [Plan::Pro, Plan::Max5x, Plan::Max20x];
+    let mut header = vec![Cell::new("Period")];
+    if mixed_plans {
+        header.push(Cell::new("Plan"));
     }
-    if let Some(higher) = current.upgrade() {
-        header.push(Cell::new(format!("on {}", higher.label())));
+    for plan in TIER_ORDER {
+        let label = if plan == current {
+            plan.label().to_string()
+        } else {
+            format!("on {}", plan.label())
+        };
+        header.push(Cell::new(label));
     }
     table.set_header(header);
 
@@ -1005,22 +1413,30 @@ fn run_plan_mode(
             start.format("%b %-d"),
             snap.cycle_end.format("%b %-d")
         );
-        let pct = snap.utilization;
-        let mut row = vec![Cell::new(&period_label), Cell::new(format!("{:.0}%", pct))];
-        if let Some(lower) = current.downgrade() {
-            row.push(Cell::new(format_projection(project_pct(
-                pct, current, lower,
-            ))));
-            if let Some(lower2) = lower.downgrade() {
-                row.push(Cell::new(format_projection(project_pct(
-                    pct, current, lower2,
-                ))));
-            }
+        // Re-project foreign snapshots onto current; unknown stay as `?`.
+        let snap_plan = snap.plan;
+        let on_current_pct: Option<f64> = match snap_plan {
+            Some(p) if p == current => Some(snap.utilization),
+            Some(p) => Some(project_pct(snap.utilization, p, current)),
+            None => None,
+        };
+
+        let mut row = vec![Cell::new(&period_label)];
+        if mixed_plans {
+            let plan_cell = match snap_plan {
+                Some(p) => p.label().to_string(),
+                None => "?".to_string(),
+            };
+            row.push(Cell::new(plan_cell));
         }
-        if let Some(higher) = current.upgrade() {
-            row.push(Cell::new(format_projection(project_pct(
-                pct, current, higher,
-            ))));
+        let project_from = on_current_pct;
+        for plan in TIER_ORDER {
+            let cell = match project_from {
+                Some(p) if plan == current => format!("{:.0}%", p),
+                Some(p) => format_projection(project_pct(p, current, plan)),
+                None => "?".to_string(),
+            };
+            row.push(Cell::new(cell));
         }
         table.add_row(row);
     }
@@ -1028,12 +1444,25 @@ fn run_plan_mode(
     println!("{table}");
 
     eprintln!();
-    eprintln!(
-        "Based on {} completed weekly cycle{}. Seasonal patterns or",
-        recent.len(),
-        if recent.len() == 1 { "" } else { "s" }
-    );
-    eprintln!("upcoming projects may shift your actual needs.");
+    if printed_recommendation {
+        let cycles_used = if native.is_empty() {
+            "a partial cycle on the new plan".to_string()
+        } else {
+            format!(
+                "{} completed weekly cycle{}",
+                native.len(),
+                if native.len() == 1 { "" } else { "s" }
+            )
+        };
+        eprintln!("Based on {}. Seasonal patterns or", cycles_used);
+        eprintln!("upcoming projects may shift your actual needs.");
+    } else if recent_switch {
+        eprintln!(
+            "Note: just switched to {}. A recommendation will appear once",
+            current.label()
+        );
+        eprintln!("there's ~48h of usage on the new plan, or one completed cycle.");
+    }
 
     Ok(())
 }
@@ -1061,6 +1490,301 @@ fn format_overage(extra: Option<&ExtraUsage>, exchange: &ExchangeRate) -> String
         exchange.format_cost(Some(used)),
         exchange.format_cost(Some(limit))
     )
+}
+
+// --- Cross-account view (`tku sub --all`) ---
+
+/// One row in the cross-account overview. Each account has its own billing
+/// cycle, plan, and OAuth token, so the only thing we sum across rows is
+/// the cost column — usage % comparisons are deliberately left to the user.
+struct AccountRow {
+    name: String,
+    is_active: bool,
+    plan_label: String,
+    seven_day_pct: Option<f64>,
+    seven_day_source: UsageSource,
+    five_hour_pct: Option<f64>,
+    resets_at: Option<DateTime<Utc>>,
+    cost: Option<f64>,
+    note: Option<String>,
+}
+
+/// Render a one-row-per-account overview of every registered Claude account.
+///
+/// Per-account behavior:
+/// - Currently-active account uses live `~/.claude/.credentials.json` (fresh
+///   token — Claude Code refreshes it on every run).
+/// - Inactive accounts use their stashed credentials. If the stashed token
+///   has expired, we skip the API call and fall back to the cached snapshot;
+///   the user is told to switch in and re-auth to get fresh data.
+/// - Cost is always computed locally from records; it works fully offline.
+pub fn run_all(
+    exchange: &ExchangeRate,
+    records: &[UsageRecord],
+    pricing: &dyn PricingMap,
+    offline: bool,
+    live: bool,
+) -> Result<()> {
+    let registry = crate::accounts::load_registry("claude");
+    if registry.accounts.is_empty() {
+        eprintln!("No accounts registered.");
+        eprintln!();
+        eprintln!("Run `tku sub` once to auto-register your current account, or");
+        eprintln!("`tku account add <name>` to register additional accounts.");
+        return Ok(());
+    }
+
+    let active_org = crate::accounts::current_claude_org_uuid()
+        .or_else(|| registry.latest_switch().map(|s| s.org_uuid.clone()));
+
+    let claude_records: Vec<&UsageRecord> = records
+        .iter()
+        .filter(|r| r.provider == Provider::Claude)
+        .collect();
+
+    // Live creds load once — cheap, and avoids re-reading + re-parsing per
+    // active-account match (there's only ever one active, but this also
+    // keeps the inactive branch from accidentally touching the live file).
+    let live_creds = load_credentials().ok();
+
+    let rows: Vec<AccountRow> = registry
+        .accounts
+        .iter()
+        .map(|account| {
+            let is_active = active_org.as_deref() == Some(account.org_uuid.as_str());
+            gather_account_row(
+                account,
+                is_active,
+                live_creds.clone(),
+                &claude_records,
+                &registry,
+                pricing,
+                offline,
+                live,
+            )
+        })
+        .collect();
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec![
+        Cell::new("Account"),
+        Cell::new("Plan"),
+        Cell::new("7-day"),
+        Cell::new("5h"),
+        Cell::new("Resets"),
+        Cell::new("Cost"),
+    ]);
+
+    let mut total_cost = 0.0;
+    let mut any_cost = false;
+    for row in &rows {
+        let name_cell = if row.is_active {
+            format!("* {}", row.name)
+        } else {
+            format!("  {}", row.name)
+        };
+        let name_with_note = match &row.note {
+            Some(n) => format!("{name_cell}\n  ({n})"),
+            None => name_cell,
+        };
+
+        let seven_str = match (row.seven_day_pct, row.seven_day_source) {
+            (Some(p), UsageSource::Estimated) => format!("~{:.0}%", p),
+            (Some(p), _) => format!("{:.0}%", p),
+            (None, _) => "—".to_string(),
+        };
+        let five_str = match row.five_hour_pct {
+            Some(p) => format!("{:.0}%", p),
+            None => "—".to_string(),
+        };
+        let resets_str = row
+            .resets_at
+            .map(|r| {
+                r.with_timezone(&chrono::Local)
+                    .format("%b %-d, %-I:%M%P")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "—".to_string());
+        let cost_str = exchange.format_cost(row.cost);
+        if let Some(c) = row.cost {
+            total_cost += c;
+            any_cost = true;
+        }
+
+        table.add_row(vec![
+            Cell::new(name_with_note),
+            Cell::new(&row.plan_label),
+            Cell::new(&seven_str),
+            Cell::new(&five_str),
+            Cell::new(&resets_str),
+            Cell::new(&cost_str),
+        ]);
+    }
+
+    // Summing usage % across accounts on different cycles isn't meaningful,
+    // so the TOTAL row only fills the cost column. Skip the row entirely
+    // when there's a single account — it would just duplicate the data.
+    if rows.len() > 1 && any_cost {
+        table.add_row(vec![
+            Cell::new("TOTAL"),
+            Cell::new(""),
+            Cell::new(""),
+            Cell::new(""),
+            Cell::new(""),
+            Cell::new(exchange.format_cost(Some(total_cost))),
+        ]);
+    }
+
+    println!("{table}");
+    eprintln!();
+    eprintln!("* = currently active. Run `tku sub --account <name>` for full details.");
+    let _ = live; // currently identical to default per-account behavior; kept
+                  // for parity with `tku sub` and a future force-refresh path.
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gather_account_row(
+    account: &crate::accounts::Account,
+    is_active: bool,
+    live_creds: Option<Credentials>,
+    claude_records: &[&UsageRecord],
+    registry: &crate::accounts::Registry,
+    pricing: &dyn PricingMap,
+    offline: bool,
+    _live: bool,
+) -> AccountRow {
+    // Records belonging to this account: prefer the recorded uuid, fall
+    // back to the timestamp-based switch log for legacy untagged records.
+    let account_records: Vec<&UsageRecord> = claude_records
+        .iter()
+        .copied()
+        .filter(|r| match r.account_uuid.as_deref() {
+            Some(uuid) => uuid == account.org_uuid.as_str(),
+            None => registry
+                .account_at(r.timestamp)
+                .map(|e| e.org_uuid == account.org_uuid)
+                .unwrap_or(false),
+        })
+        .collect();
+
+    let creds = if is_active {
+        live_creds
+    } else {
+        let path = crate::accounts::stashed_creds_path("claude", &account.name);
+        path.filter(|p| p.exists())
+            .and_then(|p| fs::read_to_string(&p).ok())
+            .and_then(|d| serde_json::from_str::<Credentials>(&d).ok())
+    };
+
+    let oauth = creds.as_ref().and_then(|c| c.claude_ai_oauth.as_ref());
+
+    let now_ms = Utc::now().timestamp_millis() as u64;
+    let creds_fresh = oauth.map(|o| now_ms <= o.expires_at).unwrap_or(false);
+
+    let mut store = load_snapshots(&account.org_uuid);
+    let cached_cycle = current_cycle_from_snapshots(&store);
+
+    // Live profile only for the active account — inactive tokens may be
+    // stale and we don't want to spam the API per-account on every run.
+    let live_plan = if is_active && creds_fresh {
+        oauth.and_then(|o| resolve_live_plan(&o.access_token, &account.org_uuid, offline).0)
+    } else {
+        None
+    };
+
+    // Plan label: live profile (active) → most-recent snapshot's tagged plan
+    //  → OAuth claims → registry-stamped subscription_type at registration time.
+    let plan_label = if let Some(p) = live_plan {
+        p.label().to_string()
+    } else if let Some(p) = store
+        .snapshots
+        .iter()
+        .max_by_key(|s| s.captured_at)
+        .and_then(|s| s.plan)
+    {
+        p.label().to_string()
+    } else {
+        match oauth {
+            Some(o) => format_tier(
+                o.subscription_type.as_deref().unwrap_or("unknown"),
+                o.rate_limit_tier.as_deref().unwrap_or(""),
+            ),
+            None => match &account.subscription_type {
+                Some(s) => format_tier(s, account.rate_limit_tier.as_deref().unwrap_or("")),
+                None => "unknown".to_string(),
+            },
+        }
+    };
+
+    // Fetch unless we're offline or the token's stale. Inactive accounts
+    // with stashed-but-expired tokens degrade gracefully to cached data —
+    // we don't want a dead account to break the whole overview.
+    let usage = if offline || !creds_fresh {
+        None
+    } else {
+        oauth.and_then(|o| fetch_usage(&o.access_token).ok())
+    };
+
+    let resolved_plan = live_plan.or_else(|| oauth.and_then(detect_plan));
+
+    let mut note = None;
+    if !creds_fresh && oauth.is_some() && !is_active {
+        note = Some("token expired — `tku account use` to refresh".to_string());
+    } else if oauth.is_none() && !is_active {
+        note = Some("no stashed credentials".to_string());
+    }
+
+    let seven_day = usage.as_ref().and_then(|u| u.seven_day.as_ref());
+    let resets_at = seven_day
+        .and_then(|w| w.resets_at.as_ref())
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        .or_else(|| cached_cycle.map(|(_, end)| end));
+
+    let cost = match resets_at {
+        Some(end) => {
+            let start = end - Duration::days(7);
+            let upper = end.min(Utc::now());
+            cost_in_range(&account_records, start, upper, pricing)
+        }
+        None => None,
+    };
+
+    // Persist fresh API data under this account's UUID so a later `--all`
+    // run can show the % even if this account's token has since expired.
+    if let (Some(end), Some(w)) = (resets_at, &seven_day) {
+        save_snapshot(end, w.utilization, cost, resolved_plan, &mut store);
+    }
+
+    // Reuse the same Live → Estimated → Cached resolution the single-account
+    // view uses, so a cycle with cached snapshot + cost data shows the
+    // "~XX%" estimate instead of the stale calibration value.
+    let (seven_day_pct, seven_day_source) = match resets_at {
+        Some(end) => {
+            resolve_current_usage(usage.as_ref(), &store, end, &account_records, pricing, cost)
+        }
+        None => (None, UsageSource::Cached),
+    };
+
+    let five_hour_pct = usage
+        .as_ref()
+        .and_then(|u| u.five_hour.as_ref())
+        .map(|w| w.utilization);
+
+    AccountRow {
+        name: account.name.clone(),
+        is_active,
+        plan_label,
+        seven_day_pct,
+        seven_day_source,
+        five_hour_pct,
+        resets_at,
+        cost,
+        note,
+    }
 }
 
 #[cfg(test)]
@@ -1153,5 +1877,231 @@ mod tests {
         assert_eq!(reparsed.version, 2);
         assert_eq!(reparsed.accounts.len(), 1);
         assert_eq!(reparsed.accounts["org-abc-123"].snapshots.len(), 2);
+    }
+
+    // --- Plan serde + provenance tests ---
+
+    #[test]
+    fn plan_serializes_to_stable_strings() {
+        assert_eq!(serde_json::to_string(&Plan::Pro).unwrap(), "\"pro\"");
+        assert_eq!(serde_json::to_string(&Plan::Max5x).unwrap(), "\"max5x\"");
+        assert_eq!(serde_json::to_string(&Plan::Max20x).unwrap(), "\"max20x\"");
+    }
+
+    #[test]
+    fn plan_roundtrips_through_serde() {
+        for p in [Plan::Pro, Plan::Max5x, Plan::Max20x] {
+            let s = serde_json::to_string(&p).unwrap();
+            let back: Plan = serde_json::from_str(&s).unwrap();
+            assert_eq!(p, back);
+        }
+    }
+
+    const V2_WITH_PLAN: &str = r#"{
+        "version": 2,
+        "accounts": {
+            "org-aaa": {
+                "snapshots": [
+                    {
+                        "cycle_end": "2026-04-01T10:00:00Z",
+                        "utilization": 18.0,
+                        "captured_at": "2026-03-28T10:00:00Z",
+                        "cost_at_calibration": 42.5,
+                        "plan": "max5x"
+                    }
+                ]
+            }
+        }
+    }"#;
+
+    #[test]
+    fn snapshot_with_plan_roundtrips() {
+        let store = parse_on_disk(V2_WITH_PLAN, "ignored");
+        let snap = &store.accounts["org-aaa"].snapshots[0];
+        assert_eq!(snap.plan, Some(Plan::Max5x));
+
+        let serialized = serde_json::to_string_pretty(&store).expect("serialize");
+        let reparsed = parse_on_disk(&serialized, "ignored");
+        let snap2 = &reparsed.accounts["org-aaa"].snapshots[0];
+        assert_eq!(snap2.plan, Some(Plan::Max5x));
+        assert_eq!(snap2.utilization, 18.0);
+    }
+
+    #[test]
+    fn snapshot_without_plan_field_loads_as_none() {
+        // V2_SAMPLE has no `plan` field on its snapshot.
+        let store = parse_on_disk(V2_SAMPLE, "ignored");
+        let snap = &store.accounts["org-aaa"].snapshots[0];
+        assert_eq!(snap.plan, None);
+        // And re-serializes cleanly.
+        let serialized = serde_json::to_string(&store).expect("serialize");
+        assert!(serialized.contains("org-aaa"));
+    }
+
+    // --- recommend() native-only correctness ---
+
+    #[test]
+    fn recommend_with_natives_preserves_existing_behavior() {
+        // High avg → upgrade.
+        let rec = recommend(Plan::Max5x, &[88.0, 90.0, 92.0, 87.0]);
+        assert!(matches!(rec, Recommendation::Upgrade(Plan::Max20x)));
+
+        // Two near-cap cycles → upgrade.
+        let rec = recommend(Plan::Pro, &[96.0, 95.0, 60.0]);
+        assert!(matches!(rec, Recommendation::Upgrade(Plan::Max5x)));
+
+        // Comfortable headroom on a lower plan → downgrade.
+        // Max5x(15%) projected onto Pro = 15 * 5 = 75% ≤ 85 → downgrade.
+        let rec = recommend(Plan::Max5x, &[10.0, 12.0, 15.0]);
+        assert!(matches!(rec, Recommendation::Downgrade(Plan::Pro)));
+
+        // Stay: utilization in mid-band on Max5x.
+        // peak=50 → on Pro = 250% > 85 → no downgrade. avg=43 < 85 → no upgrade.
+        let rec = recommend(Plan::Max5x, &[40.0, 50.0, 40.0]);
+        assert!(matches!(rec, Recommendation::Stay));
+    }
+
+    #[test]
+    fn recommend_with_empty_returns_stay() {
+        let rec = recommend(Plan::Max5x, &[]);
+        assert!(matches!(rec, Recommendation::Stay));
+    }
+
+    #[test]
+    fn run_plan_native_only_filter_skips_foreign_evidence() {
+        // The yo-yo regression: comfortable old-plan cycles must not
+        // trigger an immediate re-upgrade after a downgrade.
+        // We exercise the partition by simulating what `run_plan_mode`
+        // does: feed only natives into recommend().
+        let snaps = vec![
+            // Foreign (pre-downgrade Max5x cycles, very low utilization)
+            CycleSnapshot {
+                cycle_end: "2026-04-01T10:00:00Z".parse().unwrap(),
+                utilization: 10.0,
+                captured_at: "2026-03-28T10:00:00Z".parse().unwrap(),
+                cost_at_calibration: None,
+                plan: Some(Plan::Max5x),
+            },
+            CycleSnapshot {
+                cycle_end: "2026-04-08T10:00:00Z".parse().unwrap(),
+                utilization: 12.0,
+                captured_at: "2026-04-05T10:00:00Z".parse().unwrap(),
+                cost_at_calibration: None,
+                plan: Some(Plan::Max5x),
+            },
+        ];
+        let current = Plan::Pro;
+        let native: Vec<&CycleSnapshot> =
+            snaps.iter().filter(|s| s.plan == Some(current)).collect();
+        let utils: Vec<f64> = native.iter().map(|s| s.utilization).collect();
+        let rec = recommend(current, &utils);
+        // No native data → Stay, regardless of the comfortable foreign cycles.
+        assert!(matches!(rec, Recommendation::Stay));
+    }
+
+    #[test]
+    fn recommend_mixed_plans_uses_only_natives() {
+        let snaps = vec![
+            // Foreign pre-upgrade Pro cycles at 96% — would trigger upgrade
+            // if naively included, but they're foreign now.
+            CycleSnapshot {
+                cycle_end: "2026-04-01T10:00:00Z".parse().unwrap(),
+                utilization: 96.0,
+                captured_at: "2026-03-28T10:00:00Z".parse().unwrap(),
+                cost_at_calibration: None,
+                plan: Some(Plan::Pro),
+            },
+            CycleSnapshot {
+                cycle_end: "2026-04-08T10:00:00Z".parse().unwrap(),
+                utilization: 95.0,
+                captured_at: "2026-04-05T10:00:00Z".parse().unwrap(),
+                cost_at_calibration: None,
+                plan: Some(Plan::Pro),
+            },
+            // Native Max5x cycles at moderate utilization.
+            CycleSnapshot {
+                cycle_end: "2026-04-15T10:00:00Z".parse().unwrap(),
+                utilization: 30.0,
+                captured_at: "2026-04-12T10:00:00Z".parse().unwrap(),
+                cost_at_calibration: None,
+                plan: Some(Plan::Max5x),
+            },
+            CycleSnapshot {
+                cycle_end: "2026-04-22T10:00:00Z".parse().unwrap(),
+                utilization: 35.0,
+                captured_at: "2026-04-19T10:00:00Z".parse().unwrap(),
+                cost_at_calibration: None,
+                plan: Some(Plan::Max5x),
+            },
+        ];
+        let current = Plan::Max5x;
+        let utils: Vec<f64> = snaps
+            .iter()
+            .filter(|s| s.plan == Some(current))
+            .map(|s| s.utilization)
+            .collect();
+        let rec = recommend(current, &utils);
+        // peak=35% on Max5x → on Pro = 175% > 85, can't downgrade.
+        // avg=32.5% → no upgrade. → Stay.
+        assert!(matches!(rec, Recommendation::Stay));
+    }
+
+    #[test]
+    fn save_snapshot_forks_on_plan_change() {
+        // Same cycle_end, different plans → two entries, not one mutation.
+        let mut snaps: Vec<CycleSnapshot> = Vec::new();
+        let cycle_end: DateTime<Utc> = "2026-04-15T10:00:00Z".parse().unwrap();
+        let t1: DateTime<Utc> = "2026-04-13T10:00:00Z".parse().unwrap();
+        let t2: DateTime<Utc> = "2026-04-14T10:00:00Z".parse().unwrap();
+
+        apply_snapshot(
+            &mut snaps,
+            cycle_end,
+            40.0,
+            Some(120.0),
+            Some(Plan::Max5x),
+            t1,
+        );
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].plan, Some(Plan::Max5x));
+
+        apply_snapshot(
+            &mut snaps,
+            cycle_end,
+            80.0,
+            Some(180.0),
+            Some(Plan::Pro),
+            t2,
+        );
+        assert_eq!(snaps.len(), 2, "plan change should fork rather than mutate");
+
+        // Original Max5x entry preserved as-is.
+        let max5x = snaps
+            .iter()
+            .find(|s| s.plan == Some(Plan::Max5x))
+            .expect("max5x entry preserved");
+        assert_eq!(max5x.utilization, 40.0);
+        assert_eq!(max5x.captured_at, t1);
+
+        // New Pro entry appended.
+        let pro = snaps
+            .iter()
+            .find(|s| s.plan == Some(Plan::Pro))
+            .expect("pro entry appended");
+        assert_eq!(pro.utilization, 80.0);
+        assert_eq!(pro.captured_at, t2);
+    }
+
+    #[test]
+    fn save_snapshot_updates_in_place_when_plan_unchanged() {
+        let mut snaps: Vec<CycleSnapshot> = Vec::new();
+        let cycle_end: DateTime<Utc> = "2026-04-15T10:00:00Z".parse().unwrap();
+        let t1: DateTime<Utc> = "2026-04-13T10:00:00Z".parse().unwrap();
+        let t2: DateTime<Utc> = "2026-04-14T10:00:00Z".parse().unwrap();
+        apply_snapshot(&mut snaps, cycle_end, 40.0, None, Some(Plan::Max5x), t1);
+        apply_snapshot(&mut snaps, cycle_end, 55.0, None, Some(Plan::Max5x), t2);
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].utilization, 55.0);
+        assert_eq!(snaps[0].captured_at, t2);
     }
 }

@@ -142,10 +142,35 @@ pub enum Command {
         #[arg(long)]
         live: bool,
         /// Recommend whether to upgrade or downgrade your plan
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all")]
         plan: bool,
+        /// Show a compact one-row-per-account overview across all registered accounts
+        #[arg(long)]
+        all: bool,
     },
-    /// Manage Claude accounts (stash credentials, swap, attribute usage per account)
+    /// Switch between multiple Claude logins and track usage per account
+    #[command(
+        long_about = "Switch between multiple Claude logins and track usage per account.
+
+tku doesn't do the OAuth login itself — Claude Code does. `tku account` just
+keeps a labeled copy of ~/.claude/.credentials.json for each login and swaps
+the file in and out on demand.
+
+Typical workflow for two accounts:
+
+    # already logged into account A via Claude Code
+    tku account add work
+
+    # log into account B (Claude Code drives this, not tku)
+    claude /logout
+    claude /login
+
+    tku account add personal
+
+    # from now on:
+    tku account use work
+    tku account use personal"
+    )]
     Account {
         #[command(subcommand)]
         action: AccountAction,
@@ -169,18 +194,49 @@ pub enum Command {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum AccountAction {
-    /// Register the currently-active credentials under a name
+    /// Save your current Claude login as <name> so you can switch back to it later
+    #[command(
+        long_about = "Save your current Claude login as <name> so you can switch back to it later.
+
+tku reads whatever credentials are currently in ~/.claude/.credentials.json
+and stashes a copy. It cannot drive Claude Code's OAuth flow itself.
+
+To register a *different* account, log out of Claude Code first and log back
+in with the other one:
+
+    claude /logout
+    claude /login
+    tku account add <other-name>"
+    )]
     Add { name: String },
-    /// Swap in stashed credentials (overwrites ~/.claude/.credentials.json)
-    Use { name: String },
-    /// List registered accounts
+    /// Switch to a saved login (replaces ~/.claude/.credentials.json)
+    #[command(long_about = "Switch the active Claude login to <name>.
+
+Replaces ~/.claude/.credentials.json with the saved copy. Claude Code will
+refresh the access token on next launch if needed — no re-login unless the
+refresh token itself has expired.
+
+Refuses by default if the current live login isn't saved (switching would
+silently lose it). Pass --force to overwrite anyway.")]
+    Use {
+        name: String,
+        /// Overwrite even when the current live login isn't saved
+        #[arg(long, short)]
+        force: bool,
+    },
+    /// List saved accounts and show which one is active
     List,
-    /// Show the currently-active account
+    /// Show which saved account is currently active
     Current,
-    /// Rename an account
+    /// Rename a saved account
     Rename { old: String, new: String },
-    /// Remove an account (deletes stashed credentials; switch log is preserved)
-    Remove { name: String },
+    /// Forget a saved account (deletes the stashed login; usage history is preserved)
+    Remove {
+        name: String,
+        /// Allow removing the currently-active account
+        #[arg(long, short)]
+        force: bool,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, PartialEq)]
