@@ -167,6 +167,11 @@ fn main() -> Result<()> {
     // this, per-record account_at(timestamp) lookups would resolve new
     // records to the previous account.
     accounts::detect_implicit_swap_pre_scan();
+    // Reconcile vault with live creds: if Claude Code rotated the token
+    // (background refresh, /login to the same account) since our last run,
+    // mirror it into the active account's vault now. Otherwise the next
+    // swap-back would restore a stale token and the user would 401.
+    accounts::reconcile_live_creds();
 
     let mut store = storage::default_storage();
 

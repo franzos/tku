@@ -1,3 +1,11 @@
+## [0.1.13] - 2026-05-12
+
+### Fixed
+- Vault no longer holds a stale token after Claude Code refreshes or after `claude /login`. Every `tku` invocation now mirrors the live `~/.claude/.credentials.json` back into the active account's stash when it has changed — `account use` would otherwise restore a dead token on swap-back. Identity-gated, so live creds for a different account are never written to the wrong vault.
+- `tku account list` and `tku account current` show the live `subscriptionType` / `rateLimitTier` — refreshed at snapshot time instead of staying frozen from `account add`.
+- One-step rollback: previous vault contents are kept at `<name>.previous.credentials.json` on every snapshot.
+- `~/.claude.json` writes drop from `0o644` to `0o600`. The file carries email + org identity even when no token is present.
+
 ## [0.1.12] - 2026-04-29
 
 ### Added

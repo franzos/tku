@@ -220,7 +220,7 @@ fn save_registry(tool: &str, registry: &Registry) -> Result<()> {
 
 // --- Credential inspection ---
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct CredsInfo {
     /// `organizationUuid` from `.credentials.json` when the field is present
     /// in that file (legacy layout). Today's Claude Code doesn't write it
@@ -232,6 +232,23 @@ struct CredsInfo {
     access_token: Option<String>,
     subscription_type: Option<String>,
     rate_limit_tier: Option<String>,
+}
+
+// Hand-written Debug that omits the access token: any `{:?}` print of a
+// CredsInfo (or a struct that contains one) would otherwise leak the bearer
+// token into logs or error chains.
+impl std::fmt::Debug for CredsInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredsInfo")
+            .field("org_uuid", &self.org_uuid)
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("subscription_type", &self.subscription_type)
+            .field("rate_limit_tier", &self.rate_limit_tier)
+            .finish()
+    }
 }
 
 /// Read the live account's org UUID from the creds file. Returns None on
@@ -347,8 +364,64 @@ pub fn detect_implicit_swap_pre_scan() {
         name,
         source: SwitchSource::Implicit,
     });
+    // Capture the freshly-rotated tokens for the new active account too,
+    // not just the switch fact — otherwise the next swap-back from another
+    // account would restore a stale vault entry.
+    if let Err(e) = snapshot_live_into_active_vault(&mut registry) {
+        eprintln!("warning: could not snapshot live credentials: {e}");
+    }
     if let Err(e) = save_registry(TOOL_CLAUDE, &registry) {
         eprintln!("warning: failed to persist implicit-swap entry: {e}");
+    }
+}
+
+/// Cheap reconciliation pass: keep the active account's vault and plan
+/// metadata current with whatever Claude Code wrote to
+/// `~/.claude/.credentials.json` since our last run. This covers the gap
+/// where the user runs `claude /login` (or Claude refreshes the token in
+/// the background) without subsequently invoking `tku account use` — the
+/// fresh tokens would otherwise sit only in the live file and be lost on
+/// the next swap-back.
+///
+/// Designed to be called on every `tku` invocation except for `account use`
+/// (which runs its own snapshot inline) and `account` subcommands that
+/// don't touch credentials. No-op when the live token hasn't changed.
+pub fn reconcile_live_creds() {
+    let mut registry = load_registry(TOOL_CLAUDE);
+    if registry.accounts.is_empty() {
+        return;
+    }
+    // Cheap check up-front: if the live token already matches the active
+    // vault, skip both the identity verification and the registry write.
+    let Some(active) = registry.latest_switch().cloned() else {
+        return;
+    };
+    let Some(idx) = registry
+        .accounts
+        .iter()
+        .position(|a| a.org_uuid == active.org_uuid)
+    else {
+        return;
+    };
+    let live_token = read_current_claude_creds_info().and_then(|i| i.access_token);
+    let vault_token = stashed_creds_path(TOOL_CLAUDE, &registry.accounts[idx].name)
+        .and_then(|p| fs::read(&p).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .as_ref()
+        .and_then(|v| {
+            v.pointer("/claudeAiOauth/accessToken")
+                .and_then(|t| t.as_str())
+                .map(String::from)
+        });
+    if live_token.is_none() || live_token == vault_token {
+        return;
+    }
+    if let Err(e) = snapshot_live_into_active_vault(&mut registry) {
+        eprintln!("warning: could not snapshot live credentials: {e}");
+        return;
+    }
+    if let Err(e) = save_registry(TOOL_CLAUDE, &registry) {
+        eprintln!("warning: failed to persist registry after snapshot: {e}");
     }
 }
 
@@ -525,6 +598,16 @@ pub fn add(name: &str) -> Result<()> {
 
 pub fn use_account(name: &str, force: bool) -> Result<()> {
     validate_name(name)?;
+
+    // Reconcile the registry with reality before we make swap decisions. If
+    // the user did `claude /logout && /login` since our last invocation,
+    // `latest_switch` is stale and the snapshot step below would write the
+    // fresh login's tokens into the *previous* account's vault — exactly the
+    // cross-account contamination we're trying to prevent. Running the
+    // implicit detector first appends an Implicit switch entry so
+    // `latest_switch` reflects the live creds' actual owner.
+    detect_implicit_swap_pre_scan();
+
     let mut registry = load_registry(TOOL_CLAUDE);
     let account = registry.find_by_name(name).cloned().ok_or_else(|| {
         anyhow!("Account '{name}' not found. Run `tku account list` to see available accounts.")
@@ -547,6 +630,19 @@ pub fn use_account(name: &str, force: bool) -> Result<()> {
                 }
             }
         }
+    }
+
+    // Snapshot the live credentials back into the currently-active vault
+    // entry. Claude Code rotates tokens on launch, refresh, and `/login`
+    // without ever writing them back to our stash; without this step, the
+    // next swap-back would clobber the live file with a stale token and
+    // potentially an invalidated refresh token. Identity gated below; safe
+    // to call before deciding which account to switch to.
+    if let Err(e) = snapshot_live_into_active_vault(&mut registry) {
+        // Snapshot is best-effort: a failure here means the *next* swap-back
+        // may use a stale token, but the current swap is still safe to
+        // proceed with. Don't fail the user's `account use` over it.
+        eprintln!("warning: could not snapshot live credentials before swap: {e}");
     }
 
     let src = stashed_creds_path(TOOL_CLAUDE, name).context("cannot determine stash path")?;
@@ -596,10 +692,11 @@ pub fn use_account(name: &str, force: bool) -> Result<()> {
     // field. After the creds swap above, the live access token belongs to
     // this account, so the profile API will identify it correctly. If the
     // stashed token is expired, this will 401 — we warn and continue.
+    // Pass the in-memory bytes we just wrote (avoids a re-read TOCTOU).
     let oauth_account = if account.oauth_account.is_some() {
         account.oauth_account.clone()
     } else {
-        match fetch_live_oauth_account_with_creds(&dst) {
+        match fetch_oauth_account_from_creds_bytes(&data) {
             Ok(blob) => {
                 if let Some(a) = registry.accounts.iter_mut().find(|a| a.name == name) {
                     a.oauth_account = Some(blob.clone());
@@ -655,17 +752,149 @@ fn read_current_claude_oauth_account() -> Option<serde_json::Value> {
     value.get("oauthAccount").cloned()
 }
 
-/// Read the access token from `creds_path` and ask the profile API for the
-/// matching `oauthAccount` blob. Used to backfill legacy registry entries.
-fn fetch_live_oauth_account_with_creds(creds_path: &Path) -> Result<serde_json::Value> {
-    let data =
-        fs::read_to_string(creds_path).with_context(|| format!("read {}", redact(creds_path)))?;
-    let value: serde_json::Value = serde_json::from_str(&data).context("parse credentials file")?;
+/// Parse a credentials JSON blob and ask the profile API for the matching
+/// `oauthAccount` shape. Used to backfill legacy registry entries that
+/// pre-date the cached `oauth_account` field. Takes raw bytes so callers can
+/// reuse data they've already loaded — avoids a re-read TOCTOU window.
+fn fetch_oauth_account_from_creds_bytes(data: &[u8]) -> Result<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_slice(data).context("parse credentials")?;
     let token = value
         .pointer("/claudeAiOauth/accessToken")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("credentials file has no access token"))?;
     Ok(crate::subscription::fetch_account_identity(token)?.oauth_account)
+}
+
+/// Snapshot the live `~/.claude/.credentials.json` back into the
+/// currently-active vault entry, refreshing the registry's plan metadata at
+/// the same time. Identity-gated: we only overwrite the vault if the live
+/// creds demonstrably belong to the currently-active account.
+///
+/// Behaviour:
+/// - No-op when live creds are absent, unparseable, or have no `accessToken`.
+/// - No-op when the vault already holds an identical `accessToken` (the
+///   common case — Claude hasn't rotated since our last snapshot).
+/// - Identity check: live creds must match the active account's `org_uuid`.
+///   We try the live `organizationUuid` field first (legacy creds layout, no
+///   network); if absent we fall back to the profile API. On API failure we
+///   warn and skip — better to keep a slightly-stale vault than overwrite
+///   the wrong one. We deliberately do *not* fall back to comparing
+///   `subscriptionType`/`rateLimitTier`: two accounts on the same plan would
+///   collide and the failure mode is silent cross-account corruption.
+/// - On match: write the previous vault contents to `<name>.previous` for
+///   one-step rollback, then atomically overwrite the vault with the live
+///   bytes (same bytes we read for the comparison — no re-read window).
+/// - Refresh `subscription_type` / `rate_limit_tier` on the active account so
+///   `tku account list` displays the live plan instead of whatever was
+///   captured at `add` time. The caller persists the registry.
+fn snapshot_live_into_active_vault(registry: &mut Registry) -> Result<()> {
+    let Some(active_entry) = registry.latest_switch().cloned() else {
+        return Ok(());
+    };
+    let Some(active_idx) = registry
+        .accounts
+        .iter()
+        .position(|a| a.org_uuid == active_entry.org_uuid)
+    else {
+        // Active entry references an org_uuid we no longer have a vault for
+        // (e.g. user ran `account remove --force` on the live account).
+        // Nothing to snapshot into.
+        return Ok(());
+    };
+    let active_org = registry.accounts[active_idx].org_uuid.clone();
+    let active_name = registry.accounts[active_idx].name.clone();
+
+    let live_path = claude_creds_path().context("cannot find credentials path")?;
+    let live_bytes = match fs::read(&live_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(anyhow!("read {}: {}", redact(&live_path), e)),
+    };
+    let live_value: serde_json::Value = match serde_json::from_slice(&live_bytes) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // Claude rewriting mid-read; try again next swap.
+    };
+    let Some(live_token) = live_value
+        .pointer("/claudeAiOauth/accessToken")
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(());
+    };
+
+    let vault_path = stashed_creds_path(TOOL_CLAUDE, &active_name).context("vault path")?;
+    let vault_bytes = fs::read(&vault_path).ok();
+    let vault_token = vault_bytes
+        .as_deref()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+        .as_ref()
+        .and_then(|v| {
+            v.pointer("/claudeAiOauth/accessToken")
+                .and_then(|t| t.as_str())
+                .map(String::from)
+        });
+    if vault_token.as_deref() == Some(live_token) {
+        return Ok(()); // Vault is already current.
+    }
+
+    // Identity verification: live → active org. Cheap path first.
+    let live_org = live_value
+        .get("organizationUuid")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let identity_ok = match live_org {
+        Some(ref org) => org == &active_org,
+        None => match crate::subscription::fetch_account_identity(live_token) {
+            Ok(id) => id.org_uuid == active_org,
+            Err(e) => {
+                eprintln!(
+                    "warning: live credentials carry no organizationUuid and the profile API \
+                     could not confirm their owner ({e}). Skipping vault snapshot for \
+                     '{active_name}' — the next swap may restore a stale token."
+                );
+                return Ok(());
+            }
+        },
+    };
+    if !identity_ok {
+        eprintln!(
+            "warning: live credentials don't belong to the currently-active account \
+             '{active_name}'. Skipping vault snapshot to avoid cross-account contamination."
+        );
+        return Ok(());
+    }
+
+    // Identity confirmed: write a rollback backup, then overwrite the vault
+    // with the exact bytes we just verified.
+    if let Some(prev) = &vault_bytes {
+        let backup = vault_path.with_file_name(format!("{active_name}.previous.credentials.json"));
+        if let Err(e) = write_secure(&backup, prev) {
+            eprintln!(
+                "warning: could not write rollback backup {}: {e}",
+                redact(&backup)
+            );
+        }
+    }
+    write_secure(&vault_path, &live_bytes)
+        .with_context(|| format!("snapshot live creds → {}", redact(&vault_path)))?;
+
+    // Refresh plan metadata so `tku account list` shows the live plan. These
+    // are advisory display fields — fall back to existing values if missing.
+    let new_sub = live_value
+        .pointer("/claudeAiOauth/subscriptionType")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let new_tier = live_value
+        .pointer("/claudeAiOauth/rateLimitTier")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let acct = &mut registry.accounts[active_idx];
+    if new_sub.is_some() {
+        acct.subscription_type = new_sub;
+    }
+    if new_tier.is_some() {
+        acct.rate_limit_tier = new_tier;
+    }
+    Ok(())
 }
 
 /// Patch `~/.claude.json` so its `oauthAccount` key matches `blob`.
@@ -690,12 +919,19 @@ fn apply_oauth_account_to_claude_config(blob: &serde_json::Value) -> Result<()> 
         bail!("{} is not a JSON object", redact(&path));
     }
     let serialized = serde_json::to_string_pretty(&value).context("serialize claude config")?;
-    atomic_write(&path, serialized.as_bytes(), Some(0o644))
+    // 0o600: `oauthAccount` carries email + org name + UUIDs. Even though
+    // there's no bearer token in this file, world-readable identity leakage
+    // is gratuitous on a multi-user box.
+    atomic_write(&path, serialized.as_bytes(), Some(0o600))
         .with_context(|| format!("write {}", redact(&path)))?;
     Ok(())
 }
 
 pub fn list() -> Result<()> {
+    // Pick up any token / plan changes that happened outside tku since the
+    // last run, so the displayed plan and "active" marker reflect reality
+    // instead of whatever was captured at `add` time.
+    reconcile_live_creds();
     let registry = load_registry(TOOL_CLAUDE);
     // Prefer identifying the active account from live creds; fall back to the
     // latest switch-log entry when Claude Code has hidden `organizationUuid`
@@ -731,6 +967,7 @@ pub fn list() -> Result<()> {
 }
 
 pub fn current() -> Result<()> {
+    reconcile_live_creds();
     let registry = load_registry(TOOL_CLAUDE);
     let info = read_current_claude_creds_info();
 
