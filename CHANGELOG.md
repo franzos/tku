@@ -1,3 +1,8 @@
+## [0.1.14] - 2026-06-01
+
+### Changed
+- Account swap no longer warns about stale sessions hitting a 401 — switching is seamless
+
 ## [0.1.13] - 2026-05-12
 
 ### Fixed

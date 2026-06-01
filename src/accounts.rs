@@ -735,10 +735,6 @@ pub fn use_account(name: &str, force: bool) -> Result<()> {
         name,
         short_org(&account.org_uuid)
     );
-    eprintln!("Claude Code will refresh the access token on next launch if needed.");
-    eprintln!(
-        "Note: any `claude` session already running in another terminal will hit a 401 on its next refresh and need to be re-launched."
-    );
     Ok(())
 }
 

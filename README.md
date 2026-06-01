@@ -322,7 +322,7 @@ Stashed credentials live at `~/.config/tku/accounts/claude/<name>.credentials.js
 **Notes**:
 - On first run with existing Claude Code credentials, tku auto-registers your current account as `default` and backfills attribution to the earliest record timestamp.
 - `tku account add` needs a live access token — it resolves your `organizationUuid` via the Anthropic profile API (modern `.credentials.json` doesn't carry that field). Sign in to Claude Code first if your stash is stale.
-- After `tku account use`, Claude Code refreshes the access token itself on next launch if needed. No re-login unless the refresh token itself has expired.
+- After `tku account use`, both running and new Claude Code sessions pick up the swapped login on their next token refresh — no re-launch or re-login unless the refresh token itself has expired.
 - Long-running `claude` sessions cache their identity in memory and periodically rewrite `~/.claude.json`. If you swap accounts while one is open, that session can race-restore the previous `oauthAccount` blob — quit existing `claude` processes before swapping if you need `/status` to reflect the change immediately.
 - Swapping credentials outside tku (manual `cp`, `claude /login`, etc.) isn't reliably detected on modern creds, since the legacy `organizationUuid` field tku used as a signal is no longer written. Attribution in such windows is best-effort; prefer `tku account use` for clean handoffs.
 - Only Claude accounts are supported for now. Codex and others may follow.

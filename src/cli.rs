@@ -212,9 +212,9 @@ in with the other one:
     /// Switch to a saved login (replaces ~/.claude/.credentials.json)
     #[command(long_about = "Switch the active Claude login to <name>.
 
-Replaces ~/.claude/.credentials.json with the saved copy. Claude Code will
-refresh the access token on next launch if needed — no re-login unless the
-refresh token itself has expired.
+Replaces ~/.claude/.credentials.json with the saved copy. Running and new
+Claude Code sessions pick up the new login on their next token refresh — no
+re-launch or re-login unless the refresh token itself has expired.
 
 Refuses by default if the current live login isn't saved (switching would
 silently lose it). Pass --force to overwrite anyway.")]
