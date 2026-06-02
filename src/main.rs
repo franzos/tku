@@ -1,6 +1,7 @@
 mod accounts;
 mod aggregate;
 mod atomic_write;
+mod burn;
 mod cli;
 mod config;
 mod cost;
@@ -334,6 +335,15 @@ fn main() -> Result<()> {
     let unpriced = pricing.unpriced_models(&records);
     if !unpriced.is_empty() {
         eprintln!("No pricing data for: {}", unpriced.join(", "));
+    }
+
+    if let cli::Command::ModelBurn { idle_gap } = mode {
+        let report = burn::compute(&records, &pricing, idle_gap);
+        match cli.format {
+            cli::OutputFormat::Json => output::print_burn_json(&report, &exchange),
+            cli::OutputFormat::Table => output::print_burn_table(&report, &exchange),
+        }
+        return Ok(());
     }
 
     let buckets = aggregate::aggregate(&records, &mode, &pricing);

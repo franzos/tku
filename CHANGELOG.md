@@ -1,3 +1,9 @@
+## [0.1.15] - 2026-06-02
+
+### Added
+- `tku model-burn` — per-model burn rate: tokens/min, $/active-hour, sustained $/calendar-day
+- `--idle-gap` tunes how long a pause still counts as active (default 5 min)
+
 ## [0.1.14] - 2026-06-01
 
 ### Changed

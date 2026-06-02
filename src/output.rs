@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, ContentArrangement, Table};
 
 use crate::aggregate::short_model_name;
+use crate::burn;
 use crate::exchange::ExchangeRate;
 use crate::types::AggregatedBucket;
 
@@ -99,6 +100,90 @@ pub fn print_table(
     );
 
     println!("{table}");
+}
+
+fn format_duration(secs: u64) -> String {
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    if hours > 0 {
+        format!("{hours}h{mins:02}m")
+    } else {
+        format!("{mins}m")
+    }
+}
+
+fn rate_cell(rate: Option<f64>, exchange: &ExchangeRate) -> Cell {
+    match rate {
+        Some(v) => Cell::new(exchange.format_cost(Some(v))),
+        None => Cell::new("–"),
+    }
+}
+
+fn tokens_rate_cell(rate: Option<f64>) -> Cell {
+    match rate {
+        Some(v) => Cell::new(format_tokens(v.round() as u64)),
+        None => Cell::new("–"),
+    }
+}
+
+fn burn_row_cells(row: &burn::ModelBurnRow, model: &str, exchange: &ExchangeRate) -> Vec<Cell> {
+    vec![
+        Cell::new(model),
+        Cell::new(format_tokens(row.tokens)),
+        Cell::new(exchange.format_cost(row.cost)),
+        Cell::new(format_duration(row.active_secs)),
+        tokens_rate_cell(row.tokens_per_min),
+        rate_cell(row.cost_per_active_hour, exchange),
+        rate_cell(row.cost_per_calendar_day, exchange),
+    ]
+}
+
+pub fn print_burn_table(report: &burn::BurnReport, exchange: &ExchangeRate) {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+
+    table.set_header(
+        [
+            "model",
+            "tokens",
+            "cost",
+            "active",
+            "tok/min",
+            "$/act-hr",
+            "$/cal-day",
+        ]
+        .into_iter()
+        .map(Cell::new),
+    );
+
+    for row in &report.rows {
+        table.add_row(burn_row_cells(row, &short_model_name(&row.model), exchange));
+    }
+
+    table.add_row(burn_row_cells(&report.total, "ALL", exchange));
+
+    println!("{table}");
+}
+
+pub fn print_burn_json(report: &burn::BurnReport, exchange: &ExchangeRate) {
+    let entry = |row: &burn::ModelBurnRow| {
+        serde_json::json!({
+            "model": row.model,
+            "tokens": row.tokens,
+            "cost": row.cost.map(|c| exchange.convert(c)),
+            "active_seconds": row.active_secs,
+            "tokens_per_min": row.tokens_per_min,
+            "cost_per_active_hour": row.cost_per_active_hour.map(|c| exchange.convert(c)),
+            "cost_per_calendar_day": row.cost_per_calendar_day.map(|c| exchange.convert(c)),
+            "currency": exchange.code,
+        })
+    };
+
+    let mut arr: Vec<serde_json::Value> = report.rows.iter().map(entry).collect();
+    arr.push(entry(&report.total));
+
+    println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
 }
 
 /// Waybar CSS class for the bar widget. Stringified for JSON consumers

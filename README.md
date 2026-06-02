@@ -36,6 +36,9 @@ tku session
 # Per-model costs
 tku model
 
+# Per-model burn rate (tokens/min, $/active-hour, $/calendar-day)
+tku model-burn
+
 # Filter by date range
 tku --from 2026-02-01 --to 2026-02-19
 
@@ -82,6 +85,7 @@ tku watch --full
 | `monthly` | Aggregate by month |
 | `session` | Aggregate by session, grouped by project |
 | `model` | Aggregate by model |
+| `model-burn` | Per-model burn rate (active-time and calendar rates) |
 | `watch` | Live-updating cost monitor (default: compact single line, today only) |
 | `plot` | Inline bar chart of token usage over time |
 | `subscription` (`sub`) | Claude Max/Pro subscription usage overview |
@@ -147,6 +151,27 @@ tku watch --full --breakdown --from 2026-02-01
 |------|-------------|
 | `--full` | Show full table instead of compact summary line |
 | `--interval <seconds>` | Minimum time between refreshes (default: 2) |
+
+## Model burn
+
+`tku model-burn` answers a different question than `tku model`: not "what did each model cost," but "how hard does each model work, and what does it cost to keep it running." It shows two kinds of rate side by side.
+
+The active-time rates (`tok/min`, `$/act-hr`) measure consumption *while you're actually working*. Active time is the sum of gaps between consecutive messages, with long idle pauses clamped — by default any gap over 5 minutes counts as 5 minutes, so going for coffee doesn't dilute the rate. Tune that with `--idle-gap` (in minutes); pass something large like `--idle-gap 9999` to recover raw session-span behaviour.
+
+The calendar rate (`$/cal-day`) is sustained spend: total cost divided by the number of distinct local days the model ran. Good for "am I on track for my monthly budget."
+
+```bash
+# Default 5-minute idle cap
+tku model-burn
+
+# Treat pauses up to 30 minutes as active
+tku model-burn --idle-gap 30
+
+# Combine with the usual filters
+tku model-burn --tool claude --from 2026-05-01
+```
+
+A couple of honest caveats. Per-model active time groups by `(session, model)`, while the `ALL` row groups by session only — so when you mix models in one session, the per-model active times intentionally won't add up to the `ALL` total. And if any record of a model lacks pricing, its cost column shows `N/A` rather than an undercount; a `–` in a rate column just means there wasn't enough data to compute it.
 
 ## Plot
 

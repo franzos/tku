@@ -117,6 +117,13 @@ pub enum Command {
     Session,
     /// Aggregate by model
     Model,
+    /// Per-model burn rate: tokens/cost consumed per active minute/hour and sustained per calendar day
+    ModelBurn {
+        /// Cap idle gaps between consecutive messages at this many minutes when computing active time.
+        /// Use a large value (e.g. 9999) to recover raw session-span behaviour.
+        #[arg(long, default_value = "5")]
+        idle_gap: u64,
+    },
     /// Live-updating cost monitor
     Watch {
         /// Show full table instead of compact summary line
