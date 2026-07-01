@@ -107,3 +107,36 @@ jobs:
             tku-*.tar.gz.sha256
             *.deb
             *.rpm
+
+  # Hash the exact release artifacts (post-strip bytes as uploaded), so the SLSA
+  # provenance subjects match what a verifier downloads.
+  hashes:
+    needs: [build, deb, rpm]
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          merge-multiple: true
+
+      - name: Compute subject hashes
+        id: hash
+        run: |
+          sha256sum tku-*.tar.gz *.deb *.rpm > SHA256SUMS
+          echo "hashes=$(base64 -w0 SHA256SUMS)" >> "$GITHUB_OUTPUT"
+
+  # Keyless SLSA build provenance (OIDC -> Sigstore), attached to the release.
+  # The generator must be referenced by tag, not SHA, so slsa-verifier can
+  # resolve the trusted builder; this trades ~2 points on Pinned-Dependencies.
+  provenance:
+    needs: [hashes, release]
+    permissions:
+      id-token: write # keyless signing via OIDC
+      contents: write # attach the provenance to the release
+      actions: read
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.hashes.outputs.hashes }}
+      upload-assets: true

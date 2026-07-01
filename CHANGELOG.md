@@ -1,3 +1,8 @@
+## [0.1.17] - 2026-07-01
+
+### Added
+- SLSA build provenance attached to release artifacts
+
 ## [0.1.16] - 2026-07-01
 
 ### Added
