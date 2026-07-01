@@ -181,7 +181,7 @@ pub fn render(records: &[UsageRecord], period: &GraphPeriod, relative: bool) -> 
         .map(|(label, &val)| {
             Bar::default()
                 .value(val)
-                .label(label.clone().into())
+                .label(label.clone())
                 .style(Style::default().fg(Color::Cyan))
         })
         .collect();

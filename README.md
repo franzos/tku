@@ -8,6 +8,9 @@ Token usage tracking for Claude Code, Codex, Gemini CLI and others.
 <p align="center">
   Scans local session files, fetches live pricing, and shows aggregated reports.
 </p>
+<p align="center">
+  <a href="https://scorecard.dev/viewer/?uri=github.com/franzos/tku"><img src="https://api.scorecard.dev/projects/github.com/franzos/tku/badge" alt="OpenSSF Scorecard"></a>
+</p>
 
 ## Install
 

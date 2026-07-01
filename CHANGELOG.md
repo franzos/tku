@@ -1,3 +1,14 @@
+## [0.1.16] - 2026-07-01
+
+### Added
+- Security policy and OpenSSF Scorecard badge
+
+### Changed
+- Updated ratatui, notify, and crossterm to current releases
+
+### Fixed
+- Resolved known advisories in bundled dependencies
+
 ## [0.1.15] - 2026-06-02
 
 ### Added
