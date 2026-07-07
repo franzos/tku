@@ -70,6 +70,9 @@ tku account use work
 # Filter any report to one account
 tku monthly --account work
 
+# Run a one-shot session as another account, isolated (without switching your login)
+tku account exec personal -- claude
+
 # Bar chart of token usage (last 30 days)
 tku plot
 
@@ -92,7 +95,7 @@ tku watch --full
 | `watch` | Live-updating cost monitor (default: compact single line, today only) |
 | `plot` | Inline bar chart of token usage over time |
 | `subscription` (`sub`) | Claude Max/Pro subscription usage overview |
-| `account` | Manage stashed Claude accounts (add/use/list/current/rename/remove) |
+| `account` | Manage stashed Claude accounts (add/use/list/current/rename/remove/exec) |
 | `bar` | JSON output for status bars (waybar, i3bar, polybar) |
 
 ## Options
@@ -355,6 +358,38 @@ Stashed credentials live at `~/.config/tku/accounts/claude/<name>.credentials.js
 - Swapping credentials outside tku (manual `cp`, `claude /login`, etc.) isn't reliably detected on modern creds, since the legacy `organizationUuid` field tku used as a signal is no longer written. Attribution in such windows is best-effort; prefer `tku account use` for clean handoffs.
 - Only Claude accounts are supported for now. Codex and others may follow.
 
+### Isolated one-shot sessions
+
+Sometimes you want to run a single session as a *different* account without switching your global login. `tku account exec` runs a command with a private `CLAUDE_CONFIG_DIR` seeded from a stashed account, leaving the active `~/.claude` untouched. Your current session (and any other `claude` you have open) keeps running unchanged.
+
+Like `sudo` or `env`, it runs whatever command you give after `--`; it does not launch `claude` for you:
+
+```bash
+# Interactive session as `personal`, isolated from your active login
+tku account exec personal -- claude
+
+# One-shot prompt
+tku account exec personal -- claude -p "summarise this repo"
+
+# A shell with CLAUDE_CONFIG_DIR set (run your own launcher or alias from there)
+tku account exec personal -- bash -i
+```
+
+It seeds the private dir from the account's stashed credentials, symlinks your shared `skills/`, `plugins/`, `agents/`, `commands/`, and `CLAUDE.md` so the session behaves like your normal setup, copies and patches `.claude.json`/`settings.json`, and syncs any refreshed credentials back to the stash on exit. The dir lives under `$XDG_RUNTIME_DIR` (tmpfs, cleared on logout), never under your persistent config.
+
+| Flag | Description |
+|------|-------------|
+| `--ephemeral` | Unique throwaway dir, deleted on exit (default reuses one dir per account) |
+| `--clean` | Bare instance: skip the shared skills/plugins/agents/commands/CLAUDE.md |
+| `--copy` | Copy the shared dirs and files instead of symlinking them |
+
+**One live session per account.** `exec` refuses to run if the account is already live, whether as the active `~/.claude` login or another running `exec`. Claude's OAuth refresh tokens are single-use, so two live sessions sharing one login invalidate each other's token and brick both. To run two sessions of the same account at once, add a second login with fresh credentials (`tku account add`) as a separate stash entry.
+
+A few honest caveats:
+- Token usage inside an `exec` session is written to the isolated dir, so it does not show up in `tku` reports.
+- `SIGKILL`ing an `exec` skips the final credential sync-back, so a token rotated right before the kill lives only in the isolated dir until the next launch.
+- Credentials must be file-based (`~/.claude/.credentials.json`), so this is Linux, not macOS, where Claude keeps credentials in the Keychain that `CLAUDE_CONFIG_DIR` does not relocate.
+
 ## Status bar integration
 
 The `bar` subcommand outputs JSON for waybar, i3bar, or polybar:
@@ -420,9 +455,12 @@ Optional config file at `~/.config/tku/config.toml`:
 ```toml
 pricing_source = "litellm"  # litellm | openrouter | llmprices
 currency = "EUR"             # any ISO 4217 code
+
+[spawn]
+ephemeral = false            # default dir mode for `account exec` (see Accounts)
 ```
 
-Both keys are optional. CLI flags (`--pricing-source`, `--currency`) override config file values.
+All keys are optional. CLI flags (`--pricing-source`, `--currency`) override config file values.
 
 ## Pricing
 

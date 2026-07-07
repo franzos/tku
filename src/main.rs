@@ -13,6 +13,7 @@ mod output;
 mod paths;
 mod pricing;
 mod providers;
+mod spawn;
 mod storage;
 mod subscription;
 mod types;
@@ -92,6 +93,16 @@ fn handle_account(action: &cli::AccountAction) -> Result<()> {
         cli::AccountAction::Current => accounts::current(),
         cli::AccountAction::Rename { old, new } => accounts::rename(old, new),
         cli::AccountAction::Remove { name, force } => accounts::remove(name, *force),
+        cli::AccountAction::Exec {
+            name,
+            ephemeral,
+            clean,
+            copy,
+            args,
+        } => {
+            let code = spawn::run(name, *ephemeral, *clean, *copy, args.clone())?;
+            std::process::exit(code);
+        }
     }
 }
 

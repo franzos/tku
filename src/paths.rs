@@ -37,10 +37,8 @@ pub fn config_dir() -> Option<PathBuf> {
     }
 }
 
-/// Data directory root. Currently unused inside tku (no persistent non-cache
-/// state lives here yet) — kept for parity with the `cache/config/data` triad
-/// so callers can land incrementally without new path plumbing.
-#[allow(dead_code)]
+/// Data directory root. Home-based per-user location; used as the `spawn_dir`
+/// fallback when `$XDG_RUNTIME_DIR` is unset.
 pub fn data_dir() -> Option<PathBuf> {
     if let Some(h) = tku_home() {
         Some(h.join("data"))
@@ -97,4 +95,19 @@ pub fn accounts_dir(tool: &str) -> Option<PathBuf> {
 
 pub fn registry_file(tool: &str) -> Option<PathBuf> {
     accounts_dir(tool).map(|d| d.join("registry.json"))
+}
+
+// --- Runtime files ---
+
+/// Root for `account exec`'s isolated Claude config dirs and per-account
+/// locks. Prefers `$XDG_RUNTIME_DIR` (tmpfs, cleared at logout) so seeded
+/// credentials don't linger on disk. Falls back to a `$HOME`-based per-user
+/// dir, never a shared world-writable temp dir like `/tmp`.
+pub fn spawn_dir(tool: &str) -> Option<PathBuf> {
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+        if !rt.is_empty() {
+            return Some(PathBuf::from(rt).join("tku").join("spawn").join(tool));
+        }
+    }
+    data_dir().map(|d| d.join("spawn").join(tool))
 }

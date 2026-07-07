@@ -1,6 +1,6 @@
 [package]
 name = "tku"
-version = "0.1.17"
+version = "0.1.18"
 edition = "2021"
 authors = ["Franz Geffke <mail@gofranz.com>"]
 license = "GPL-3.0-only"
@@ -39,6 +39,9 @@ ureq = { version = "3", features = ["rustls"] }
 ratatui = "0.30"
 crossterm = "0.29"
 walkdir = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Trim the release binary and speed up cold-start. `lto = "thin"` +
 # codegen-units = 1 gives noticeably better inlining across crate boundaries

@@ -258,6 +258,16 @@ pub fn current_claude_org_uuid() -> Option<String> {
     read_current_claude_creds_info().and_then(|i| i.org_uuid)
 }
 
+/// Live account's org UUID from `~/.claude.json`'s `oauthAccount` block.
+/// Unlike the creds file this survives token refreshes, so it catches an
+/// out-of-band `claude /login` that the switch log wouldn't reflect. No network.
+pub(crate) fn current_claude_oauth_org() -> Option<String> {
+    read_current_claude_oauth_account()?
+        .get("organizationUuid")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
 fn read_current_claude_creds_info() -> Option<CredsInfo> {
     let path = claude_creds_path()?;
     let data = fs::read_to_string(&path).ok()?;
@@ -478,7 +488,7 @@ fn short_org(org: &str) -> String {
 
 // --- Account commands ---
 
-fn validate_name(name: &str) -> Result<()> {
+pub(crate) fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("Account name cannot be empty");
     }
@@ -899,27 +909,35 @@ fn apply_oauth_account_to_claude_config(blob: &serde_json::Value) -> Result<()> 
     let path = BaseDirs::new()
         .map(|b| b.home_dir().join(".claude.json"))
         .ok_or_else(|| anyhow!("cannot determine ~/.claude.json path"))?;
-    let mut value: serde_json::Value = match fs::read_to_string(&path) {
+    apply_oauth_account_to_config(&path, blob)
+}
+
+/// Patch the Claude config at `path` so its `oauthAccount` key matches `blob`,
+/// preserving all other fields (projects, onboarding state, etc). Atomic.
+/// Used both for the global `~/.claude.json` and for an isolated
+/// `$CLAUDE_CONFIG_DIR/.claude.json` seeded by `account exec`.
+pub(crate) fn apply_oauth_account_to_config(path: &Path, blob: &serde_json::Value) -> Result<()> {
+    let mut value: serde_json::Value = match fs::read_to_string(path) {
         Ok(data) => {
-            serde_json::from_str(&data).with_context(|| format!("parse {}", redact(&path)))?
+            serde_json::from_str(&data).with_context(|| format!("parse {}", redact(path)))?
         }
         // Missing file is fine — Claude Code will recreate on next launch.
         // We still write our oauthAccount so the next launch sees the right
         // identity from the start.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(anyhow!("read {}: {}", redact(&path), e)),
+        Err(e) => return Err(anyhow!("read {}: {}", redact(path), e)),
     };
     if let Some(obj) = value.as_object_mut() {
         obj.insert("oauthAccount".to_string(), blob.clone());
     } else {
-        bail!("{} is not a JSON object", redact(&path));
+        bail!("{} is not a JSON object", redact(path));
     }
     let serialized = serde_json::to_string_pretty(&value).context("serialize claude config")?;
     // 0o600: `oauthAccount` carries email + org name + UUIDs. Even though
     // there's no bearer token in this file, world-readable identity leakage
     // is gratuitous on a multi-user box.
-    atomic_write(&path, serialized.as_bytes(), Some(0o600))
-        .with_context(|| format!("write {}", redact(&path)))?;
+    atomic_write(path, serialized.as_bytes(), Some(0o600))
+        .with_context(|| format!("write {}", redact(path)))?;
     Ok(())
 }
 

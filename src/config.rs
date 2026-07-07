@@ -9,6 +9,13 @@ use crate::pricing::PricingSource;
 pub struct Config {
     pub pricing_source: Option<PricingSource>,
     pub currency: Option<String>,
+    #[serde(default)]
+    pub spawn: Option<SpawnConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SpawnConfig {
+    pub ephemeral: Option<bool>,
 }
 
 pub fn load_config() -> Config {

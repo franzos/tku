@@ -1,3 +1,8 @@
+## [0.1.18] - 2026-07-07
+
+### Added
+- `account exec`: run a command as a stashed account in an isolated config dir
+
 ## [0.1.17] - 2026-07-01
 
 ### Added

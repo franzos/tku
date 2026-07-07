@@ -244,6 +244,46 @@ silently lose it). Pass --force to overwrite anyway.")]
         #[arg(long, short)]
         force: bool,
     },
+    /// Run a command as <name> in an isolated Claude config, without touching ~/.claude
+    #[command(
+        long_about = "Run a command with a private CLAUDE_CONFIG_DIR authenticated as <name>,\n\
+leaving the globally-active ~/.claude untouched.\n\
+\n\
+Like `sudo`/`env`, exec runs whatever command you give after `--`; it does not\n\
+launch claude implicitly. tku seeds the isolated dir from the stashed\n\
+credentials (and, by default, symlinks your shared\n\
+skills/plugins/agents/commands/CLAUDE.md into it), sets CLAUDE_CONFIG_DIR, runs\n\
+your command, and syncs any refreshed credentials back to the stash on exit.\n\
+\n\
+Refuses to run if <name> is already live (as the active ~/.claude login or\n\
+another running `exec`) because Claude's refresh tokens are single-use: two live\n\
+sessions sharing one login brick each other. To run two sessions of the same\n\
+account, add a second login with fresh credentials via `tku account add`.\n\
+\n\
+Examples:\n\
+\n\
+    tku account exec business -- claude\n\
+    tku account exec business -- claude -p \"hi\"\n\
+    tku account exec business -- bash -i   # shell with CLAUDE_CONFIG_DIR set\n\
+\n\
+Note: SIGKILLing the exec skips the final credential sync-back, so a token\n\
+rotated right before the kill lives only in the isolated dir until next launch."
+    )]
+    Exec {
+        name: String,
+        /// Use a unique throwaway config dir, deleted on exit
+        #[arg(long)]
+        ephemeral: bool,
+        /// Bare instance: skip the shared skills/plugins/agents/commands/CLAUDE.md
+        #[arg(long)]
+        clean: bool,
+        /// Copy the shared dirs/files instead of symlinking them
+        #[arg(long)]
+        copy: bool,
+        /// Command to run (after `--`): program then its arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, PartialEq)]
