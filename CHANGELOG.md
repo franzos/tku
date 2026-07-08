@@ -1,3 +1,8 @@
+## [0.1.20] - 2026-07-08
+
+### Fixed
+- OpenRouter pricing source used an unreachable host
+
 ## [0.1.19] - 2026-07-08
 
 ### Added

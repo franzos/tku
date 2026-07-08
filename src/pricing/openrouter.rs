@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::cost::ModelPricing;
 
-const OPENROUTER_URL: &str = "https://api.openrouter.ai/api/v1/models";
+const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
 
 const MAX_RESPONSE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
 
