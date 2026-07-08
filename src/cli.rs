@@ -6,6 +6,7 @@ use crate::pricing::PricingSource;
 #[derive(Parser, Debug)]
 #[command(
     name = "tku",
+    version,
     about = "Token usage and cost tracker for LLM coding tools"
 )]
 pub struct Cli {
