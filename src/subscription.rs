@@ -31,13 +31,80 @@ const CALIBRATION_THRESHOLDS: &[f64] = &[
 struct UsageResponse {
     five_hour: Option<UsageWindow>,
     seven_day: Option<UsageWindow>,
+    // Legacy flat per-model windows. Anthropic moved model-scoped limits into
+    // the `limits[]` array below; these now come back `null`. Kept as a
+    // fallback for older API responses.
     seven_day_sonnet: Option<UsageWindow>,
     seven_day_opus: Option<UsageWindow>,
     #[allow(dead_code)]
     seven_day_cowork: Option<UsageWindow>,
     #[allow(dead_code)]
     seven_day_oauth_apps: Option<UsageWindow>,
+    #[serde(default)]
+    limits: Vec<LimitEntry>,
     extra_usage: Option<ExtraUsage>,
+}
+
+/// One entry of the reshaped usage API's `limits[]` array. Model-scoped weekly
+/// windows (Fable, Opus, Sonnet, …) live here now, keyed by
+/// `scope.model.display_name`. Unknown fields are ignored by serde.
+#[derive(Debug, Deserialize)]
+struct LimitEntry {
+    #[serde(default)]
+    group: Option<String>,
+    #[serde(default)]
+    percent: f64,
+    #[serde(default)]
+    scope: Option<LimitScope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LimitScope {
+    #[serde(default)]
+    model: Option<LimitModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LimitModel {
+    #[serde(default)]
+    display_name: Option<String>,
+}
+
+impl UsageResponse {
+    /// Per-model weekly limits from the new `limits[]` array, as
+    /// `(display_name, percent)`, in API order. Falls back to the legacy flat
+    /// `seven_day_opus`/`seven_day_sonnet` fields when `limits[]` is absent.
+    fn scoped_model_limits(&self) -> Vec<(String, f64)> {
+        let scoped: Vec<(String, f64)> = self
+            .limits
+            .iter()
+            .filter(|l| l.group.as_deref() == Some("weekly"))
+            .filter_map(|l| {
+                let name = l.scope.as_ref()?.model.as_ref()?.display_name.clone()?;
+                Some((name, l.percent))
+            })
+            .collect();
+        if !scoped.is_empty() {
+            return scoped;
+        }
+        let mut legacy = Vec::new();
+        if let Some(w) = &self.seven_day_sonnet {
+            legacy.push(("Sonnet".to_string(), w.utilization));
+        }
+        if let Some(w) = &self.seven_day_opus {
+            legacy.push(("Opus".to_string(), w.utilization));
+        }
+        legacy
+    }
+
+    /// Utilization % for a single model by display name, across both the new
+    /// `limits[]` array and the legacy flat fields.
+    fn model_limit_pct(&self, name: &str) -> Option<f64> {
+        self.scoped_model_limits()
+            .into_iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, pct)| pct)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -561,22 +628,11 @@ pub fn run(
                         Cell::new(""),
                     ]);
                 }
-                if let Some(ref w) = u.seven_day_sonnet {
-                    if w.utilization > 0.0 {
+                for (name, pct) in u.scoped_model_limits() {
+                    if pct > 0.0 {
                         table.add_row(vec![
-                            Cell::new("  └─ Sonnet"),
-                            Cell::new(format!("{:.0}%", w.utilization)),
-                            Cell::new(""),
-                            Cell::new(""),
-                            Cell::new(""),
-                        ]);
-                    }
-                }
-                if let Some(ref w) = u.seven_day_opus {
-                    if w.utilization > 0.0 {
-                        table.add_row(vec![
-                            Cell::new("  └─ Opus"),
-                            Cell::new(format!("{:.0}%", w.utilization)),
+                            Cell::new(format!("  └─ {name}")),
+                            Cell::new(format!("{:.0}%", pct)),
                             Cell::new(""),
                             Cell::new(""),
                             Cell::new(""),
@@ -1256,10 +1312,7 @@ fn run_plan_mode(
     eprintln!();
 
     let native_utilizations: Vec<f64> = native.iter().map(|s| s.utilization).collect();
-    let opus_pct = usage
-        .as_ref()
-        .and_then(|u| u.seven_day_opus.as_ref())
-        .map(|w| w.utilization);
+    let opus_pct = usage.as_ref().and_then(|u| u.model_limit_pct("Opus"));
 
     enum Synth {
         None,
@@ -1877,6 +1930,56 @@ mod tests {
             }
         }
     }"#;
+
+    // Reshaped usage API: per-model limits live in `limits[]` keyed by
+    // `scope.model.display_name`; the flat `seven_day_opus`/`_sonnet` fields
+    // now come back null.
+    const USAGE_LIMITS_SAMPLE: &str = r#"{
+        "five_hour": { "utilization": 5.0, "resets_at": "2026-07-13T11:30:00Z" },
+        "seven_day": { "utilization": 45.0, "resets_at": "2026-07-18T17:00:00Z" },
+        "seven_day_opus": null,
+        "seven_day_sonnet": null,
+        "seven_day_omelette": null,
+        "tangelo": null,
+        "limits": [
+            { "kind": "session", "group": "session", "percent": 5, "is_active": false },
+            { "kind": "weekly_all", "group": "weekly", "percent": 45, "is_active": true, "scope": null },
+            { "kind": "weekly_scoped", "group": "weekly", "percent": 12,
+              "scope": { "model": { "id": null, "display_name": "Fable" } }, "is_active": true },
+            { "kind": "weekly_scoped", "group": "weekly", "percent": 30,
+              "scope": { "model": { "id": null, "display_name": "Opus" } }, "is_active": true }
+        ]
+    }"#;
+
+    #[test]
+    fn parses_scoped_model_limits_from_new_array() {
+        let u: UsageResponse = serde_json::from_str(USAGE_LIMITS_SAMPLE).unwrap();
+        // weekly_all (no model scope) is excluded; per-model entries survive in order.
+        assert_eq!(
+            u.scoped_model_limits(),
+            vec![("Fable".to_string(), 12.0), ("Opus".to_string(), 30.0)]
+        );
+        assert_eq!(u.model_limit_pct("fable"), Some(12.0));
+        assert_eq!(u.model_limit_pct("Opus"), Some(30.0));
+        assert_eq!(u.model_limit_pct("Sonnet"), None);
+    }
+
+    #[test]
+    fn falls_back_to_legacy_flat_windows_when_limits_absent() {
+        // Older API shape: no `limits[]`, model usage in flat fields.
+        let legacy = r#"{
+            "five_hour": { "utilization": 3.0 },
+            "seven_day": { "utilization": 40.0 },
+            "seven_day_sonnet": { "utilization": 20.0 },
+            "seven_day_opus": { "utilization": 55.0 }
+        }"#;
+        let u: UsageResponse = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            u.scoped_model_limits(),
+            vec![("Sonnet".to_string(), 20.0), ("Opus".to_string(), 55.0)]
+        );
+        assert_eq!(u.model_limit_pct("Opus"), Some(55.0));
+    }
 
     #[test]
     fn migrates_v1_to_v2_under_current_org() {

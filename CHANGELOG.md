@@ -1,3 +1,8 @@
+## [0.1.21] - 2026-07-13
+
+### Fixed
+- Subscription view: restore per-model weekly limit rows (Fable, Opus, Sonnet)
+
 ## [0.1.20] - 2026-07-08
 
 ### Fixed
