@@ -1,6 +1,6 @@
-# TKU - Token Usage CLI
+# TKU - Usage, Cost & Accounts for AI Coding Agents
 
-Token usage tracking for Claude Code, Codex, Gemini CLI and others.
+A local-first CLI for Claude Code, Codex and other AI coding agents: token usage, real dollar cost (live pricing), subscription and plan insights, multi-account switching, and a live spend monitor.
 
 <p align="center">
   <img src="assets/logo.svg" alt="tku" width="480">
