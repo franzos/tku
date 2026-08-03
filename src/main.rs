@@ -13,13 +13,14 @@ mod output;
 mod paths;
 mod pricing;
 mod providers;
+mod scrub;
 mod spawn;
 mod storage;
 mod subscription;
 mod types;
 mod watch;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::str::FromStr;
 
 use anyhow::{bail, Result};
@@ -106,6 +107,104 @@ fn handle_account(action: &cli::AccountAction) -> Result<()> {
     }
 }
 
+fn handle_scrub(mode: &cli::Command, format: &cli::OutputFormat, quiet: bool) -> Result<()> {
+    let cli::Command::Scrub {
+        only,
+        skip,
+        apply,
+        stale_after,
+        max_spread,
+        include_wide,
+        preview,
+        export,
+        allow,
+        list_detectors,
+    } = mode
+    else {
+        unreachable!("handle_scrub called with a non-scrub command");
+    };
+
+    let mut state = scrub::state::load_or_init()?;
+    let custom = scrub::detect::build_custom(&state.custom)?;
+
+    if *list_detectors {
+        let mut table = comfy_table::Table::new();
+        table.set_header(vec!["CATEGORY", "DETECTOR", "DEFAULT", "SOURCE"]);
+        for d in scrub::detect::DETECTORS
+            .iter()
+            .chain(custom.iter().copied())
+        {
+            let builtin = scrub::detect::DETECTORS.iter().any(|b| b.id == d.id);
+            table.add_row(vec![
+                d.category.as_str(),
+                d.id,
+                if d.default_on { "on" } else { "off" },
+                if builtin { "built-in" } else { "scrub.toml" },
+            ]);
+        }
+        println!("{table}");
+        return Ok(());
+    }
+
+    if let Some(fp) = allow {
+        let fp = fp.trim().to_lowercase();
+        if fp.len() < scrub::fingerprint::SHORT_LEN || !fp.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!(
+                "expected a fingerprint from the report (at least {} hex characters), not a secret value",
+                scrub::fingerprint::SHORT_LEN
+            );
+        }
+        if state.allow_hash(&fp) {
+            scrub::state::save(&state)?;
+            println!("allowlisted {fp}");
+        } else {
+            println!("{fp} is already allowlisted");
+        }
+        return Ok(());
+    }
+
+    // 0 would make `age < Duration::ZERO` always false, disabling the
+    // live-session guard entirely.
+    let minutes = (*stale_after).max(1);
+    if minutes != *stale_after {
+        eprintln!("--stale-after raised to 1 minute; 0 would disable the live-session guard");
+    }
+
+    let opts = scrub::Options {
+        only: only.clone(),
+        skip: skip.clone(),
+        apply: *apply,
+        stale_after: std::time::Duration::from_secs(minutes * 60),
+        max_spread: *max_spread,
+        include_wide: *include_wide,
+        preview: preview.unwrap_or(0),
+        export: export.clone(),
+    };
+    // Progress goes to stderr, so it stays out of `--format json` on stdout.
+    // Suppressed when stderr is redirected: the in-place `\r` redraw only makes
+    // sense on a terminal, and otherwise fills the log with one line per tick.
+    let quiet = quiet || !std::io::stderr().is_terminal();
+    let progress_cb = |phase: &str, current: usize, total: usize| {
+        if total == 0 {
+            eprint!("\x1b[2K\r{phase}... {current}");
+        } else {
+            eprint!("\x1b[2K\r{phase}... {current}/{total}");
+        }
+        let _ = std::io::stderr().flush();
+    };
+    let outcome = scrub::run(&opts, &state, if quiet { None } else { Some(&progress_cb) })?;
+    if !quiet {
+        eprint!("\x1b[2K\r");
+        let _ = std::io::stderr().flush();
+    }
+
+    match format {
+        cli::OutputFormat::Json => scrub::report::print_json(&outcome),
+        cli::OutputFormat::Table => scrub::report::print_table(&outcome),
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let mode = cli.effective_command();
@@ -113,6 +212,10 @@ fn main() -> Result<()> {
     // Account management subcommands: handled early; no record scan needed.
     if let cli::Command::Account { action } = &mode {
         return handle_account(action);
+    }
+
+    if let cli::Command::Scrub { .. } = &mode {
+        return handle_scrub(&mode, &cli.format, cli.cli);
     }
 
     let config = config::load_config();

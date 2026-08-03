@@ -20,6 +20,47 @@ impl ProviderDriver for ClaudeProvider {
         compute_roots()
     }
 
+    /// Claude scatters transcript-adjacent content across siblings of
+    /// `projects/`, so the default (usage roots only) misses most of it.
+    ///
+    /// `projects/` deliberately takes every file, not just `*.jsonl`: it also
+    /// holds ~100 MB of spilled `tool-results/*.{txt,md}`, which is the same
+    /// tool-output path that carries most secrets in the transcripts.
+    ///
+    /// `.credentials.json` is excluded on purpose. It holds the live Claude
+    /// OAuth token *and* an `mcpOAuth` entry per connected MCP server, so
+    /// redacting it would sign you out of Claude Code and every MCP server at
+    /// once. `~/.claude.json` is in scope by contrast: its `mcpServers` blocks
+    /// carry auth headers and `env` values, which are config, not live session
+    /// state.
+    fn scrub_targets(&self) -> Vec<crate::scrub::ScrubTarget> {
+        use crate::scrub::ScrubTarget;
+
+        let mut out = Vec::new();
+        for root in compute_roots() {
+            let Some(home) = root.parent().map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            out.push(ScrubTarget::any(root, "transcripts"));
+            out.push(ScrubTarget::jsonl(
+                home.join("history.jsonl"),
+                "prompt-history",
+            ));
+            out.push(ScrubTarget::any(home.join("file-history"), "file-history"));
+            out.push(ScrubTarget::any(home.join("paste-cache"), "paste-cache"));
+            out.push(ScrubTarget::any(home.join("session-env"), "session-env"));
+            out.push(ScrubTarget::any(home.join("debug"), "debug"));
+            out.push(ScrubTarget::any(home.join("backups"), "config-backups"));
+            out.push(ScrubTarget::any(home.join("jobs"), "jobs"));
+        }
+
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            out.push(ScrubTarget::json(home.join(".claude.json"), "config"));
+        }
+
+        out
+    }
+
     fn discover_and_parse(
         &self,
         storage: &mut dyn Storage,

@@ -2015,8 +2015,9 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "tku"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "bitcode",
  "chrono",
@@ -2024,13 +2025,16 @@ dependencies = [
  "comfy-table",
  "crossterm",
  "directories",
+ "getrandom 0.2.17",
  "libc",
  "notify",
  "ratatui",
  "rayon",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "toml",
  "ureq",
  "walkdir",

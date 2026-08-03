@@ -88,6 +88,13 @@ pub fn config_file() -> Option<PathBuf> {
     config_dir().map(|d| d.join("config.toml"))
 }
 
+/// Scrub salt + allowlist. Deliberately separate from `config.toml`: that file
+/// is hand-written and `Config` derives only `Deserialize`, so round-tripping it
+/// through a serializer would drop the user's comments and unknown keys.
+pub fn scrub_state_file() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("scrub.toml"))
+}
+
 /// Root of the stashed-credentials hierarchy for a given tool.
 pub fn accounts_dir(tool: &str) -> Option<PathBuf> {
     config_dir().map(|d| d.join("accounts").join(tool))

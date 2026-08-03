@@ -2127,7 +2127,7 @@ mod tests {
         // trigger an immediate re-upgrade after a downgrade.
         // We exercise the partition by simulating what `run_plan_mode`
         // does: feed only natives into recommend().
-        let snaps = vec![
+        let snaps = [
             // Foreign (pre-downgrade Max5x cycles, very low utilization)
             CycleSnapshot {
                 cycle_end: "2026-04-01T10:00:00Z".parse().unwrap(),
@@ -2155,7 +2155,7 @@ mod tests {
 
     #[test]
     fn recommend_mixed_plans_uses_only_natives() {
-        let snaps = vec![
+        let snaps = [
             // Foreign pre-upgrade Pro cycles at 96% — would trigger upgrade
             // if naively included, but they're foreign now.
             CycleSnapshot {

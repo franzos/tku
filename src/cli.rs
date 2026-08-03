@@ -198,6 +198,57 @@ Typical workflow for two accounts:
         #[arg(long)]
         critical: Option<f64>,
     },
+    /// Find and redact secrets in local agent session files
+    #[command(
+        long_about = "Find and redact secrets across local agent session stores.
+
+Reports by default and changes nothing. `--apply` rewrites in place: it splices
+the secret out of the raw bytes, re-parses the result and compares it to the
+original as a tree, and refuses to write unless every difference is explained by
+a redaction. Files modified in the last few minutes are skipped so a live
+session is never rewritten under itself.
+
+Redaction is not rotation. A key found here already went to a model API and
+still exists in filesystem snapshots, in backups, and in the disk blocks the
+rewrite merely unlinked. Rotate it; scrubbing only removes local copies.
+
+There is no backup, by design: a copy of exactly the files known to hold secrets
+is a concentrated plaintext store in a new location. On a copy-on-write
+filesystem, `cp -a --reflink=auto ~/.claude ~/.claude.pre-scrub` gives you an
+undo for free if you want one."
+    )]
+    Scrub {
+        /// Only these categories or detector ids (secrets, pii, ip, or e.g. jwt)
+        #[arg(long, value_delimiter = ',')]
+        only: Option<Vec<String>>,
+        /// Exclude these categories or detector ids
+        #[arg(long, value_delimiter = ',')]
+        skip: Vec<String>,
+        /// Redact in place instead of only reporting
+        #[arg(long)]
+        apply: bool,
+        /// Treat files untouched for this many minutes as safe to rewrite (minimum 1)
+        #[arg(long, default_value = "5")]
+        stale_after: u64,
+        /// Contextual matches in more than this many files are reported but not swept
+        #[arg(long, default_value = "5")]
+        max_spread: usize,
+        /// Sweep contextual matches even when they exceed --max-spread
+        #[arg(long)]
+        include_wide: bool,
+        /// Show up to N occurrences per finding, with the exact before/after edit
+        #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "3")]
+        preview: Option<usize>,
+        /// Write every detected secret, in plaintext, to FILE as JSON (mode 0600)
+        #[arg(long, value_name = "FILE")]
+        export: Option<std::path::PathBuf>,
+        /// Ignore a finding from now on, by the fingerprint shown in the report
+        #[arg(long, conflicts_with = "apply", value_name = "FINGERPRINT")]
+        allow: Option<String>,
+        /// List every detector with its category and default state
+        #[arg(long)]
+        list_detectors: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]

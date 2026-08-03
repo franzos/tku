@@ -19,6 +19,23 @@ use std::path::{Path, PathBuf};
 /// then `rename` over `path`. Any stale `<path>.tmp` from a crashed run is
 /// removed first.
 pub fn atomic_write(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    atomic_write_checked(path, contents, mode, || Ok(()))
+}
+
+/// As [`atomic_write`], but `precondition` runs immediately before the rename
+/// and aborts the write if it fails.
+///
+/// Checking before the write instead would leave a window as long as the write
+/// itself: `scrub --apply` re-stats a transcript to confirm no agent has
+/// appended to it, then spends the write + fsync of up to a few hundred MB
+/// before the rename actually lands. A file that wakes up in between would have
+/// its new tail silently dropped.
+pub fn atomic_write_checked(
+    path: &Path,
+    contents: &[u8],
+    mode: Option<u32>,
+    precondition: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let tmp = tmp_path(path);
 
     let res: std::io::Result<()> = (|| {
@@ -42,9 +59,15 @@ pub fn atomic_write(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io:
     })();
 
     match res {
-        Ok(()) => fs::rename(&tmp, path).inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        }),
+        Ok(()) => match precondition() {
+            Ok(()) => fs::rename(&tmp, path).inspect_err(|_| {
+                let _ = fs::remove_file(&tmp);
+            }),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                Err(e)
+            }
+        },
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             Err(e)

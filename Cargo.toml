@@ -1,6 +1,6 @@
 [package]
 name = "tku"
-version = "0.1.21"
+version = "0.1.22"
 edition = "2021"
 authors = ["Franz Geffke <mail@gofranz.com>"]
 license = "GPL-3.0-only"
@@ -23,11 +23,16 @@ default = []
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
+aho-corasick = "1"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
 directories = "6"
+# 0.2, not 0.3: ring already builds 0.2, so this unifies instead of adding a crate.
+getrandom = { version = "0.2", features = ["std"] }
+regex = "1"
+sha2 = "0.10"
 bitcode = { version = "0.6", features = ["serde"] }
 rusqlite = { version = "0.38", features = ["bundled"], optional = true }
 serde = { version = "1", features = ["derive"] }

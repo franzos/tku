@@ -22,7 +22,7 @@ use crate::types::UsageRecord;
 /// Hard ceiling on whole-file size for JSONL sources. Legitimate session
 /// transcripts don't approach this; anything larger is either a junk file
 /// or a resource-exhaustion attempt. 500 MB matches the bitcode cap.
-const MAX_FILE_BYTES: u64 = 500 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 500 * 1024 * 1024;
 
 /// Per-line cap. JSONL lines that exceed this are skipped (not parsed),
 /// which protects against a single pathological record from OOMing the
@@ -49,6 +49,20 @@ pub trait Provider {
     }
 
     fn root_dirs(&self) -> Vec<PathBuf>;
+
+    /// Files this provider owns that may contain secrets.
+    ///
+    /// Defaults to the usage roots, which is right for every provider whose
+    /// transcripts are the only thing it writes. Claude overrides it: its usage
+    /// root is `~/.claude/projects`, but prompt history, file-history and the
+    /// paste cache live as *siblings* of that directory, not children.
+    fn scrub_targets(&self) -> Vec<crate::scrub::ScrubTarget> {
+        self.root_dirs()
+            .into_iter()
+            .map(|r| crate::scrub::ScrubTarget::any(r, "transcripts"))
+            .collect()
+    }
+
     fn discover_and_parse(
         &self,
         storage: &mut dyn Storage,

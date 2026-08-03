@@ -1,3 +1,14 @@
+## [0.1.22] - 2026-08-03
+
+### Added
+- `scrub`: find and redact secrets in local session files
+- `scrub --preview`: show every edit before applying it
+- `scrub --export`: plaintext secret inventory and undo map
+- Custom detectors via `scrub.toml`
+
+### Fixed
+- README stated MIT; the project is GPL-3.0-only
+
 ## [0.1.21] - 2026-07-13
 
 ### Fixed
