@@ -53,6 +53,9 @@ pub fn parse_llmprices_json(data: &str) -> Result<HashMap<String, ModelPricing>>
             output_cost_per_token: output_per_m / 1_000_000.0,
             cache_read_input_token_cost: cache_read,
             cache_creation_input_token_cost: None,
+            // No cache-write rate at all here, so no 1-hour rate to derive from.
+            cache_creation_1h_input_token_cost: None,
+            supports_fast_mode: false,
         };
 
         map.insert(id.to_string(), mp);

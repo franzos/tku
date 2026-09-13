@@ -118,3 +118,54 @@ pub fn spawn_dir(tool: &str) -> Option<PathBuf> {
     }
     data_dir().map(|d| d.join("spawn").join(tool))
 }
+
+// --- Persistent transcripts (`account exec`) ---
+
+/// Root of the persistent transcript store for a tool. `account exec` runs
+/// with its config dir on tmpfs, which would take the session transcripts
+/// down with it at logout, so `projects/` is symlinked out to here.
+pub fn transcripts_dir(tool: &str) -> Option<PathBuf> {
+    data_dir().map(|d| d.join("transcripts").join(tool))
+}
+
+/// Where an exec'd session's transcripts actually live. Keyed by `org_uuid`
+/// rather than account name: names are mutable and reusable, so a name-keyed
+/// store would silently re-attribute an earlier login's history to whatever
+/// account later took the name.
+pub fn spawn_transcripts_dir(tool: &str, org_uuid: &str) -> Option<PathBuf> {
+    transcripts_dir(tool).map(|d| d.join(org_uuid).join("projects"))
+}
+
+/// Serialises tests that point `TKU_HOME` somewhere of their own. The variable
+/// is process-global, so every test that sets it must hold this.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_paths_follow_tku_home() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join("tku-paths-test");
+        std::env::set_var("TKU_HOME", &tmp);
+
+        assert_eq!(
+            transcripts_dir("claude"),
+            Some(tmp.join("data").join("transcripts").join("claude"))
+        );
+        assert_eq!(
+            spawn_transcripts_dir("claude", "org-123"),
+            Some(
+                tmp.join("data")
+                    .join("transcripts")
+                    .join("claude")
+                    .join("org-123")
+                    .join("projects")
+            )
+        );
+
+        std::env::remove_var("TKU_HOME");
+    }
+}

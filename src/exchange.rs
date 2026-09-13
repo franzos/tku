@@ -27,6 +27,27 @@ impl ExchangeRate {
         usd * self.rate
     }
 
+    /// Convert an amount already denominated in `currency` back to USD, which
+    /// is what `format_cost` takes as input. The API bills overage credits in
+    /// the account's own currency, so handing those straight to `format_cost`
+    /// would convert a second time.
+    pub fn to_usd(&self, amount: f64, currency: &str, offline: bool) -> f64 {
+        let code = currency.to_uppercase();
+        if code == "USD" {
+            return amount;
+        }
+        let rate = if code == self.code {
+            self.rate
+        } else {
+            load_exchange_rate(&code, offline).rate
+        };
+        if rate == 0.0 {
+            amount
+        } else {
+            amount / rate
+        }
+    }
+
     pub fn format_cost(&self, cost: Option<f64>) -> String {
         match cost {
             Some(c) => format!("{}{:.2}", self.symbol, self.convert(c)),

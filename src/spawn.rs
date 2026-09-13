@@ -120,12 +120,15 @@ pub fn run(
     };
 
     let home = BaseDirs::new().ok_or_else(|| anyhow!("cannot determine home directory"))?;
+    let transcripts = crate::paths::spawn_transcripts_dir(TOOL, &account.org_uuid)
+        .context("cannot determine a data dir for persistent transcripts")?;
     let seed = Seed {
         dir: &dir,
         stash_creds: &stash_creds,
         claude_home: &home.home_dir().join(".claude"),
         claude_json: &home.home_dir().join(".claude.json"),
         oauth_account: account.oauth_account.as_ref(),
+        transcripts: Some(&transcripts),
         clean,
         copy,
     };
@@ -180,6 +183,9 @@ struct Seed<'a> {
     claude_home: &'a Path,
     claude_json: &'a Path,
     oauth_account: Option<&'a serde_json::Value>,
+    /// Persistent store `<dir>/projects` is linked to, from
+    /// `paths::spawn_transcripts_dir`. The scanner reads that same path.
+    transcripts: Option<&'a Path>,
     clean: bool,
     copy: bool,
 }
@@ -222,6 +228,12 @@ impl Seed<'_> {
             }
         }
 
+        // Before the `clean` return: under `--clean --ephemeral` a missing link
+        // would send real transcripts to tmpfs for `EphemeralGuard` to delete.
+        if let Some(target) = self.transcripts {
+            install_transcripts_link(self.dir, target)?;
+        }
+
         if self.clean {
             return Ok(());
         }
@@ -243,6 +255,66 @@ impl Seed<'_> {
 
         Ok(())
     }
+}
+
+/// Point `<dir>/projects` at the persistent transcript store. Claude Code
+/// relocates everything under `CLAUDE_CONFIG_DIR`, transcripts included, and
+/// that dir is tmpfs — the link is what keeps a session's history past logout.
+///
+/// A symlink already pointing at the target is the migration marker, so this is
+/// idempotent. `replace_path` is deliberately not used on `projects`: its
+/// remove-the-directory branch would delete the transcripts being rescued.
+fn install_transcripts_link(dir: &Path, target: &Path) -> Result<()> {
+    create_dir_secure(target).with_context(|| format!("create {}", redact(target)))?;
+    ensure_private_dir(target)?;
+
+    let link = dir.join("projects");
+    match link.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if fs::read_link(&link).ok().as_deref() == Some(target) {
+                return Ok(());
+            }
+            fs::remove_file(&link).with_context(|| format!("remove {}", redact(&link)))?;
+        }
+        Ok(meta) if meta.is_dir() => migrate_transcripts(&link, target)?,
+        Ok(_) => fs::remove_file(&link).with_context(|| format!("remove {}", redact(&link)))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => bail!("stat {}: {}", redact(&link), e),
+    }
+
+    symlink(target, &link)
+        .with_context(|| format!("symlink {} -> {}", redact(&link), redact(target)))
+}
+
+/// Move a pre-upgrade real `projects/` directory into the persistent store,
+/// then remove the source so the symlink can take its place.
+///
+/// Copy-then-remove rather than `fs::rename`: the source is tmpfs and the
+/// target is disk, so a rename fails `EXDEV`. Each file is written atomically
+/// and its source removed only once its own copy has landed, so an interrupt
+/// leaves every remaining file still readable on the source side.
+fn migrate_transcripts(src: &Path, target: &Path) -> Result<()> {
+    move_dir_contents(src, target)?;
+    fs::remove_dir_all(src).with_context(|| format!("remove {}", redact(src)))
+}
+
+fn move_dir_contents(src: &Path, dst: &Path) -> Result<()> {
+    create_dir_secure(dst).with_context(|| format!("create {}", redact(dst)))?;
+    for entry in fs::read_dir(src).with_context(|| format!("read {}", redact(src)))? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            move_dir_contents(&from, &to)?;
+        } else {
+            let data = fs::read(&from).with_context(|| format!("read {}", redact(&from)))?;
+            atomic_write(&to, &data, None)
+                .with_context(|| format!("write {}", redact(&to)))
+                .with_context(|| format!("migrate {}", redact(&from)))?;
+            fs::remove_file(&from).with_context(|| format!("remove {}", redact(&from)))?;
+        }
+    }
+    Ok(())
 }
 
 /// Remove any existing file, symlink, or directory at `path` so the seed step
@@ -737,6 +809,7 @@ mod tests {
             claude_home: &claude_home,
             claude_json: &claude_json,
             oauth_account: Some(&blob),
+            transcripts: None,
             clean: false,
             copy: false,
         };
@@ -797,6 +870,7 @@ mod tests {
             claude_home: &claude_home,
             claude_json: &claude_json,
             oauth_account: Some(&blob),
+            transcripts: None,
             clean: true,
             copy: false,
         }
@@ -830,6 +904,7 @@ mod tests {
             claude_home: &claude_home,
             claude_json: &claude_json,
             oauth_account: Some(&blob),
+            transcripts: None,
             clean: false,
             copy,
         };
@@ -843,6 +918,180 @@ mod tests {
         assert!(agents.join("a.md").exists());
 
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn seed_with_transcripts<'a>(
+        dir: &'a Path,
+        stash: &'a Path,
+        claude_home: &'a Path,
+        claude_json: &'a Path,
+        blob: &'a serde_json::Value,
+        target: &'a Path,
+        clean: bool,
+    ) -> Seed<'a> {
+        Seed {
+            dir,
+            stash_creds: stash,
+            claude_home,
+            claude_json,
+            oauth_account: Some(blob),
+            transcripts: Some(target),
+            clean,
+            copy: false,
+        }
+    }
+
+    /// Minimal fixture: a spawn dir, a stash, and a persistent target.
+    struct Fixture {
+        root: PathBuf,
+        dir: PathBuf,
+        stash: PathBuf,
+        claude_home: PathBuf,
+        claude_json: PathBuf,
+        target: PathBuf,
+        blob: serde_json::Value,
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let root = scratch(tag);
+            let claude_home = root.join(".claude");
+            fs::create_dir_all(&claude_home).unwrap();
+            let claude_json = root.join(".claude.json");
+            let stash = root.join("stash.credentials.json");
+            fs::write(&stash, b"{\"claudeAiOauth\":{\"accessToken\":\"tok\"}}").unwrap();
+            let dir = root.join("spawn");
+            fs::create_dir_all(&dir).unwrap();
+            let target = root.join("persistent").join("org-123").join("projects");
+            Self {
+                root,
+                dir,
+                stash,
+                claude_home,
+                claude_json,
+                target,
+                blob: serde_json::json!({"emailAddress": "a@b.io"}),
+            }
+        }
+
+        fn apply(&self, clean: bool) {
+            seed_with_transcripts(
+                &self.dir,
+                &self.stash,
+                &self.claude_home,
+                &self.claude_json,
+                &self.blob,
+                &self.target,
+                clean,
+            )
+            .apply()
+            .unwrap();
+        }
+
+        fn link(&self) -> PathBuf {
+            self.dir.join("projects")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_pre_existing_projects_dir_is_migrated_then_linked() {
+        let f = Fixture::new("migrate");
+        let session = f.link().join("proj-a").join("s1.jsonl");
+        fs::create_dir_all(session.parent().unwrap()).unwrap();
+        fs::write(&session, b"line-one\nline-two\n").unwrap();
+
+        f.apply(false);
+
+        let moved = f.target.join("proj-a").join("s1.jsonl");
+        assert_eq!(fs::read(&moved).unwrap(), b"line-one\nline-two\n");
+        assert!(f
+            .link()
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(f.link()).unwrap(), f.target);
+        // Source side is reachable only through the link now.
+        assert_eq!(
+            fs::read(f.link().join("proj-a").join("s1.jsonl"))
+                .unwrap()
+                .len(),
+            18
+        );
+    }
+
+    #[test]
+    fn a_second_apply_leaves_the_link_and_transcripts_alone() {
+        let f = Fixture::new("idem-link");
+        fs::create_dir_all(f.link()).unwrap();
+        fs::write(f.link().join("s.jsonl"), b"data").unwrap();
+        f.apply(false);
+        f.apply(false);
+
+        assert_eq!(fs::read(f.target.join("s.jsonl")).unwrap(), b"data");
+        assert_eq!(fs::read_link(f.link()).unwrap(), f.target);
+        assert_eq!(fs::read_dir(&f.target).unwrap().count(), 1);
+    }
+
+    /// Mirrors `EphemeralGuard::drop`, which is the whole reason transcripts
+    /// live outside the spawn dir.
+    #[test]
+    fn wiping_the_spawn_dir_does_not_touch_the_transcripts() {
+        let f = Fixture::new("ephemeral");
+        fs::create_dir_all(f.link()).unwrap();
+        fs::write(f.link().join("s.jsonl"), b"kept").unwrap();
+        f.apply(false);
+
+        fs::remove_dir_all(&f.dir).unwrap();
+
+        assert!(!f.dir.exists());
+        assert_eq!(fs::read(f.target.join("s.jsonl")).unwrap(), b"kept");
+    }
+
+    #[test]
+    fn clean_still_installs_the_link() {
+        let f = Fixture::new("clean-link");
+        f.apply(true);
+        assert_eq!(fs::read_link(f.link()).unwrap(), f.target);
+    }
+
+    #[test]
+    fn a_fresh_account_can_be_written_through_the_new_link() {
+        let f = Fixture::new("fresh");
+        assert!(!f.link().exists());
+        f.apply(false);
+
+        // A dangling link would fail both of these with ENOENT / EEXIST.
+        let through = f.link().join("proj-b");
+        fs::create_dir_all(&through).unwrap();
+        fs::write(through.join("s2.jsonl"), b"written").unwrap();
+        assert_eq!(
+            fs::read(f.target.join("proj-b").join("s2.jsonl")).unwrap(),
+            b"written"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_migration_does_not_lose_the_good_copy() {
+        let f = Fixture::new("interrupted");
+        fs::create_dir_all(f.link()).unwrap();
+        fs::write(f.link().join("s.jsonl"), b"full-good-content").unwrap();
+        // A previous run copied half the file before dying.
+        fs::create_dir_all(&f.target).unwrap();
+        fs::write(f.target.join("s.jsonl"), b"full-go").unwrap();
+
+        f.apply(false);
+
+        assert_eq!(
+            fs::read(f.target.join("s.jsonl")).unwrap(),
+            b"full-good-content"
+        );
     }
 
     #[test]

@@ -118,6 +118,8 @@ struct ExtraUsage {
     is_enabled: bool,
     monthly_limit: f64,
     used_credits: f64,
+    #[serde(default)]
+    currency: Option<String>,
 }
 
 // --- Profile API response (live plan detection) ---
@@ -603,6 +605,7 @@ pub fn run(
             format_overage(
                 usage.as_ref().and_then(|u| u.extra_usage.as_ref()),
                 exchange,
+                offline,
             )
         } else {
             "—".to_string()
@@ -850,24 +853,12 @@ fn resolve_live_plan(
 /// `account` for the Pro/Max distinction when tier is missing.
 fn plan_from_profile(p: &ProfileResponse) -> Option<Plan> {
     if let Some(org) = &p.organization {
-        if let Some(tier) = org.rate_limit_tier.as_deref() {
-            if tier.contains("20x") {
-                return Some(Plan::Max20x);
-            }
-            if tier.contains("5x") || tier.contains("max") {
-                return Some(Plan::Max5x);
-            }
-            if tier.contains("pro") {
-                return Some(Plan::Pro);
-            }
-        }
-        if let Some(t) = org.organization_type.as_deref() {
-            if t == "claude_max" {
-                return Some(Plan::Max5x);
-            }
-            if t == "claude_pro" {
-                return Some(Plan::Pro);
-            }
+        if let Some(plan) = resolve_plan(
+            None,
+            org.rate_limit_tier.as_deref(),
+            org.organization_type.as_deref(),
+        ) {
+            return Some(plan);
         }
     }
     if let Some(acc) = &p.account {
@@ -1118,25 +1109,25 @@ fn cost_in_range(
 }
 
 fn format_tier(sub_type: &str, tier: &str) -> String {
+    format_plan_label(Some(sub_type), Some(tier))
+}
+
+/// Shared label for the OAuth-claims inputs behind both `tku sub` and
+/// `tku account list`, so the two can't drift apart on the same account.
+/// An unrecognised future tier string still passes through verbatim.
+pub(crate) fn format_plan_label(sub_type: Option<&str>, rate_tier: Option<&str>) -> String {
+    if let Some(plan) = resolve_plan(sub_type, rate_tier, None) {
+        return plan.label().to_string();
+    }
+    let tier = rate_tier.unwrap_or("");
     let multiplier = if tier.contains("20x") {
-        "20x"
+        " (20x)"
     } else if tier.contains("5x") {
-        "5x"
+        " (5x)"
     } else {
         ""
     };
-
-    let plan = match sub_type {
-        "max" => "Claude Max",
-        "pro" => "Claude Pro",
-        _ => sub_type,
-    };
-
-    if multiplier.is_empty() {
-        plan.to_string()
-    } else {
-        format!("{plan} ({multiplier})")
-    }
+    format!("{}{}", sub_type.unwrap_or("unknown"), multiplier)
 }
 
 fn format_duration_short(hours: f64) -> String {
@@ -1160,44 +1151,63 @@ fn format_duration_short(hours: f64) -> String {
 /// Prices are Anthropic's public USD rates as of early 2026; may drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Plan {
+pub(crate) enum Plan {
     Pro,
     Max5x,
     Max20x,
+    TeamStandard,
+    TeamPremium,
+    Enterprise,
 }
 
 impl Plan {
     /// Usage capacity expressed in "Pro units" — Anthropic describes
     /// Max as 5×/20× Pro's weekly limit.
+    ///
+    /// Seat plans get 1.0 rather than an invented multiplier: `run_plan_mode`
+    /// returns before the recommendation math for them.
     fn pro_units(self) -> f64 {
         match self {
             Plan::Pro => 1.0,
             Plan::Max5x => 5.0,
             Plan::Max20x => 20.0,
+            Plan::TeamStandard | Plan::TeamPremium | Plan::Enterprise => 1.0,
         }
     }
 
-    fn price_usd(self) -> f64 {
+    /// `None` for Enterprise, which is negotiated per contract.
+    fn price_usd(self) -> Option<f64> {
         match self {
-            Plan::Pro => 20.0,
-            Plan::Max5x => 100.0,
-            Plan::Max20x => 200.0,
+            Plan::Pro => Some(20.0),
+            Plan::Max5x => Some(100.0),
+            Plan::Max20x => Some(200.0),
+            Plan::TeamStandard => Some(25.0),
+            Plan::TeamPremium => Some(125.0),
+            Plan::Enterprise => None,
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Plan::Pro => "Claude Pro",
             Plan::Max5x => "Claude Max (5x)",
             Plan::Max20x => "Claude Max (20x)",
+            Plan::TeamStandard => "Claude Team",
+            Plan::TeamPremium => "Claude Team (Premium)",
+            Plan::Enterprise => "Claude Enterprise",
         }
+    }
+
+    /// Pro and Max only: an organisation seat isn't the user's to change.
+    fn is_self_serve(self) -> bool {
+        matches!(self, Plan::Pro | Plan::Max5x | Plan::Max20x)
     }
 
     fn downgrade(self) -> Option<Plan> {
         match self {
-            Plan::Pro => None,
             Plan::Max5x => Some(Plan::Pro),
             Plan::Max20x => Some(Plan::Max5x),
+            _ => None,
         }
     }
 
@@ -1205,21 +1215,62 @@ impl Plan {
         match self {
             Plan::Pro => Some(Plan::Max5x),
             Plan::Max5x => Some(Plan::Max20x),
-            Plan::Max20x => None,
+            _ => None,
+        }
+    }
+}
+
+/// The one place a plan is decided, from whichever of the three signals a
+/// caller has. `organization_type` is checked before the rate-limit tier
+/// because a Team seat reports a Max-shaped tier (`default_claude_max_5x`)
+/// and would otherwise be read as personal Max — at the wrong price, and
+/// inconsistently between `account list` and `sub`.
+pub(crate) fn resolve_plan(
+    sub_type: Option<&str>,
+    rate_tier: Option<&str>,
+    org_type: Option<&str>,
+) -> Option<Plan> {
+    let sub = sub_type.unwrap_or("");
+    let tier = rate_tier.unwrap_or("");
+
+    if org_type == Some("claude_team") || sub == "team" {
+        return Some(if tier.contains("5x") || tier.contains("20x") {
+            Plan::TeamPremium
+        } else {
+            Plan::TeamStandard
+        });
+    }
+    if org_type == Some("claude_enterprise") || sub == "enterprise" {
+        return Some(Plan::Enterprise);
+    }
+
+    if tier.contains("20x") {
+        return Some(Plan::Max20x);
+    }
+    if tier.contains("5x") {
+        return Some(Plan::Max5x);
+    }
+    match sub {
+        "max" => Some(Plan::Max5x),
+        "pro" => Some(Plan::Pro),
+        _ => {
+            if tier.contains("max") || org_type == Some("claude_max") {
+                Some(Plan::Max5x)
+            } else if tier.contains("pro") || org_type == Some("claude_pro") {
+                Some(Plan::Pro)
+            } else {
+                None
+            }
         }
     }
 }
 
 fn detect_plan(oauth: &OAuthCredentials) -> Option<Plan> {
-    let sub = oauth.subscription_type.as_deref()?;
-    let tier = oauth.rate_limit_tier.as_deref().unwrap_or("");
-    match sub {
-        "pro" => Some(Plan::Pro),
-        "max" if tier.contains("20x") => Some(Plan::Max20x),
-        "max" if tier.contains("5x") => Some(Plan::Max5x),
-        "max" => Some(Plan::Max5x),
-        _ => None,
-    }
+    resolve_plan(
+        oauth.subscription_type.as_deref(),
+        oauth.rate_limit_tier.as_deref(),
+        None,
+    )
 }
 
 #[derive(Debug)]
@@ -1259,6 +1310,11 @@ fn recommend(current: Plan, utilizations: &[f64]) -> Recommendation {
     }
 
     Recommendation::Stay
+}
+
+/// Monthly difference between two plans, `None` when either is negotiated.
+fn price_delta(from: Plan, to: Plan) -> Option<f64> {
+    Some(from.price_usd()? - to.price_usd()?)
 }
 
 fn run_plan_mode(
@@ -1307,9 +1363,19 @@ fn run_plan_mode(
     eprintln!(
         "{} — {}/month",
         current.label(),
-        exchange.format_cost(Some(current.price_usd()))
+        match current.price_usd() {
+            Some(p) => exchange.format_cost(Some(p)),
+            None => "negotiated".to_string(),
+        }
     );
     eprintln!();
+
+    // An organisation seat isn't the user's to switch, so the recommendation
+    // math is meaningless for it.
+    if !current.is_self_serve() {
+        eprintln!("Seat managed by your organisation — no plan change to recommend.");
+        return Ok(());
+    }
 
     let native_utilizations: Vec<f64> = native.iter().map(|s| s.utilization).collect();
     let opus_pct = usage.as_ref().and_then(|u| u.model_limit_pct("Opus"));
@@ -1399,13 +1465,13 @@ fn run_plan_mode(
         };
         match rec {
             Recommendation::Downgrade(to) => {
-                let savings = current.price_usd() - to.price_usd();
+                let savings = price_delta(current, to);
                 let proj_avg = project_pct(avg, current, to);
                 let proj_max = project_pct(max, current, to);
                 eprintln!(
                     "▸ Recommend: downgrade to {} — save ~{}/month",
                     to.label(),
-                    exchange.format_cost(Some(savings))
+                    exchange.format_cost(savings)
                 );
                 eprintln!();
                 eprintln!(
@@ -1421,11 +1487,11 @@ fn run_plan_mode(
                 );
             }
             Recommendation::Upgrade(to) => {
-                let extra = to.price_usd() - current.price_usd();
+                let extra = price_delta(to, current);
                 eprintln!(
                     "▸ Recommend: upgrade to {} — +{}/month",
                     to.label(),
-                    exchange.format_cost(Some(extra))
+                    exchange.format_cost(extra)
                 );
                 eprintln!();
                 let near_cap = native_utilizations.iter().filter(|&&x| x >= 95.0).count();
@@ -1579,16 +1645,17 @@ fn format_projection(pct: f64) -> String {
     }
 }
 
-fn format_overage(extra: Option<&ExtraUsage>, exchange: &ExchangeRate) -> String {
+fn format_overage(extra: Option<&ExtraUsage>, exchange: &ExchangeRate, offline: bool) -> String {
     let Some(extra) = extra else {
         return "—".to_string();
     };
     if !extra.is_enabled {
         return "disabled".to_string();
     }
-    // API returns cents
-    let used = extra.used_credits / 100.0;
-    let limit = extra.monthly_limit / 100.0;
+    // API returns cents, in the account's own billing currency.
+    let currency = extra.currency.as_deref().unwrap_or("USD");
+    let used = exchange.to_usd(extra.used_credits / 100.0, currency, offline);
+    let limit = exchange.to_usd(extra.monthly_limit / 100.0, currency, offline);
     format!(
         "{} / {}",
         exchange.format_cost(Some(used)),
@@ -1800,9 +1867,23 @@ fn gather_account_row(
         None
     };
 
-    // Plan label: live profile (active) → most-recent snapshot's tagged plan
-    //  → OAuth claims → registry-stamped subscription_type at registration time.
+    // Plan label: live profile (active) → OAuth claims → most-recent snapshot's
+    // tagged plan → registry-stamped subscription_type at registration time.
+    //
+    // Claims sit ahead of the snapshot tag because they describe the account as
+    // it stands now, while a tag records what some past cycle ran on — and a tag
+    // written before Team seats were modelled says Max for a Team account, which
+    // is exactly the `account list` / `sub` disagreement this resolver exists to
+    // end. The tag still drives the native/foreign cycle partition.
+    let claims = oauth
+        .map(|o| (o.subscription_type.as_deref(), o.rate_limit_tier.as_deref()))
+        .unwrap_or((
+            account.subscription_type.as_deref(),
+            account.rate_limit_tier.as_deref(),
+        ));
     let plan_label = if let Some(p) = live_plan {
+        p.label().to_string()
+    } else if let Some(p) = resolve_plan(claims.0, claims.1, None) {
         p.label().to_string()
     } else if let Some(p) = store
         .snapshots
@@ -1812,16 +1893,7 @@ fn gather_account_row(
     {
         p.label().to_string()
     } else {
-        match oauth {
-            Some(o) => format_tier(
-                o.subscription_type.as_deref().unwrap_or("unknown"),
-                o.rate_limit_tier.as_deref().unwrap_or(""),
-            ),
-            None => match &account.subscription_type {
-                Some(s) => format_tier(s, account.rate_limit_tier.as_deref().unwrap_or("")),
-                None => "unknown".to_string(),
-            },
-        }
+        format_plan_label(claims.0, claims.1)
     };
 
     // Fetch unless we're offline or the token's stale. Inactive accounts
@@ -2257,5 +2329,118 @@ mod tests {
         assert_eq!(snaps.len(), 1);
         assert_eq!(snaps[0].utilization, 55.0);
         assert_eq!(snaps[0].captured_at, t2);
+    }
+
+    #[test]
+    fn a_team_seat_is_not_read_as_personal_max() {
+        // Profile API: organization_type wins over a Max-shaped tier string.
+        assert_eq!(
+            resolve_plan(None, Some("default_claude_max_5x"), Some("claude_team")),
+            Some(Plan::TeamPremium)
+        );
+        // OAuth claims only, which is all `account list` has.
+        assert_eq!(
+            resolve_plan(Some("team"), Some("default_claude_max_5x"), None),
+            Some(Plan::TeamPremium)
+        );
+        // Both formatters must therefore agree on the same account.
+        assert_eq!(
+            format_plan_label(Some("team"), Some("default_claude_max_5x")),
+            "Claude Team (Premium)"
+        );
+        assert_eq!(
+            format_tier("team", "default_claude_max_5x"),
+            "Claude Team (Premium)"
+        );
+        assert_eq!(Plan::TeamPremium.price_usd(), Some(125.0));
+    }
+
+    #[test]
+    fn personal_plans_and_enterprise_still_resolve() {
+        assert_eq!(
+            resolve_plan(Some("max"), Some("default_claude_max_20x"), None),
+            Some(Plan::Max20x)
+        );
+        assert_eq!(
+            resolve_plan(Some("max"), Some("default_claude_max_5x"), None),
+            Some(Plan::Max5x)
+        );
+        assert_eq!(resolve_plan(Some("pro"), None, None), Some(Plan::Pro));
+        assert_eq!(
+            resolve_plan(None, None, Some("claude_enterprise")),
+            Some(Plan::Enterprise)
+        );
+        assert_eq!(Plan::Enterprise.price_usd(), None);
+        assert_eq!(
+            resolve_plan(Some("team"), None, None),
+            Some(Plan::TeamStandard)
+        );
+        assert_eq!(Plan::TeamStandard.price_usd(), Some(25.0));
+    }
+
+    #[test]
+    fn an_unrecognised_tier_string_still_passes_through() {
+        assert_eq!(
+            resolve_plan(Some("ultra"), Some("default_ultra"), None),
+            None
+        );
+        assert_eq!(
+            format_plan_label(Some("ultra"), Some("default_ultra")),
+            "ultra"
+        );
+        assert_eq!(format_plan_label(None, None), "unknown");
+    }
+
+    #[test]
+    fn only_pro_and_max_get_a_recommendation() {
+        assert!(Plan::Pro.is_self_serve());
+        assert!(Plan::Max20x.is_self_serve());
+        assert!(!Plan::TeamPremium.is_self_serve());
+        assert!(!Plan::Enterprise.is_self_serve());
+        // No neighbouring plan to climb to or from, either.
+        assert_eq!(Plan::TeamPremium.upgrade(), None);
+        assert_eq!(Plan::TeamPremium.downgrade(), None);
+        assert!(matches!(
+            recommend(Plan::TeamPremium, &[99.0, 99.0, 99.0]),
+            Recommendation::Stay
+        ));
+    }
+
+    fn eur_at(rate: f64) -> ExchangeRate {
+        ExchangeRate {
+            symbol: "\u{20ac}".to_string(),
+            rate,
+            code: "EUR".to_string(),
+        }
+    }
+
+    #[test]
+    fn eur_overage_credits_are_not_converted_twice() {
+        let extra = ExtraUsage {
+            is_enabled: true,
+            monthly_limit: 5000.0,
+            used_credits: 1234.0,
+            currency: Some("EUR".to_string()),
+        };
+        // 1234 cents is already EUR 12.34, so it must display as EUR 12.34
+        // rather than the EUR 11.11 a second USD->EUR pass would produce.
+        assert_eq!(
+            format_overage(Some(&extra), &eur_at(0.9), true),
+            "\u{20ac}12.34 / \u{20ac}50.00"
+        );
+    }
+
+    #[test]
+    fn overage_credits_without_a_currency_are_treated_as_usd() {
+        let extra = ExtraUsage {
+            is_enabled: true,
+            monthly_limit: 5000.0,
+            used_credits: 1234.0,
+            currency: None,
+        };
+        assert_eq!(
+            format_overage(Some(&extra), &eur_at(0.9), true),
+            "\u{20ac}11.11 / \u{20ac}45.00"
+        );
     }
 }

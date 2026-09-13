@@ -339,16 +339,17 @@ tku account exec personal -- bash -i
 
 It seeds the private dir from the account's stashed credentials, symlinks your shared `skills/`, `plugins/`, `agents/`, `commands/`, and `CLAUDE.md` so the session behaves like your normal setup, copies and patches `.claude.json`/`settings.json`, and syncs any refreshed credentials back to the stash on exit. The dir lives under `$XDG_RUNTIME_DIR` (tmpfs, cleared on logout), never under your persistent config.
 
+Session transcripts are the exception: `projects/` inside the private dir is a symlink to `~/.local/share/tku/transcripts/claude/<org_uuid>/projects`, so what an `exec` session costs is counted like any other usage and survives logout. Only credentials and config are throwaway.
+
 | Flag | Description |
 |------|-------------|
-| `--ephemeral` | Unique throwaway dir, deleted on exit (default reuses one dir per account) |
+| `--ephemeral` | Unique throwaway dir, deleted on exit (default reuses one dir per account). Transcripts persist regardless; only credentials and config are discarded |
 | `--clean` | Bare instance: skip the shared skills/plugins/agents/commands/CLAUDE.md |
 | `--copy` | Copy the shared dirs and files instead of symlinking them |
 
 **One live session per account.** `exec` refuses to run if the account is already live, whether as the active `~/.claude` login or another running `exec`. Claude's OAuth refresh tokens are single-use, so two live sessions sharing one login invalidate each other's token and brick both. To run two sessions of the same account at once, add a second login with fresh credentials (`tku account add`) as a separate stash entry.
 
 A few honest caveats:
-- Token usage inside an `exec` session is written to the isolated dir, so it doesn't show up in `tku` reports.
 - `SIGKILL`ing an `exec` skips the final credential sync-back, so a token rotated right before the kill lives only in the isolated dir until the next launch.
 - Credentials must be file-based (`~/.claude/.credentials.json`), so this is Linux, not macOS, where Claude keeps credentials in the Keychain that `CLAUDE_CONFIG_DIR` doesn't relocate.
 

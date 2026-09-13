@@ -9,7 +9,7 @@ use super::Storage;
 use crate::paths;
 use crate::types::{Provider, UsageRecord};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 pub struct SqliteStorage {
     conn: Connection,
@@ -64,7 +64,9 @@ impl SqliteStorage {
                  input_tokens                 INTEGER NOT NULL,
                  output_tokens                INTEGER NOT NULL,
                  cache_creation_input_tokens  INTEGER NOT NULL,
+                 cache_creation_1h_input_tokens INTEGER NOT NULL,
                  cache_read_input_tokens      INTEGER NOT NULL,
+                 fast_mode                    INTEGER NOT NULL,
                  account_uuid                 TEXT
              );
 
@@ -139,9 +141,10 @@ impl Storage for SqliteStorage {
             "INSERT INTO records (
                 file_id, session_id, timestamp, project, model,
                 message_id, request_id, input_tokens, output_tokens,
-                cache_creation_input_tokens, cache_read_input_tokens,
+                cache_creation_input_tokens, cache_creation_1h_input_tokens,
+                cache_read_input_tokens, fast_mode,
                 account_uuid
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         ) {
             Ok(mut stmt) => {
                 for r in &records {
@@ -156,7 +159,9 @@ impl Storage for SqliteStorage {
                         r.input_tokens as i64,
                         r.output_tokens as i64,
                         r.cache_creation_input_tokens as i64,
+                        r.cache_creation_1h_input_tokens as i64,
                         r.cache_read_input_tokens as i64,
+                        r.fast_mode,
                         r.account_uuid,
                     ]) {
                         eprintln!("tku: sqlite insert record failed: {e}");
@@ -220,7 +225,8 @@ impl Storage for SqliteStorage {
         let mut stmt = match self.conn.prepare(
             "SELECT f.provider, r.session_id, r.timestamp, r.project, r.model,
                     r.message_id, r.request_id, r.input_tokens, r.output_tokens,
-                    r.cache_creation_input_tokens, r.cache_read_input_tokens,
+                    r.cache_creation_input_tokens, r.cache_creation_1h_input_tokens,
+                    r.cache_read_input_tokens, r.fast_mode,
                     r.account_uuid
                FROM records r
                JOIN files f ON r.file_id = f.file_id",
@@ -263,8 +269,10 @@ impl Storage for SqliteStorage {
                 input_tokens: row.get::<_, i64>(7)?.max(0) as u64,
                 output_tokens: row.get::<_, i64>(8)?.max(0) as u64,
                 cache_creation_input_tokens: row.get::<_, i64>(9)?.max(0) as u64,
-                cache_read_input_tokens: row.get::<_, i64>(10)?.max(0) as u64,
-                account_uuid: row.get::<_, Option<String>>(11)?,
+                cache_creation_1h_input_tokens: row.get::<_, i64>(10)?.max(0) as u64,
+                cache_read_input_tokens: row.get::<_, i64>(11)?.max(0) as u64,
+                fast_mode: row.get::<_, bool>(12)?,
+                account_uuid: row.get::<_, Option<String>>(13)?,
             })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())

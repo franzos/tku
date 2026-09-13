@@ -178,6 +178,8 @@ mod tests {
                     output_cost_per_token: 0.0,
                     cache_read_input_token_cost: None,
                     cache_creation_input_token_cost: None,
+                    cache_creation_1h_input_token_cost: None,
+                    supports_fast_mode: false,
                 },
             );
         }
@@ -199,7 +201,9 @@ mod tests {
             input_tokens: input,
             output_tokens: 0,
             cache_creation_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
             cache_read_input_tokens: 0,
+            fast_mode: false,
             account_uuid: None,
         }
     }

@@ -171,7 +171,9 @@ fn extract_ledger_event(
         input_tokens: input,
         output_tokens: output,
         cache_creation_input_tokens: cache_creation,
+        cache_creation_1h_input_tokens: 0,
         cache_read_input_tokens: cache_read,
+        fast_mode: false,
         account_uuid: None,
     })
 }

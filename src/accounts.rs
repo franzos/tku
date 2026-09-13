@@ -1094,19 +1094,5 @@ pub fn remove(name: &str, force: bool) -> Result<()> {
 }
 
 fn format_plan(sub_type: Option<&str>, rate_tier: Option<&str>) -> String {
-    let plan = match sub_type {
-        Some("max") => "Claude Max",
-        Some("pro") => "Claude Pro",
-        Some(other) => other,
-        None => "unknown",
-    };
-    let tier = rate_tier.unwrap_or("");
-    let multiplier = if tier.contains("20x") {
-        " (20x)"
-    } else if tier.contains("5x") {
-        " (5x)"
-    } else {
-        ""
-    };
-    format!("{plan}{multiplier}")
+    crate::subscription::format_plan_label(sub_type, rate_tier)
 }

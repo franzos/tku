@@ -90,7 +90,16 @@ pub struct UsageRecord {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    /// Portion of `cache_creation_input_tokens` written with a 1-hour TTL,
+    /// which Anthropic prices at 2x base input against 1.25x for 5 minutes.
+    /// The flat total stays authoritative; the 5-minute figure is derived as
+    /// `total - this` at cost time so the two can never disagree.
+    #[serde(default)]
+    pub cache_creation_1h_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// Fast mode, priced at a flat 2x on every token class.
+    #[serde(default)]
+    pub fast_mode: bool,
     /// Organization UUID of the Claude account that produced this record,
     /// captured at scan time from `~/.claude/.credentials.json`. None for
     /// non-Claude providers, for records cached before this field existed,

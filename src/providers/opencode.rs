@@ -313,7 +313,9 @@ fn extract_record_from_data(
         input_tokens: input,
         output_tokens: output,
         cache_creation_input_tokens: cache_write,
+        cache_creation_1h_input_tokens: 0,
         cache_read_input_tokens: cache_read,
+        fast_mode: false,
         account_uuid: None,
     })
 }
@@ -375,7 +377,9 @@ fn extract_record(
         input_tokens: input,
         output_tokens: output,
         cache_creation_input_tokens: cache_write,
+        cache_creation_1h_input_tokens: 0,
         cache_read_input_tokens: cache_read,
+        fast_mode: false,
         account_uuid: None,
     })
 }

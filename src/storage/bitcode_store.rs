@@ -15,6 +15,12 @@ use crate::types::UsageRecord;
 /// as if no cache exists and re-parse from source.
 const MAX_CACHE_BYTES: u64 = 500 * 1024 * 1024;
 
+/// Prefix written ahead of every cache payload; bump on any `UsageRecord`
+/// shape change. bitcode is positionally packed and carries no schema, so a
+/// stale cache can decode into a new struct as plausible garbage instead of
+/// failing — the marker is what makes that impossible.
+const CACHE_FORMAT_VERSION: u32 = 0x746b_7501;
+
 /// One file per provider: `~/.cache/tku/{provider}.bin`
 ///
 /// Each provider's data is loaded/flushed independently so adding
@@ -66,9 +72,14 @@ impl BitcodeStorage {
                 let Ok(data) = fs::read(&path) else {
                     return ProviderCache::default();
                 };
-                bitcode::deserialize(&data).unwrap_or_default()
+                decode_cache(&data).unwrap_or_default()
             })
     }
+}
+
+fn decode_cache(data: &[u8]) -> Option<ProviderCache> {
+    let (version, cache): (u32, ProviderCache) = bitcode::deserialize(data).ok()?;
+    (version == CACHE_FORMAT_VERSION).then_some(cache)
 }
 
 impl Storage for BitcodeStorage {
@@ -127,7 +138,7 @@ impl Storage for BitcodeStorage {
             if !pc.dirty {
                 continue;
             }
-            let data = match bitcode::serialize(pc) {
+            let data = match bitcode::serialize(&(CACHE_FORMAT_VERSION, pc)) {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("tku: failed to serialize {name} cache: {e}");

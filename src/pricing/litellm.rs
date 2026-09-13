@@ -39,11 +39,30 @@ pub fn parse_litellm_json(data: &str) -> Result<HashMap<String, ModelPricing>> {
             .get("cache_creation_input_token_cost")
             .and_then(|v| v.as_f64());
 
+        let cache_creation_1h = val
+            .get("cache_creation_input_token_cost_above_1hr")
+            .and_then(|v| v.as_f64());
+
+        let supports_fast_mode = val
+            .get("supports_speed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            && val
+                .get("provider_specific_entry")
+                .and_then(|v| v.get("fast"))
+                .is_some();
+
         let pricing = ModelPricing {
             input_cost_per_token: input,
             output_cost_per_token: output,
             cache_read_input_token_cost: cache_read,
             cache_creation_input_token_cost: cache_creation,
+            cache_creation_1h_input_token_cost: crate::cost::resolve_cache_creation_1h_cost(
+                input,
+                cache_creation,
+                cache_creation_1h,
+            ),
+            supports_fast_mode,
         };
 
         // Store under the original key
@@ -121,4 +140,51 @@ fn strip_version_suffix(key: &str) -> &str {
         return stripped;
     }
     key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_mode_needs_both_the_flag_and_a_fast_entry() {
+        let data = r#"{
+            "claude-opus-5": {"input_cost_per_token": 5e-6, "output_cost_per_token": 25e-6,
+                "cache_creation_input_token_cost": 6.25e-6,
+                "cache_creation_input_token_cost_above_1hr": 1e-5,
+                "supports_speed": true, "provider_specific_entry": {"us": 1.1, "fast": 2.0}},
+            "claude-opus-4-7": {"input_cost_per_token": 5e-6, "output_cost_per_token": 25e-6,
+                "supports_speed": true, "provider_specific_entry": {"us": 1.1}},
+            "claude-sonnet-5": {"input_cost_per_token": 3e-6, "output_cost_per_token": 15e-6}
+        }"#;
+        let map = parse_litellm_json(data).unwrap();
+        assert!(map["claude-opus-5"].supports_fast_mode);
+        assert!(!map["claude-opus-4-7"].supports_fast_mode);
+        assert!(!map["claude-sonnet-5"].supports_fast_mode);
+    }
+
+    #[test]
+    fn the_one_hour_write_rate_is_explicit_when_published_and_derived_otherwise() {
+        let data = r#"{
+            "with-1h": {"input_cost_per_token": 5e-6, "output_cost_per_token": 25e-6,
+                "cache_creation_input_token_cost": 6.25e-6,
+                "cache_creation_input_token_cost_above_1hr": 1e-5},
+            "without-1h": {"input_cost_per_token": 3e-6, "output_cost_per_token": 15e-6,
+                "cache_creation_input_token_cost": 3.75e-6},
+            "no-cache-write": {"input_cost_per_token": 3e-6, "output_cost_per_token": 15e-6}
+        }"#;
+        let map = parse_litellm_json(data).unwrap();
+        assert_eq!(
+            map["with-1h"].cache_creation_1h_input_token_cost,
+            Some(1e-5)
+        );
+        assert_eq!(
+            map["without-1h"].cache_creation_1h_input_token_cost,
+            Some(6e-6)
+        );
+        assert_eq!(
+            map["no-cache-write"].cache_creation_1h_input_token_cost,
+            None
+        );
+    }
 }

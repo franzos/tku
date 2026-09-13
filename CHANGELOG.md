@@ -1,3 +1,19 @@
+## [0.1.23] - 2026-09-13
+
+### Added
+- Fast-mode pricing for Opus 5 and Opus 4.8
+- Team, Team Premium and Enterprise plans
+
+### Changed
+- `account exec --ephemeral` keeps session transcripts; only credentials and config are discarded
+
+### Fixed
+- Cache writes were priced at the 5-minute rate whatever their TTL, undercounting cost by ~6%
+- `account exec` usage was missing from every report, and deleted at logout
+- Team seats were reported as Claude Max, at the wrong price
+- `account list` and `sub` disagreed about the same account's plan
+- Overage credits billed in a non-USD currency were converted twice
+
 ## [0.1.22] - 2026-08-03
 
 ### Added

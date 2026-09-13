@@ -60,6 +60,13 @@ pub fn parse_openrouter_json(data: &str) -> Result<HashMap<String, ModelPricing>
             output_cost_per_token: output,
             cache_read_input_token_cost: cache_read,
             cache_creation_input_token_cost: cache_creation,
+            // openrouter publishes one cache-write rate; the 1-hour one is derived.
+            cache_creation_1h_input_token_cost: crate::cost::resolve_cache_creation_1h_cost(
+                input,
+                cache_creation,
+                None,
+            ),
+            supports_fast_mode: false,
         };
 
         // Store under full ID (e.g. "anthropic/claude-opus-4-5")

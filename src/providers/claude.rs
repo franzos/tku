@@ -82,16 +82,28 @@ impl ProviderDriver for ClaudeProvider {
         // very first run before bootstrap has anchored to the earliest
         // record) and for the rare case where the registry has no entries
         // at all.
+        //
+        // Exec'd sessions are the exception: they run concurrently with
+        // whatever account is globally active, so the switch log would
+        // confidently tag them with the wrong one. Their path carries the
+        // org_uuid, which is a strictly stronger signal.
         let registry = crate::accounts::load_registry("claude");
         let live_uuid = crate::accounts::current_claude_org_uuid()
             .or_else(|| registry.latest_switch().map(|s| s.org_uuid.clone()));
+        let transcripts_base = crate::paths::transcripts_dir("claude");
         discover_and_parse_with(self.name(), files, storage, progress, prune, |path| {
             let mut records = parse_jsonl_file(path);
+            let from_path = transcripts_base
+                .as_deref()
+                .and_then(|base| org_uuid_from_transcripts_path(base, path))
+                .map(str::to_string);
             for r in &mut records {
-                r.account_uuid = registry
-                    .account_at(r.timestamp)
-                    .map(|e| e.org_uuid.clone())
-                    .or_else(|| live_uuid.clone());
+                r.account_uuid = from_path.clone().or_else(|| {
+                    registry
+                        .account_at(r.timestamp)
+                        .map(|e| e.org_uuid.clone())
+                        .or_else(|| live_uuid.clone())
+                });
             }
             records
         });
@@ -99,7 +111,7 @@ impl ProviderDriver for ClaudeProvider {
 }
 
 fn compute_roots() -> Vec<PathBuf> {
-    compute_provider_roots(
+    let mut roots = compute_provider_roots(
         None,
         &[],
         &[
@@ -112,7 +124,46 @@ fn compute_roots() -> Vec<PathBuf> {
                 subpaths: &["claude", "projects"],
             },
         ],
-    )
+    );
+    roots.extend(spawn_transcript_roots());
+    roots
+}
+
+/// `account exec` sessions write through a symlink into
+/// `<transcripts>/<org_uuid>/projects`. Roots point at the real directory, so
+/// neither the scanner nor the watcher depends on symlink traversal.
+///
+/// Enumerated by listing the store, never from the registry: `remove_account`
+/// keeps switch-log history on purpose, and the storage prune step drops cached
+/// records for any file no longer walked — a registry-derived list would erase
+/// a removed account's exec spend from every total on the next scan.
+fn spawn_transcript_roots() -> Vec<PathBuf> {
+    let Some(base) = crate::paths::transcripts_dir("claude") else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    let mut roots: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path().join("projects"))
+        .collect();
+    roots.sort();
+    roots
+}
+
+/// The first path component under the transcripts base *is* the `org_uuid`, so
+/// attribution survives an account being renamed, removed, or re-added under a
+/// reused name — none of which a timestamp lookup in the switch log would.
+fn org_uuid_from_transcripts_path<'a>(
+    base: &std::path::Path,
+    path: &'a std::path::Path,
+) -> Option<&'a str> {
+    match path.strip_prefix(base).ok()?.components().next()? {
+        std::path::Component::Normal(name) => name.to_str(),
+        _ => None,
+    }
 }
 
 fn parse_jsonl_file(path: &std::path::Path) -> Vec<UsageRecord> {
@@ -257,11 +308,140 @@ fn extract_record(
             .get("cache_creation_input_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
+        cache_creation_1h_input_tokens: usage
+            .get("cache_creation")
+            .and_then(|v| v.get("ephemeral_1h_input_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
         cache_read_input_tokens: usage
             .get("cache_read_input_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
+        fast_mode: usage.get("speed").and_then(|v| v.as_str()) == Some("fast"),
         // Filled in by discover_and_parse via per-record account_at lookup.
         account_uuid: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(line: &str) -> UsageRecord {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        extract_record(&v, "sess", "proj").unwrap()
+    }
+
+    #[test]
+    fn one_hour_cache_writes_are_read_from_the_ttl_split() {
+        let r = parse(
+            r#"{"type":"assistant","timestamp":"2026-09-12T10:00:00Z","requestId":"req_1",
+                "message":{"id":"msg_1","model":"claude-opus-5",
+                "usage":{"input_tokens":4,"output_tokens":7,
+                "cache_creation_input_tokens":29350,
+                "cache_creation":{"ephemeral_1h_input_tokens":29350,"ephemeral_5m_input_tokens":0},
+                "cache_read_input_tokens":120}}}"#,
+        );
+        assert_eq!(r.cache_creation_input_tokens, 29350);
+        assert_eq!(r.cache_creation_1h_input_tokens, 29350);
+        assert_eq!(r.cache_read_input_tokens, 120);
+    }
+
+    #[test]
+    fn a_mixed_ttl_split_keeps_the_flat_total_authoritative() {
+        let r = parse(
+            r#"{"type":"assistant","timestamp":"2026-09-12T10:00:00Z","requestId":"req_2",
+                "message":{"id":"msg_2","model":"claude-opus-5",
+                "usage":{"input_tokens":1,"output_tokens":1,
+                "cache_creation_input_tokens":1000,
+                "cache_creation":{"ephemeral_1h_input_tokens":400,"ephemeral_5m_input_tokens":600}}}}"#,
+        );
+        assert_eq!(r.cache_creation_input_tokens, 1000);
+        assert_eq!(r.cache_creation_1h_input_tokens, 400);
+    }
+
+    #[test]
+    fn a_record_without_the_split_is_all_five_minute() {
+        let r = parse(
+            r#"{"type":"assistant","timestamp":"2026-09-12T10:00:00Z","requestId":"req_3",
+                "message":{"id":"msg_3","model":"claude-opus-5",
+                "usage":{"input_tokens":1,"output_tokens":1,
+                "cache_creation_input_tokens":8192}}}"#,
+        );
+        assert_eq!(r.cache_creation_input_tokens, 8192);
+        assert_eq!(r.cache_creation_1h_input_tokens, 0);
+    }
+
+    #[test]
+    fn an_org_uuid_is_read_from_a_transcripts_path_and_nowhere_else() {
+        let base = std::path::Path::new("/data/tku/transcripts/claude");
+        assert_eq!(
+            org_uuid_from_transcripts_path(
+                base,
+                std::path::Path::new(
+                    "/data/tku/transcripts/claude/org-abc/projects/-home-p/s1.jsonl"
+                )
+            ),
+            Some("org-abc")
+        );
+        // Outside the base the caller must fall back to the switch log.
+        assert_eq!(
+            org_uuid_from_transcripts_path(
+                base,
+                std::path::Path::new("/home/u/.claude/projects/-home-p/s1.jsonl")
+            ),
+            None
+        );
+        assert_eq!(org_uuid_from_transcripts_path(base, base), None);
+    }
+
+    /// An org dir belonging to no registry entry still yields a root: a removed
+    /// account keeps its history, and a dropped root would prune it away.
+    #[test]
+    fn transcript_roots_come_from_listing_not_the_registry() {
+        let _guard = crate::paths::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "tku-claude-roots-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let base = home.join("data").join("transcripts").join("claude");
+        std::fs::create_dir_all(base.join("org-unknown").join("projects")).unwrap();
+        std::fs::create_dir_all(base.join("org-other").join("projects")).unwrap();
+        std::fs::write(base.join("stray-file"), b"x").unwrap();
+
+        std::env::set_var("TKU_HOME", &home);
+        let roots = spawn_transcript_roots();
+        let claude_roots = compute_roots();
+        std::env::remove_var("TKU_HOME");
+
+        assert_eq!(
+            roots,
+            vec![
+                base.join("org-other").join("projects"),
+                base.join("org-unknown").join("projects"),
+            ]
+        );
+        // And they reach the shared root list the scanner and watcher use.
+        assert!(claude_roots.ends_with(&roots));
+
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn speed_marks_only_fast_mode_records() {
+        let line = |speed: &str| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"2026-09-12T10:00:00Z","requestId":"req_4",
+                    "message":{{"id":"msg_4","model":"claude-opus-5",
+                    "usage":{{"input_tokens":1,"output_tokens":1,"speed":{speed}}}}}}}"#
+            )
+        };
+        assert!(parse(&line("\"fast\"")).fast_mode);
+        assert!(!parse(&line("\"standard\"")).fast_mode);
+        assert!(!parse(&line("null")).fast_mode);
+    }
 }

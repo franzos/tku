@@ -318,12 +318,17 @@ Examples:\n\
     tku account exec business -- claude -p \"hi\"\n\
     tku account exec business -- bash -i   # shell with CLAUDE_CONFIG_DIR set\n\
 \n\
+Session transcripts are kept out of the throwaway dir: `projects/` is a symlink\n\
+to ~/.local/share/tku/transcripts/claude/<org_uuid>/projects, so exec'd usage\n\
+survives logout and shows up in every tku report. --ephemeral discards the\n\
+credentials and config, not the transcripts.\n\
+\n\
 Note: SIGKILLing the exec skips the final credential sync-back, so a token\n\
 rotated right before the kill lives only in the isolated dir until next launch."
     )]
     Exec {
         name: String,
-        /// Use a unique throwaway config dir, deleted on exit
+        /// Use a unique throwaway config dir, deleted on exit (transcripts persist)
         #[arg(long)]
         ephemeral: bool,
         /// Bare instance: skip the shared skills/plugins/agents/commands/CLAUDE.md
