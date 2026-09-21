@@ -9,6 +9,9 @@ use crate::pricing::PricingSource;
 pub struct Config {
     pub pricing_source: Option<PricingSource>,
     pub currency: Option<String>,
+    /// Ceiling on a single provider's cache file. Past it, records older than
+    /// 180 days are collapsed to daily totals rather than dropped.
+    pub cache_max_bytes: Option<u64>,
     #[serde(default)]
     pub spawn: Option<SpawnConfig>,
 }

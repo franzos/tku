@@ -37,6 +37,7 @@ pub fn bucket_key(record: &UsageRecord, mode: &Command) -> String {
         Command::Subscription { .. } => "subscription".to_string(),
         Command::Account { .. } => "account".to_string(),
         Command::Scrub { .. } => "scrub".to_string(),
+        Command::Cache { .. } => "cache".to_string(),
     }
 }
 

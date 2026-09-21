@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
 
 use super::Storage;
@@ -30,12 +30,39 @@ impl SqliteStorage {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
             .context("Failed to set sqlite pragmas")?;
 
-        // Migrate if schema is outdated (this is a cache — safe to drop and recreate)
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .context("Failed to query sqlite schema version")?;
 
+        // An outdated schema is recreated rather than migrated, which is fine
+        // for the parse-cache half of this store and fatal for the archive
+        // half: most of these records describe sessions whose transcripts the
+        // tool has already deleted, so re-scanning cannot bring them back.
+        // Snapshot the database first, and say where it went.
         if version < SCHEMA_VERSION {
+            if let Some(path) = paths::sqlite_db_file() {
+                if records_present(&conn) {
+                    let aside = path.with_extension(format!(
+                        "db.quarantine-{}",
+                        chrono::Utc::now().format("%Y%m%d%H%M%S")
+                    ));
+                    match conn.execute("VACUUM INTO ?1", params![aside.to_string_lossy()]) {
+                        Ok(_) => eprintln!(
+                            "tku: {} uses schema v{version}, which this build recreates. \
+                             Copied it to {} first — `tku cache import-sqlite --db {}` \
+                             merges those records into the bitcode cache.",
+                            path.display(),
+                            aside.display(),
+                            aside.display()
+                        ),
+                        Err(e) => bail!(
+                            "{} uses schema v{version} and would be recreated, but it could \
+                             not be copied aside first ({e}). Refusing to discard it.",
+                            path.display()
+                        ),
+                    }
+                }
+            }
             conn.execute_batch(
                 "DROP TABLE IF EXISTS records;
                  DROP TABLE IF EXISTS files;",
@@ -79,6 +106,13 @@ impl SqliteStorage {
 
         Ok(Self { conn })
     }
+}
+
+/// Whether the old schema actually holds records worth preserving. A missing
+/// table means a fresh database, which needs no snapshot.
+fn records_present(conn: &Connection) -> bool {
+    conn.query_row("SELECT 1 FROM records LIMIT 1", [], |_| Ok(()))
+        .is_ok()
 }
 
 impl Storage for SqliteStorage {
@@ -217,7 +251,7 @@ impl Storage for SqliteStorage {
         }
     }
 
-    fn flush(&self) {
+    fn flush(&mut self) {
         // WAL mode — writes are already persisted
     }
 

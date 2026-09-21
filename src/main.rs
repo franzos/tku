@@ -107,6 +107,45 @@ fn handle_account(action: &cli::AccountAction) -> Result<()> {
     }
 }
 
+#[cfg(feature = "sqlite")]
+fn handle_cache(action: &cli::CacheAction) -> Result<()> {
+    let cli::CacheAction::ImportSqlite { db, dry_run } = action;
+    let path = db
+        .clone()
+        .or_else(paths::sqlite_db_file)
+        .ok_or_else(|| anyhow::anyhow!("could not resolve a sqlite cache path"))?;
+
+    let report = storage::import::import_sqlite(&path, *dry_run)?;
+    let verb = if *dry_run { "Would import" } else { "Imported" };
+    println!(
+        "{verb} {} records from {} session files in {}",
+        report.records,
+        report.files,
+        path.display()
+    );
+    if let Some((from, to)) = report.range {
+        println!("Covering {} to {}", from.date_naive(), to.date_naive());
+    }
+    if report.skipped_files > 0 {
+        println!(
+            "Left {} files alone — the bitcode cache already has them",
+            report.skipped_files
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn handle_cache(action: &cli::CacheAction) -> Result<()> {
+    let cli::CacheAction::ImportSqlite { .. } = action;
+    anyhow::bail!(
+        "this build cannot read sqlite. Rebuild with the feature and run the import once:\n\
+         \n    cargo build --release --features sqlite\n    \
+         ./target/release/tku cache import-sqlite\n\n\
+         It writes into the bitcode cache, so this build picks the records up afterwards."
+    )
+}
+
 fn handle_scrub(mode: &cli::Command, format: &cli::OutputFormat, quiet: bool) -> Result<()> {
     let cli::Command::Scrub {
         only,
@@ -216,6 +255,10 @@ fn main() -> Result<()> {
 
     if let cli::Command::Scrub { .. } = &mode {
         return handle_scrub(&mode, &cli.format, cli.cli);
+    }
+
+    if let cli::Command::Cache { action } = &mode {
+        return handle_cache(action);
     }
 
     let config = config::load_config();

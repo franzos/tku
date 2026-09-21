@@ -444,6 +444,10 @@ There's no whole-file backup, on purpose - a copy of exactly the files known to 
 
 tku caches parsed session data so repeated runs skip unchanged files. Two backends are available, selected at compile time.
 
+The cache is also the only long-term record of your usage. Coding tools delete their own transcripts — Claude Code drops sessions older than `cleanupPeriodDays` (30 by default) — so cached records routinely outlive the file they came from. Nothing removes them on its own: a source file disappearing leaves its records in place, and an unreadable or unrecognized cache file is renamed to `*.quarantine-<timestamp>` rather than overwritten.
+
+Only two things delete records. `--prune` does, explicitly and permanently. And if the cache exceeds `cache_max_bytes`, it first drops records that reporting would have deduplicated anyway, then collapses sessions older than 180, 90, and finally 30 days into one record per day, model and account — day-level totals are unaffected, intra-day detail is not — and only if that still isn't enough does it drop the oldest sessions whose transcripts are already gone. If the transcripts still on disk exceed the ceiling by themselves, the ceiling gives way and the file is written oversized with a warning. Every run warns once the cache passes 85% of the ceiling.
+
 ### Bitcode (default)
 
 Binary serialization using [bitcode](https://crates.io/crates/bitcode). One file per provider in `~/.cache/tku/`.
@@ -459,6 +463,19 @@ SQLite with WAL mode. Single database file at `~/.cache/tku/records.db`.
 ```bash
 cargo build --release --features sqlite
 ```
+
+### Moving between backends
+
+The two backends never share a file, so a build that switches from one to the other stops seeing the older store's records. Nothing is deleted — the data is in a file the running binary doesn't open. Copy it across with a one-off sqlite build:
+
+```bash
+cargo build --release --features sqlite
+./target/release/tku cache import-sqlite            # add --dry-run to see what it would do
+```
+
+It reads the database read-only, writes into the bitcode cache whichever backend the build defaults to, and leaves alone any path the bitcode cache already knows. Afterwards the normal build picks the records up.
+
+A sqlite build also recreates its database when it finds an older schema. It copies the old one to `records.db.quarantine-<timestamp>` first and prints the import command for it.
 
 ### Comparison
 
@@ -479,6 +496,7 @@ Optional config file at `~/.config/tku/config.toml`:
 ```toml
 pricing_source = "litellm"  # litellm | openrouter | llmprices
 currency = "EUR"             # any ISO 4217 code
+cache_max_bytes = 536870912  # ceiling per provider cache file (default 512 MiB)
 
 [spawn]
 ephemeral = false            # default dir mode for `account exec` (see Accounts)

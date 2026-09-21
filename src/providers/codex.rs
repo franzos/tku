@@ -225,7 +225,8 @@ fn extract_token_event(
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         (input, output, cached)
-    } else if let Some(total) = info.get("total_token_usage") {
+    } else {
+        let total = info.get("total_token_usage")?;
         let cur_input = total
             .get("input_tokens")
             .and_then(|v| v.as_u64())
@@ -249,8 +250,6 @@ fn extract_token_event(
         prev_totals.cached_input_tokens = cur_cached;
 
         (input, output, cached)
-    } else {
-        return None;
     };
 
     // Skip zero-token events

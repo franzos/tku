@@ -64,7 +64,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub cli: bool,
 
-    /// Remove cached records for source files that no longer exist
+    /// Permanently delete cached records whose source file is gone.
+    /// Those records are usually the only remaining copy — leave this off
+    /// unless you specifically want the history deleted.
     #[arg(long, global = true)]
     pub prune: bool,
 }
@@ -248,6 +250,43 @@ undo for free if you want one."
         /// List every detector with its category and default state
         #[arg(long)]
         list_detectors: bool,
+    },
+    /// Inspect and maintain the parsed-session cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum CacheAction {
+    /// Merge records from a sqlite cache into the bitcode cache
+    #[command(
+        long_about = "Merge records from a sqlite cache into the bitcode cache.
+
+The two backends are chosen at compile time and never share a file, so a build
+that switches from one to the other stops seeing the older store's records.
+Nothing was deleted — the data is simply in a file the running binary doesn't
+open. This copies it across.
+
+Reading sqlite needs a build with the feature compiled in:
+
+    cargo build --release --features sqlite
+    ./target/release/tku cache import-sqlite
+
+The import always writes to the bitcode cache, whichever backend this build
+defaults to, so the normal build picks the records up afterwards. Paths already
+present in the bitcode cache are left alone: a live file's current parse always
+wins over whatever the older store recorded for it."
+    )]
+    ImportSqlite {
+        /// Sqlite database to read (default: records.db in the cache dir).
+        /// Not `--from`: that is the global date filter.
+        #[arg(long, value_name = "FILE")]
+        db: Option<std::path::PathBuf>,
+        /// Report what would be imported without writing
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

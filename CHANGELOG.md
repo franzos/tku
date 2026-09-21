@@ -1,3 +1,17 @@
+## [0.1.24] - 2026-09-21
+
+### Added
+- `cache import-sqlite`: move records from a sqlite cache into the bitcode cache
+- `cache_max_bytes` config option, with a warning past 85%
+
+### Changed
+- Cached records outlive their source file; only `--prune` deletes them
+- Over the size ceiling, old sessions are collapsed to daily totals rather than dropped
+
+### Fixed
+- An unreadable cache was silently replaced; it is now kept aside
+- A sqlite cache with an older schema was discarded without a copy
+
 ## [0.1.23] - 2026-09-13
 
 ### Added

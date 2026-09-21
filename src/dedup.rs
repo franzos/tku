@@ -17,7 +17,7 @@ use crate::types::{Provider, UsageRecord};
 /// whichever was scanned first. Records tagged with `None` (legacy cache
 /// entries, non-Claude providers) hash to a stable empty bucket and continue
 /// to dedup against each other.
-fn fingerprint(
+pub(crate) fn fingerprint(
     provider: Provider,
     message_id: &str,
     request_id: &str,
