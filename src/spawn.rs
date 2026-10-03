@@ -13,9 +13,9 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use directories::BaseDirs;
@@ -23,9 +23,10 @@ use notify::{EventKind, RecursiveMode, Watcher};
 
 use crate::accounts::{self, redact};
 use crate::atomic_write::atomic_write;
+use crate::creds::{self, CREDS_FILE};
 
 const TOOL: &str = "claude";
-const CREDS_FILE: &str = ".credentials.json";
+const POLL_EVERY: Duration = Duration::from_secs(10);
 /// Shared, non-stateful config that every isolated instance can borrow from
 /// `~/.claude/` by symlink (or copy under `--copy`).
 const SHARED_ENTRIES: &[&str] = &[
@@ -118,12 +119,14 @@ pub fn run(
         create_dir_secure(&d).with_context(|| format!("create {}", redact(&d)))?;
         (d, None)
     };
+    let live = creds::isolated(&dir);
 
     let home = BaseDirs::new().ok_or_else(|| anyhow!("cannot determine home directory"))?;
     let transcripts = crate::paths::spawn_transcripts_dir(TOOL, &account.org_uuid)
         .context("cannot determine a data dir for persistent transcripts")?;
     let seed = Seed {
         dir: &dir,
+        live: &live,
         stash_creds: &stash_creds,
         claude_home: &home.home_dir().join(".claude"),
         claude_json: &home.home_dir().join(".claude.json"),
@@ -156,7 +159,7 @@ pub fn run(
         ),
     }
 
-    let code = launch_and_sync(&dir, &stash_creds, name, &account.org_uuid, &command)?;
+    let code = launch_and_sync(&dir, &live, &stash_creds, name, &account.org_uuid, &command)?;
     Ok(code)
 }
 
@@ -179,6 +182,7 @@ fn resolve_live_org(
 
 struct Seed<'a> {
     dir: &'a Path,
+    live: &'a creds::Store,
     stash_creds: &'a Path,
     claude_home: &'a Path,
     claude_json: &'a Path,
@@ -196,9 +200,9 @@ impl Seed<'_> {
         // truth, kept current by the sync-back below).
         let creds = fs::read(self.stash_creds)
             .with_context(|| format!("read {}", redact(self.stash_creds)))?;
-        let creds_dst = self.dir.join(CREDS_FILE);
-        atomic_write(&creds_dst, &creds, Some(0o600))
-            .with_context(|| format!("write {}", redact(&creds_dst)))?;
+        // Without the delete, `write` would merge into a reused dir's previous blob.
+        self.live.delete()?;
+        self.live.write(&creds)?;
 
         // .claude.json: start from the user's global copy (projects, onboarding
         // flags) then patch oauthAccount to this account's identity. Clear any
@@ -374,12 +378,72 @@ fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
 
 fn launch_and_sync(
     dir: &Path,
+    live: &creds::Store,
     stash_creds: &Path,
     name: &str,
     expected_org: &str,
     command: &[String],
 ) -> Result<i32> {
     let (tx, rx) = mpsc::channel::<()>();
+    let watcher = match live.file_path() {
+        Some(_) => Some(watch_creds(dir, tx)?),
+        None => None,
+    };
+
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..])
+        .env("CLAUDE_CONFIG_DIR", dir)
+        // An inherited value would change the Keychain service name Claude Code derives.
+        .env_remove("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    reset_child_signals(&mut cmd);
+
+    // Ignore terminal signals in the parent so a Ctrl-C reaches only the
+    // interactive child; we stay alive to reap it and run the mandatory
+    // credentials sync-back before exiting. A SIGKILL can't be caught, so it
+    // skips the final sync and a just-rotated token then lives only in `live`.
+    ignore_parent_signals();
+
+    let claude_json = dir.join(".claude.json");
+    let mut child = spawn_child(&mut cmd, live, &command[0])?;
+
+    let mut last_poll = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().context("wait for command")? {
+            break st;
+        }
+        if watcher.is_some() {
+            match rx.recv_timeout(Duration::from_millis(400)) {
+                Ok(()) => {
+                    sync_back(live, &claude_json, stash_creds, name, expected_org);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(400));
+            if last_poll.elapsed() >= POLL_EVERY {
+                sync_back(live, &claude_json, stash_creds, name, expected_org);
+                last_poll = Instant::now();
+            }
+        }
+    };
+
+    drop(watcher);
+    // Final sync: covers a token rotation that landed between the last watcher
+    // event and the child exiting. Not optional: skipping it can leave the
+    // stash holding an invalidated refresh token and brick the next spawn.
+    let ok = sync_back(live, &claude_json, stash_creds, name, expected_org);
+    finish(live, ok);
+
+    Ok(status.code().unwrap_or(1))
+}
+
+fn watch_creds(dir: &Path, tx: mpsc::Sender<()>) -> Result<notify::RecommendedWatcher> {
     // Watch the dir, not the file: Claude replaces .credentials.json via an
     // atomic rename, so a direct file watch would go stale after the first
     // rotation.
@@ -403,47 +467,37 @@ fn launch_and_sync(
     watcher
         .watch(dir, RecursiveMode::NonRecursive)
         .with_context(|| format!("watch {}", redact(dir)))?;
+    Ok(watcher)
+}
 
-    let mut cmd = Command::new(&command[0]);
-    cmd.args(&command[1..])
-        .env("CLAUDE_CONFIG_DIR", dir)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    reset_child_signals(&mut cmd);
-
-    // Ignore terminal signals in the parent so a Ctrl-C reaches only the
-    // interactive child; we stay alive to reap it and run the mandatory
-    // credentials sync-back before exiting. A SIGKILL can't be caught, so it
-    // skips the final sync and a just-rotated token then lives only in `dir`.
-    ignore_parent_signals();
-
-    let spawn_creds = dir.join(CREDS_FILE);
-    let claude_json = dir.join(".claude.json");
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("run '{}'", command[0]))?;
-
-    let status = loop {
-        if let Some(st) = child.try_wait().context("wait for command")? {
-            break st;
+fn spawn_child(cmd: &mut Command, live: &creds::Store, program: &str) -> Result<Child> {
+    match cmd.spawn() {
+        Ok(child) => Ok(child),
+        Err(e) => {
+            // Nothing ran, so the seeded login holds no rotated token; an ephemeral
+            // dir is about to vanish and with it the only way to name the item.
+            finish(live, true);
+            Err(e).with_context(|| format!("run '{program}'"))
         }
-        match rx.recv_timeout(Duration::from_millis(400)) {
-            Ok(()) => sync_back(&spawn_creds, &claude_json, stash_creds, name, expected_org),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-    };
+    }
+}
 
-    drop(watcher);
-    // Final sync: covers a token rotation that landed between the last watcher
-    // event and the child exiting. Not optional: skipping it can leave the
-    // stash holding an invalidated refresh token and brick the next spawn.
-    sync_back(&spawn_creds, &claude_json, stash_creds, name, expected_org);
-
-    Ok(status.code().unwrap_or(1))
+/// Remove a Keychain-backed isolated login once its token is safely in the stash.
+fn finish(live: &creds::Store, ok: bool) {
+    if live.file_path().is_some() {
+        return;
+    }
+    if !ok {
+        eprintln!(
+            "tku: warning: left {} in place because the final credentials sync failed; \
+             the refreshed token may exist only there",
+            live.describe()
+        );
+        return;
+    }
+    if let Err(e) = live.delete() {
+        eprintln!("tku: warning: could not remove {}: {e}", live.describe());
+    }
 }
 
 enum Sync {
@@ -453,34 +507,43 @@ enum Sync {
     AccountMismatch,
 }
 
-fn sync_back(spawn_creds: &Path, claude_json: &Path, stash: &Path, name: &str, expected_org: &str) {
-    match try_sync_back(spawn_creds, claude_json, stash, expected_org) {
+/// False only when the sync errored.
+fn sync_back(
+    live: &creds::Store,
+    claude_json: &Path,
+    stash: &Path,
+    name: &str,
+    expected_org: &str,
+) -> bool {
+    match try_sync_back(live, claude_json, stash, expected_org) {
         Ok(Sync::Written) => {
-            eprintln!("tku: synced refreshed credentials for '{name}' back to the stash")
+            eprintln!("tku: synced refreshed credentials for '{name}' back to the stash");
         }
         Ok(Sync::Unchanged) => {}
         Ok(Sync::LoggedOut) => {
             eprintln!(
                 "tku: warning: in-session credentials look logged-out; not syncing to the stash"
-            )
+            );
         }
         Ok(Sync::AccountMismatch) => {
-            eprintln!("tku: warning: in-session login changed account; not syncing to the stash")
+            eprintln!("tku: warning: in-session login changed account; not syncing to the stash");
         }
-        Err(e) => eprintln!("tku: warning: could not sync credentials back to the stash: {e}"),
+        Err(e) => {
+            eprintln!("tku: warning: could not sync credentials back to the stash: {e}");
+            return false;
+        }
     }
+    true
 }
 
 fn try_sync_back(
-    spawn_creds: &Path,
+    live: &creds::Store,
     claude_json: &Path,
     stash: &Path,
     expected_org: &str,
 ) -> Result<Sync> {
-    let bytes = match fs::read(spawn_creds) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Sync::Unchanged),
-        Err(e) => return Err(anyhow!("read {}: {}", redact(spawn_creds), e)),
+    let Some(bytes) = live.read()? else {
+        return Ok(Sync::Unchanged);
     };
     // Reject a logged-out or half-written (torn read) blob before it can
     // clobber a good stash entry: a valid login carries a non-empty access +
@@ -803,8 +866,10 @@ mod tests {
 
         let dir = root.join("D");
         fs::create_dir_all(&dir).unwrap();
+        let live = creds::Store::File(dir.join(CREDS_FILE));
         let seed = Seed {
             dir: &dir,
+            live: &live,
             stash_creds: &stash,
             claude_home: &claude_home,
             claude_json: &claude_json,
@@ -864,8 +929,10 @@ mod tests {
 
         let dir = root.join("D");
         fs::create_dir_all(&dir).unwrap();
+        let live = creds::Store::File(dir.join(CREDS_FILE));
         Seed {
             dir: &dir,
+            live: &live,
             stash_creds: &stash,
             claude_home: &claude_home,
             claude_json: &claude_json,
@@ -898,8 +965,10 @@ mod tests {
 
         let dir = root.join("D");
         fs::create_dir_all(&dir).unwrap();
+        let live = creds::Store::File(dir.join(CREDS_FILE));
         let mk = |copy: bool| Seed {
             dir: &dir,
+            live: &live,
             stash_creds: &stash,
             claude_home: &claude_home,
             claude_json: &claude_json,
@@ -920,31 +989,47 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    fn seed_with_transcripts<'a>(
-        dir: &'a Path,
-        stash: &'a Path,
-        claude_home: &'a Path,
-        claude_json: &'a Path,
-        blob: &'a serde_json::Value,
-        target: &'a Path,
-        clean: bool,
-    ) -> Seed<'a> {
-        Seed {
-            dir,
-            stash_creds: stash,
-            claude_home,
-            claude_json,
-            oauth_account: Some(blob),
-            transcripts: Some(target),
-            clean,
+    #[test]
+    fn reseed_replaces_previous_creds_verbatim() {
+        let root = scratch("reseed");
+        let claude_home = root.join(".claude");
+        let claude_json = root.join(".claude.json");
+        let stash = root.join("stash.credentials.json");
+        let dir = root.join("D");
+        fs::create_dir_all(&dir).unwrap();
+        let live = creds::Store::File(dir.join(CREDS_FILE));
+        let seed = Seed {
+            dir: &dir,
+            live: &live,
+            stash_creds: &stash,
+            claude_home: &claude_home,
+            claude_json: &claude_json,
+            oauth_account: None,
+            transcripts: None,
+            clean: true,
             copy: false,
-        }
+        };
+
+        fs::write(
+            &stash,
+            b"{\"claudeAiOauth\":{\"accessToken\":\"tok-1\"},\"mcpOAuth\":{\"k\":\"v\"}}",
+        )
+        .unwrap();
+        seed.apply().unwrap();
+        let second = b"{\"claudeAiOauth\":{\"accessToken\":\"tok-2\"}}";
+        fs::write(&stash, second).unwrap();
+        seed.apply().unwrap();
+
+        assert_eq!(fs::read(dir.join(CREDS_FILE)).unwrap(), second);
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// Minimal fixture: a spawn dir, a stash, and a persistent target.
     struct Fixture {
         root: PathBuf,
         dir: PathBuf,
+        live: creds::Store,
         stash: PathBuf,
         claude_home: PathBuf,
         claude_json: PathBuf,
@@ -965,6 +1050,7 @@ mod tests {
             let target = root.join("persistent").join("org-123").join("projects");
             Self {
                 root,
+                live: creds::Store::File(dir.join(CREDS_FILE)),
                 dir,
                 stash,
                 claude_home,
@@ -975,15 +1061,17 @@ mod tests {
         }
 
         fn apply(&self, clean: bool) {
-            seed_with_transcripts(
-                &self.dir,
-                &self.stash,
-                &self.claude_home,
-                &self.claude_json,
-                &self.blob,
-                &self.target,
+            Seed {
+                dir: &self.dir,
+                live: &self.live,
+                stash_creds: &self.stash,
+                claude_home: &self.claude_home,
+                claude_json: &self.claude_json,
+                oauth_account: Some(&self.blob),
+                transcripts: Some(&self.target),
                 clean,
-            )
+                copy: false,
+            }
             .apply()
             .unwrap();
         }
@@ -1164,6 +1252,7 @@ mod tests {
     fn sync_back_syncs_only_complete_rotated_login() {
         let root = scratch("sync");
         let spawn_creds = root.join(CREDS_FILE);
+        let live = creds::Store::File(spawn_creds.clone());
         let cj = root.join(".claude.json");
         let stash = root.join("stash.json");
         fs::write(&stash, login_blob("old")).unwrap();
@@ -1173,14 +1262,14 @@ mod tests {
         // Unchanged token: no write.
         fs::write(&spawn_creds, login_blob("old")).unwrap();
         assert!(matches!(
-            try_sync_back(&spawn_creds, &cj, &stash, "org-1").unwrap(),
+            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
             Sync::Unchanged
         ));
 
         // Complete rotated login: mirrored back.
         fs::write(&spawn_creds, login_blob("new")).unwrap();
         assert!(matches!(
-            try_sync_back(&spawn_creds, &cj, &stash, "org-1").unwrap(),
+            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
             Sync::Written
         ));
         assert_eq!(
@@ -1193,7 +1282,7 @@ mod tests {
         // Missing spawn creds: no-op.
         fs::remove_file(&spawn_creds).unwrap();
         assert!(matches!(
-            try_sync_back(&spawn_creds, &cj, &stash, "org-1").unwrap(),
+            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
             Sync::Unchanged
         ));
 
@@ -1204,6 +1293,7 @@ mod tests {
     fn sync_back_rejects_logged_out_or_partial_blob() {
         let root = scratch("logout");
         let spawn_creds = root.join(CREDS_FILE);
+        let live = creds::Store::File(spawn_creds.clone());
         let cj = root.join(".claude.json");
         let stash = root.join("stash.json");
         fs::write(&stash, login_blob("good")).unwrap();
@@ -1224,7 +1314,7 @@ mod tests {
         for blob in bad {
             fs::write(&spawn_creds, blob).unwrap();
             assert!(matches!(
-                try_sync_back(&spawn_creds, &cj, &stash, "org-1").unwrap(),
+                try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
                 Sync::LoggedOut
             ));
         }
@@ -1243,6 +1333,7 @@ mod tests {
     fn sync_back_skips_on_account_mismatch() {
         let root = scratch("mismatch");
         let spawn_creds = root.join(CREDS_FILE);
+        let live = creds::Store::File(spawn_creds.clone());
         let cj = root.join(".claude.json");
         let stash = root.join("stash.json");
         fs::write(&stash, login_blob("old")).unwrap();
@@ -1251,7 +1342,7 @@ mod tests {
         // Sibling .claude.json says a different account is logged in now.
         fs::write(&cj, claude_json_with_org("org-other")).unwrap();
         assert!(matches!(
-            try_sync_back(&spawn_creds, &cj, &stash, "org-1").unwrap(),
+            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
             Sync::AccountMismatch
         ));
         // Stash preserved.
@@ -1265,7 +1356,7 @@ mod tests {
         // Matching org: proceeds.
         fs::write(&cj, claude_json_with_org("org-1")).unwrap();
         assert!(matches!(
-            try_sync_back(&spawn_creds, &cj, &stash, "org-1").unwrap(),
+            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
             Sync::Written
         ));
 
@@ -1273,9 +1364,93 @@ mod tests {
         fs::write(&stash, login_blob("old")).unwrap();
         fs::write(&cj, b"{\"projects\":{}}").unwrap();
         assert!(matches!(
-            try_sync_back(&spawn_creds, &cj, &stash, "org-1").unwrap(),
+            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
             Sync::Written
         ));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn fake_keychain(dir: &Path) -> creds::Store {
+        creds::Store::Keychain(creds::Keychain {
+            program: creds::fake::security(dir),
+            account: "u".into(),
+            service: "Claude Code-credentials-test".into(),
+            file: dir.join(CREDS_FILE),
+            timeout: Duration::from_secs(5),
+        })
+    }
+
+    fn fake_lock() -> std::sync::MutexGuard<'static, ()> {
+        creds::fake::LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn sync_back_reads_keychain_store() {
+        let _g = fake_lock();
+        let root = scratch("sync-keychain");
+        let live = fake_keychain(&root);
+        let cj = root.join(".claude.json");
+        let stash = root.join("stash.json");
+        fs::write(&stash, login_blob("old")).unwrap();
+        fs::write(&cj, claude_json_with_org("org-1")).unwrap();
+        fs::write(root.join("out.1"), format!("{}\n", login_blob("new"))).unwrap();
+
+        assert!(matches!(
+            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
+            Sync::Written
+        ));
+        assert_eq!(fs::read(&stash).unwrap(), login_blob("new").as_bytes());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn finish_deletes_keychain_item_after_good_sync() {
+        let _g = fake_lock();
+        let root = scratch("finish-ok");
+        finish(&fake_keychain(&root), true);
+        assert_eq!(fs::read_to_string(root.join("calls")).unwrap().trim(), "1");
+        let argv = fs::read_to_string(root.join("argv.1")).unwrap();
+        assert_eq!(argv.lines().next(), Some("delete-generic-password"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn finish_keeps_keychain_item_after_failed_sync() {
+        let _g = fake_lock();
+        let root = scratch("finish-fail");
+        finish(&fake_keychain(&root), false);
+        assert!(!root.join("calls").exists());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn failed_spawn_removes_seeded_keychain_item() {
+        let _g = fake_lock();
+        let root = scratch("spawn-fail");
+        let live = fake_keychain(&root);
+        let mut cmd = Command::new(root.join("no-such-program"));
+        let err = spawn_child(&mut cmd, &live, "no-such-program")
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("run 'no-such-program'"));
+        assert_eq!(fs::read_to_string(root.join("calls")).unwrap().trim(), "1");
+        let argv = fs::read_to_string(root.join("argv.1")).unwrap();
+        assert_eq!(argv.lines().next(), Some("delete-generic-password"));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn finish_leaves_file_store_alone() {
+        let root = scratch("finish-file");
+        let path = root.join(CREDS_FILE);
+        fs::write(&path, login_blob("t")).unwrap();
+        finish(&creds::Store::File(path.clone()), true);
+        assert!(path.exists());
 
         fs::remove_dir_all(&root).unwrap();
     }

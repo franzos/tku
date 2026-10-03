@@ -5,6 +5,7 @@ mod burn;
 mod cli;
 mod config;
 mod cost;
+mod creds;
 mod dedup;
 mod exchange;
 mod graph;

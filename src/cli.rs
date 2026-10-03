@@ -163,8 +163,12 @@ pub enum Command {
         long_about = "Switch between multiple Claude logins and track usage per account.
 
 tku doesn't do the OAuth login itself — Claude Code does. `tku account` just
-keeps a labeled copy of ~/.claude/.credentials.json for each login and swaps
-the file in and out on demand.
+keeps a labeled copy of each login and swaps the live Claude Code login in and
+out on demand.
+
+On Linux the live login is ~/.claude/.credentials.json. On macOS it is the
+Keychain item `Claude Code-credentials`, which tku reads and writes through
+the system `security` tool; the first run may show a Keychain access prompt.
 
 Typical workflow for two accounts:
 
@@ -296,8 +300,12 @@ pub enum AccountAction {
     #[command(
         long_about = "Save your current Claude login as <name> so you can switch back to it later.
 
-tku reads whatever credentials are currently in ~/.claude/.credentials.json
-and stashes a copy. It cannot drive Claude Code's OAuth flow itself.
+tku reads the live Claude Code login and stashes a copy. It cannot drive
+Claude Code's OAuth flow itself.
+
+On macOS the live login is the Keychain item `Claude Code-credentials`, which
+tku reads through the system `security` tool; the first run may show a
+Keychain access prompt.
 
 To register a *different* account, log out of Claude Code first and log back
 in with the other one:
@@ -307,12 +315,15 @@ in with the other one:
     tku account add <other-name>"
     )]
     Add { name: String },
-    /// Switch to a saved login (replaces ~/.claude/.credentials.json)
+    /// Switch to a saved login (replaces the live Claude Code login)
     #[command(long_about = "Switch the active Claude login to <name>.
 
-Replaces ~/.claude/.credentials.json with the saved copy. Running and new
-Claude Code sessions pick up the new login on their next token refresh — no
-re-launch or re-login unless the refresh token itself has expired.
+Replaces the live Claude Code login with the saved copy. On macOS that is the
+Keychain item `Claude Code-credentials`, which tku writes through the system
+`security` tool; the first run may show a Keychain access prompt.
+
+Running and new Claude Code sessions pick up the new login on their next token
+refresh — no re-launch or re-login unless the refresh token itself has expired.
 
 Refuses by default if the current live login isn't saved (switching would
 silently lose it). Pass --force to overwrite anyway.")]
@@ -346,6 +357,9 @@ credentials (and, by default, symlinks your shared\n\
 skills/plugins/agents/commands/CLAUDE.md into it), sets CLAUDE_CONFIG_DIR, runs\n\
 your command, and syncs any refreshed credentials back to the stash on exit.\n\
 \n\
+On macOS the isolated session's credentials live in a per-session Keychain\n\
+item, which tku removes when the command exits.\n\
+\n\
 Refuses to run if <name> is already live (as the active ~/.claude login or\n\
 another running `exec`) because Claude's refresh tokens are single-use: two live\n\
 sessions sharing one login brick each other. To run two sessions of the same\n\
@@ -363,7 +377,8 @@ survives logout and shows up in every tku report. --ephemeral discards the\n\
 credentials and config, not the transcripts.\n\
 \n\
 Note: SIGKILLing the exec skips the final credential sync-back, so a token\n\
-rotated right before the kill lives only in the isolated dir until next launch."
+rotated right before the kill lives only in the isolated session until next\n\
+launch."
     )]
     Exec {
         name: String,

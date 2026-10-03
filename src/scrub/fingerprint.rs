@@ -9,7 +9,7 @@ pub const SHORT_LEN: usize = 8;
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
-fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push(HEX[(b >> 4) as usize] as char);

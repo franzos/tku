@@ -1,19 +1,21 @@
 //! Multi-account support for Claude Code.
 //!
-//! tku stashes credentials (`.credentials.json`) under
+//! tku stashes the live Claude Code login (`~/.claude/.credentials.json`, or
+//! the login Keychain on macOS) under
 //! `~/.config/tku/accounts/claude/<name>.credentials.json` and records every
 //! swap in a registry file, so historical usage records can be attributed to
 //! the account that was active at the time.
 //!
 //! Design notes:
-//! - Only `.credentials.json` is swapped. Everything else in `~/.claude/`
+//! - Only the OAuth credentials are swapped. Everything else in `~/.claude/`
 //!   (skills, CLAUDE.md, settings, hooks) stays shared.
-//! - Account key is `organizationUuid` from the creds file. Names are aliases.
+//! - Account key is `organizationUuid` from the credentials. Names are aliases.
 //! - On every tku run we detect credential changes that happened outside
 //!   tku and append an "implicit" switch entry with a soft warning.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -21,6 +23,7 @@ use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_write::atomic_write;
+use crate::creds;
 use crate::paths;
 use crate::types::UsageRecord;
 
@@ -123,10 +126,6 @@ pub fn stashed_creds_path(tool: &str, name: &str) -> Option<PathBuf> {
     paths::accounts_dir(tool).map(|d| d.join(format!("{name}.credentials.json")))
 }
 
-pub fn claude_creds_path() -> Option<PathBuf> {
-    BaseDirs::new().map(|b| b.home_dir().join(".claude").join(".credentials.json"))
-}
-
 /// Replace the user's home-dir prefix with `~` for user-visible paths.
 /// Leaves paths outside `$HOME` untouched. Avoids leaking the username in
 /// error messages that may be shared in bug reports.
@@ -222,8 +221,8 @@ fn save_registry(tool: &str, registry: &Registry) -> Result<()> {
 
 #[derive(Clone)]
 struct CredsInfo {
-    /// `organizationUuid` from `.credentials.json` when the field is present
-    /// in that file (legacy layout). Today's Claude Code doesn't write it
+    /// `organizationUuid` from the live credentials when the field is present
+    /// there (legacy layout). Today's Claude Code doesn't write it
     /// here — `add()` resolves the field via the profile API instead.
     /// Note: `~/.claude.json:oauthAccount.organizationUuid` exists
     /// but is only written at first onboarding and isn't refreshed on
@@ -268,11 +267,31 @@ pub(crate) fn current_claude_oauth_org() -> Option<String> {
         .map(String::from)
 }
 
+/// Best-effort hint for callers that tolerate an unknown login.
 fn read_current_claude_creds_info() -> Option<CredsInfo> {
-    let path = claude_creds_path()?;
-    let data = fs::read_to_string(&path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&data).ok()?;
-    // A credentials file without the OAuth object is unusable for any purpose.
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    match read_live() {
+        Ok(live) => live.map(|(_, info)| info),
+        Err(e) => {
+            if creds::is_locked(&e) && !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("warning: macOS Keychain is locked; live login unknown");
+            }
+            None
+        }
+    }
+}
+
+/// Live credentials blob and its parsed fields; `None` when there is no usable login.
+fn read_live() -> Result<Option<(Vec<u8>, CredsInfo)>> {
+    let Some(bytes) = creds::live()?.read()? else {
+        return Ok(None);
+    };
+    Ok(parse_creds_info(&bytes).map(|info| (bytes, info)))
+}
+
+fn parse_creds_info(bytes: &[u8]) -> Option<CredsInfo> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    // Credentials without the OAuth object are unusable for any purpose.
     value.get("claudeAiOauth")?;
     let org_uuid = value
         .get("organizationUuid")
@@ -304,13 +323,12 @@ fn write_secure(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     atomic_write(path, data, Some(0o600))
 }
 
-fn stash_creds_file(tool: &str, name: &str, src: &std::path::Path) -> Result<PathBuf> {
+fn stash_creds_bytes(tool: &str, name: &str, data: &[u8]) -> Result<PathBuf> {
     let dst = stashed_creds_path(tool, name).context("cannot determine stash path")?;
     if let Some(parent) = dst.parent() {
         create_stash_parent(parent).with_context(|| format!("create {}", redact(parent)))?;
     }
-    let data = fs::read(src).with_context(|| format!("read {}", redact(src)))?;
-    write_secure(&dst, &data).with_context(|| format!("write {}", redact(&dst)))?;
+    write_secure(&dst, data).with_context(|| format!("write {}", redact(&dst)))?;
     Ok(dst)
 }
 
@@ -386,12 +404,11 @@ pub fn detect_implicit_swap_pre_scan() {
 }
 
 /// Cheap reconciliation pass: keep the active account's vault and plan
-/// metadata current with whatever Claude Code wrote to
-/// `~/.claude/.credentials.json` since our last run. This covers the gap
-/// where the user runs `claude /login` (or Claude refreshes the token in
-/// the background) without subsequently invoking `tku account use` — the
-/// fresh tokens would otherwise sit only in the live file and be lost on
-/// the next swap-back.
+/// metadata current with whatever Claude Code wrote to the live login since
+/// our last run. This covers the gap where the user runs `claude /login` (or
+/// Claude refreshes the token in the background) without subsequently
+/// invoking `tku account use` — the fresh tokens would otherwise sit only in
+/// the live login and be lost on the next swap-back.
 ///
 /// Designed to be called on every `tku` invocation except for `account use`
 /// (which runs its own snapshot inline) and `account` subcommands that
@@ -440,7 +457,7 @@ pub fn reconcile_live_creds() {
 /// earliest record timestamp so historical records get attributed correctly
 /// instead of all collapsing to "Utc::now()".
 pub fn bootstrap_if_needed_post_scan(claude_records: &[&UsageRecord]) -> Option<String> {
-    let info = read_current_claude_creds_info()?;
+    let (bytes, info) = read_live().ok().flatten()?;
     let current_org = info.org_uuid?;
     let mut registry = load_registry(TOOL_CLAUDE);
     if !registry.accounts.is_empty() {
@@ -470,10 +487,8 @@ pub fn bootstrap_if_needed_post_scan(claude_records: &[&UsageRecord]) -> Option<
         source: SwitchSource::Bootstrap,
     });
 
-    if let Some(creds) = claude_creds_path() {
-        if let Err(e) = stash_creds_file(TOOL_CLAUDE, "default", &creds) {
-            eprintln!("warning: failed to stash credentials for 'default': {e}");
-        }
+    if let Err(e) = stash_creds_bytes(TOOL_CLAUDE, "default", &bytes) {
+        eprintln!("warning: failed to stash credentials for 'default': {e}");
     }
 
     if let Err(e) = save_registry(TOOL_CLAUDE, &registry) {
@@ -511,20 +526,23 @@ pub(crate) fn validate_name(name: &str) -> Result<()> {
 
 pub fn add(name: &str) -> Result<()> {
     validate_name(name)?;
-    let src = claude_creds_path().context("cannot find credentials path")?;
-
-    // Skip TOCTOU `exists()` check — let `fs::read` surface a missing-file
-    // error with context. Avoids a race where the file disappears between
-    // the existence check and the read.
-    let data = fs::read(&src).with_context(|| {
-        format!(
-            "Cannot read credentials at {}. Run Claude Code at least once first.",
-            redact(&src)
-        )
-    })?;
-
-    let info = read_current_claude_creds_info()
-        .ok_or_else(|| anyhow!("Credentials file is missing or unparseable"))?;
+    let live = creds::live()?;
+    let data = live
+        .read()
+        .with_context(|| {
+            format!(
+                "Cannot read the live Claude Code login ({})",
+                live.describe()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow!(
+                "No Claude Code login found ({}). Sign in to Claude Code first.",
+                live.describe()
+            )
+        })?;
+    let info = parse_creds_info(&data)
+        .ok_or_else(|| anyhow!("Live credentials ({}) are unparseable", live.describe()))?;
     // Modern Claude Code creds files don't carry `organizationUuid`, so we
     // resolve identity via the profile API using the live access token.
     // We also stash the resulting `oauthAccount` blob so `use_account` can
@@ -561,12 +579,7 @@ pub fn add(name: &str) -> Result<()> {
         );
     }
 
-    // Stash a copy of the bytes we already loaded (avoid re-reading the src).
-    let dst = stashed_creds_path(TOOL_CLAUDE, name).context("cannot determine stash path")?;
-    if let Some(parent) = dst.parent() {
-        create_stash_parent(parent).with_context(|| format!("create {}", redact(parent)))?;
-    }
-    write_secure(&dst, &data).with_context(|| format!("write {}", redact(&dst)))?;
+    stash_creds_bytes(TOOL_CLAUDE, name, &data)?;
 
     let now = Utc::now();
     registry.accounts.push(Account {
@@ -627,7 +640,7 @@ pub fn use_account(name: &str, force: bool) -> Result<()> {
     // delete the only copy of those credentials. The implicit-swap detector
     // catches this *after* the fact; this check stops it from happening.
     if !force {
-        if let Some(info) = read_current_claude_creds_info() {
+        if let Some((_, info)) = read_live()? {
             if let Some(current_org) = info.org_uuid {
                 if current_org != account.org_uuid && registry.find_by_org(&current_org).is_none() {
                     bail!(
@@ -662,10 +675,6 @@ pub fn use_account(name: &str, force: bool) -> Result<()> {
             redact(&src)
         );
     }
-    let dst = claude_creds_path().context("cannot find credentials path")?;
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", redact(parent)))?;
-    }
 
     // Pre-swap migration: if `.claude.json:oauthAccount` matches a registered
     // account that hasn't had its identity stored yet, capture it now —
@@ -689,7 +698,9 @@ pub fn use_account(name: &str, force: bool) -> Result<()> {
     }
 
     let data = fs::read(&src).with_context(|| format!("read {}", redact(&src)))?;
-    write_secure(&dst, &data).with_context(|| format!("write {}", redact(&dst)))?;
+    let live = creds::live()?;
+    live.write(&data)
+        .with_context(|| format!("write {}", live.describe()))?;
 
     // Re-read the (possibly migrated) account record before deciding whether
     // to backfill via API.
@@ -771,7 +782,7 @@ fn fetch_oauth_account_from_creds_bytes(data: &[u8]) -> Result<serde_json::Value
     Ok(crate::subscription::fetch_account_identity(token)?.oauth_account)
 }
 
-/// Snapshot the live `~/.claude/.credentials.json` back into the
+/// Snapshot the live Claude Code login back into the
 /// currently-active vault entry, refreshing the registry's plan metadata at
 /// the same time. Identity-gated: we only overwrite the vault if the live
 /// creds demonstrably belong to the currently-active account.
@@ -810,11 +821,12 @@ fn snapshot_live_into_active_vault(registry: &mut Registry) -> Result<()> {
     let active_org = registry.accounts[active_idx].org_uuid.clone();
     let active_name = registry.accounts[active_idx].name.clone();
 
-    let live_path = claude_creds_path().context("cannot find credentials path")?;
-    let live_bytes = match fs::read(&live_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(anyhow!("read {}: {}", redact(&live_path), e)),
+    let live = creds::live()?;
+    let Some(live_bytes) = live
+        .read()
+        .with_context(|| format!("read {}", live.describe()))?
+    else {
+        return Ok(());
     };
     let live_value: serde_json::Value = match serde_json::from_slice(&live_bytes) {
         Ok(v) => v,
@@ -1065,14 +1077,14 @@ pub fn remove(name: &str, force: bool) -> Result<()> {
         .ok_or_else(|| anyhow!("Account '{name}' not found."))?;
 
     // Removing the live account would delete the only saved copy *and* leave
-    // ~/.claude/.credentials.json in an unsaved state — easy to do by accident.
+    // the live login in an unsaved state — easy to do by accident.
     if !force {
         let target_org = registry.accounts[idx].org_uuid.clone();
-        let active_org = read_current_claude_creds_info().and_then(|i| i.org_uuid);
+        let active_org = read_live()?.and_then(|(_, i)| i.org_uuid);
         if active_org.as_deref() == Some(target_org.as_str()) {
             bail!(
                 "'{name}' is the currently-active account. Switch away first with `tku account use <other>`,\n\
-                 or pass --force to remove it anyway (the live credentials file will stay in place but\n\
+                 or pass --force to remove it anyway (the live login will stay in place but\n\
                  won't be saved anywhere)."
             );
         }

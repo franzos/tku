@@ -4,7 +4,6 @@ use std::fs;
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, ContentArrangement, Table};
-use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
 use crate::accounts::redact;
@@ -255,9 +254,9 @@ pub fn run(
 ) -> Result<()> {
     // When `--account` is specified, load that account's stashed credentials
     // and the org UUID it was registered under. Otherwise fall back to the
-    // currently-active credentials in `~/.claude/.credentials.json`. The
-    // subscription/usage API is per-account: we have to use the matching
-    // OAuth token, or we'd be reporting the wrong account's window.
+    // currently-active Claude Code login. The subscription/usage API is
+    // per-account: we have to use the matching OAuth token, or we'd be
+    // reporting the wrong account's window.
     let registry = crate::accounts::load_registry("claude");
 
     // Plan mode with multiple registered accounts is ambiguous — the
@@ -269,6 +268,7 @@ pub fn run(
         std::process::exit(1);
     }
 
+    let store = crate::creds::live()?;
     let (creds, requested_org) = if let Some(name) = account {
         let acct = registry.find_by_name(name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -276,9 +276,9 @@ pub fn run(
             )
         })?;
         // If the requested account is also the currently active one, prefer
-        // the live credentials file. Claude Code refreshes the access token
-        // in `~/.claude/.credentials.json` on each run but never writes back
-        // to the stashed copy — so the stash for the active account drifts
+        // the live login. Claude Code refreshes the live access token on
+        // each run but never writes back to the stashed copy, so the stash
+        // for the active account drifts
         // stale and would otherwise fail the expiry check below.
         //
         // Match by org_uuid when present; fall back to the latest switch-log
@@ -288,9 +288,13 @@ pub fn run(
             .or_else(|| registry.latest_switch().map(|s| s.org_uuid.clone()));
         let use_live = live_org.as_deref() == Some(acct.org_uuid.as_str());
         let creds = if use_live {
-            load_credentials().with_context(|| {
-                format!("Cannot load live credentials while account '{name}' is active")
-            })?
+            read_live_credentials(&store)
+                .and_then(|c| {
+                    c.ok_or_else(|| anyhow::anyhow!("No Claude Code login ({})", store.describe()))
+                })
+                .with_context(|| {
+                    format!("Cannot load live credentials while account '{name}' is active")
+                })?
         } else {
             let path = crate::accounts::stashed_creds_path("claude", name)
                 .ok_or_else(|| anyhow::anyhow!("cannot determine stash path"))?;
@@ -306,13 +310,20 @@ pub fn run(
         };
         (creds, Some(acct.org_uuid.clone()))
     } else {
-        match load_credentials() {
-            Ok(c) => (c, None),
-            Err(_) => {
-                eprintln!("Claude Code credentials not found (~/.claude/.credentials.json).");
-                eprintln!("Run Claude Code at least once to create them.");
+        match read_live_credentials(&store) {
+            Ok(Some(c)) => (c, None),
+            Ok(None) => {
+                eprintln!("Claude Code login not found ({}).", store.describe());
+                eprintln!("Sign in to Claude Code to create it.");
                 eprintln!();
                 eprintln!("The subscription command currently only supports Claude Max/Pro.");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Could not read the Claude Code login ({}): {e:#}",
+                    store.describe()
+                );
                 std::process::exit(1);
             }
         }
@@ -321,7 +332,7 @@ pub fn run(
     let oauth = match creds.claude_ai_oauth {
         Some(o) => o,
         None => {
-            eprintln!("No Claude OAuth token found in credentials file.");
+            eprintln!("No Claude OAuth token found in the live login.");
             eprintln!("Sign in to Claude Code to generate an OAuth token.");
             std::process::exit(1);
         }
@@ -703,12 +714,13 @@ fn resolve_current_usage(
 
 // --- Implementation ---
 
-fn load_credentials() -> Result<Credentials> {
-    let base = BaseDirs::new().context("Cannot determine home directory")?;
-    let path = base.home_dir().join(".claude").join(".credentials.json");
-    let data =
-        fs::read_to_string(&path).with_context(|| format!("Cannot read {}", redact(&path)))?;
-    serde_json::from_str(&data).context("Failed to parse credentials")
+fn read_live_credentials(store: &crate::creds::Store) -> Result<Option<Credentials>> {
+    let Some(bytes) = store.read()? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .context("Failed to parse credentials")
 }
 
 fn fetch_usage(access_token: &str) -> Result<UsageResponse> {
@@ -1683,8 +1695,8 @@ struct AccountRow {
 /// Render a one-row-per-account overview of every registered Claude account.
 ///
 /// Per-account behavior:
-/// - Currently-active account uses live `~/.claude/.credentials.json` (fresh
-///   token — Claude Code refreshes it on every run).
+/// - Currently-active account uses the live Claude Code login (fresh token;
+///   Claude Code refreshes it on every run).
 /// - Inactive accounts use their stashed credentials. If the stashed token
 ///   has expired, we skip the API call and fall back to the cached snapshot;
 ///   the user is told to switch in and re-auth to get fresh data.
@@ -1715,8 +1727,10 @@ pub fn run_all(
 
     // Live creds load once — cheap, and avoids re-reading + re-parsing per
     // active-account match (there's only ever one active, but this also
-    // keeps the inactive branch from accidentally touching the live file).
-    let live_creds = load_credentials().ok();
+    // keeps the inactive branch from accidentally touching the live login).
+    let live_creds = crate::creds::live()
+        .ok()
+        .and_then(|store| read_live_credentials(&store).ok().flatten());
 
     let rows: Vec<AccountRow> = registry
         .accounts

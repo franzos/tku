@@ -193,7 +193,7 @@ By default, buckets align to the local clock (e.g. `1d` at 08:00 shows 08:00 yes
 
 ## Subscription
 
-`tku sub` shows a 4-week overview of your Claude Max/Pro subscription usage. It fetches live utilization % from the Anthropic OAuth API and combines it with locally computed costs. Requires Claude Code credentials (`~/.claude/.credentials.json`) - other providers are not currently supported.
+`tku sub` shows a 4-week overview of your Claude Max/Pro subscription usage. It fetches live utilization % from the Anthropic OAuth API and combines it with locally computed costs. Requires a Claude Code login - other providers are not currently supported.
 
 ```bash
 # Show subscription overview
@@ -220,7 +220,7 @@ Claude Pro — 45% used, resets Mar 13, 3:00pm
 └─────────────────┴───────┴─────────┴────────┴─────────┘
 ```
 
-Usage % for the current week is fetched live; previous weeks show the last captured snapshot (saved each time you run `tku sub`). Cost is always computed from local session records. Requires Claude Code OAuth credentials at `~/.claude/.credentials.json`.
+Usage % for the current week is fetched live; previous weeks show the last captured snapshot (saved each time you run `tku sub`). Cost is always computed from local session records. Requires a Claude Code OAuth login (see [Accounts](#accounts) for where it lives).
 
 ### Multi-account overview
 
@@ -271,7 +271,9 @@ Rules: recommend **upgrade** when ≥2 recent cycles hit ≥95% or 4-cycle avera
 
 ## Accounts
 
-If you use Claude Code with more than one account (personal + work, say), `tku account` keeps a labeled copy of each login and swaps them on demand. `~/.claude/.credentials.json` is swapped, plus a targeted `oauthAccount` patch to `~/.claude.json` so Claude Code's `/status` reflects the swapped identity. Skills, `CLAUDE.md`, hooks, and other settings stay shared.
+If you use Claude Code with more than one account (personal + work, say), `tku account` keeps a labeled copy of each login and swaps them on demand. The live Claude Code login is swapped, plus a targeted `oauthAccount` patch to `~/.claude.json` so Claude Code's `/status` reflects the swapped identity. Skills, `CLAUDE.md`, hooks, and other settings stay shared.
+
+On Linux the live login is `~/.claude/.credentials.json`. On macOS it's the Keychain item `Claude Code-credentials`, which tku reads and writes through the system `security` tool, the same way Claude Code does; the first run may show a Keychain access prompt.
 
 `tku` doesn't drive the OAuth login itself; Claude Code does. So adding a second account means logging in with the other one through Claude Code first:
 
@@ -314,7 +316,7 @@ Stashed credentials live at `~/.config/tku/accounts/claude/<name>.credentials.js
 
 **Notes**:
 - On first run with existing Claude Code credentials, tku auto-registers your current account as `default` and backfills attribution to the earliest record timestamp.
-- `tku account add` needs a live access token - it resolves your `organizationUuid` via the Anthropic profile API (modern `.credentials.json` doesn't carry that field). Sign in to Claude Code first if your stash is stale.
+- `tku account add` needs a live access token - it resolves your `organizationUuid` via the Anthropic profile API (modern Claude Code credentials don't carry that field). Sign in to Claude Code first if your stash is stale.
 - After `tku account use`, both running and new Claude Code sessions pick up the swapped login on their next token refresh - no re-launch or re-login unless the refresh token itself has expired.
 - Long-running `claude` sessions cache their identity in memory and periodically rewrite `~/.claude.json`. If you swap accounts while one is open, that session can race-restore the previous `oauthAccount` blob - quit existing `claude` processes before swapping if you need `/status` to reflect the change immediately.
 - Swapping credentials outside tku (manual `cp`, `claude /login`, etc.) isn't reliably detected on modern creds, since the legacy `organizationUuid` field tku used as a signal is no longer written. Attribution in such windows is best-effort; prefer `tku account use` for clean handoffs.
@@ -337,7 +339,7 @@ tku account exec personal -- claude -p "summarise this repo"
 tku account exec personal -- bash -i
 ```
 
-It seeds the private dir from the account's stashed credentials, symlinks your shared `skills/`, `plugins/`, `agents/`, `commands/`, and `CLAUDE.md` so the session behaves like your normal setup, copies and patches `.claude.json`/`settings.json`, and syncs any refreshed credentials back to the stash on exit. The dir lives under `$XDG_RUNTIME_DIR` (tmpfs, cleared on logout), never under your persistent config.
+It seeds the private dir from the account's stashed credentials, symlinks your shared `skills/`, `plugins/`, `agents/`, `commands/`, and `CLAUDE.md` so the session behaves like your normal setup, copies and patches `.claude.json`/`settings.json`, and syncs any refreshed credentials back to the stash on exit. The dir lives under `$XDG_RUNTIME_DIR` (tmpfs, cleared on logout) when that is set, otherwise under tku's data dir (`~/.local/share/tku/spawn/` on Linux, `~/Library/Application Support/tku/spawn/` on macOS), never under your Claude Code config.
 
 Session transcripts are the exception: `projects/` inside the private dir is a symlink to `~/.local/share/tku/transcripts/claude/<org_uuid>/projects`, so what an `exec` session costs is counted like any other usage and survives logout. Only credentials and config are throwaway.
 
@@ -350,8 +352,8 @@ Session transcripts are the exception: `projects/` inside the private dir is a s
 **One live session per account.** `exec` refuses to run if the account is already live, whether as the active `~/.claude` login or another running `exec`. Claude's OAuth refresh tokens are single-use, so two live sessions sharing one login invalidate each other's token and brick both. To run two sessions of the same account at once, add a second login with fresh credentials (`tku account add`) as a separate stash entry.
 
 A few honest caveats:
-- `SIGKILL`ing an `exec` skips the final credential sync-back, so a token rotated right before the kill lives only in the isolated dir until the next launch.
-- Credentials must be file-based (`~/.claude/.credentials.json`), so this is Linux, not macOS, where Claude keeps credentials in the Keychain that `CLAUDE_CONFIG_DIR` doesn't relocate.
+- `SIGKILL`ing an `exec` skips the final credential sync-back, so a token rotated right before the kill lives only in the isolated session until the next launch.
+- On macOS the isolated session's credentials live in a per-session Keychain item rather than a file in the private dir. tku polls that item for token rotation, syncs rotated tokens back to the stash, and removes the item when the command exits. If the final sync fails, the item stays in place and tku prints a warning.
 
 ## Status bar integration
 

@@ -1,3 +1,16 @@
+## [0.1.25] - 2026-10-03
+
+### Added
+- macOS: `account` and `sub` use the Claude Code login in the Keychain
+- macOS: `account exec` runs on a per-session Keychain item, removed on exit
+
+### Changed
+- `account use` keeps `mcpOAuth` and other sibling keys when swapping
+- A locked Keychain is an error, not "no login"
+
+### Fixed
+- `account add` blamed a missing file when the login lived elsewhere
+
 ## [0.1.24] - 2026-09-21
 
 ### Added
