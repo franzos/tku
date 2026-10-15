@@ -456,13 +456,26 @@ pub fn reconcile_live_creds() {
 /// first time we see them. Anchors the bootstrap switch entry to the
 /// earliest record timestamp so historical records get attributed correctly
 /// instead of all collapsing to "Utc::now()".
-pub fn bootstrap_if_needed_post_scan(claude_records: &[&UsageRecord]) -> Option<String> {
+pub fn bootstrap_if_needed_post_scan(
+    claude_records: &[&UsageRecord],
+    offline: bool,
+) -> Option<String> {
     let (bytes, info) = read_live().ok().flatten()?;
-    let current_org = info.org_uuid?;
     let mut registry = load_registry(TOOL_CLAUDE);
     if !registry.accounts.is_empty() {
         return registry.latest_switch().map(|s| s.name.clone());
     }
+    // Current Claude Code logins carry no organizationUuid; resolve it via
+    // the profile API like `add()` does.
+    let (current_org, oauth_account) = match info.org_uuid {
+        Some(org) => (org, None),
+        None if !offline => {
+            let identity =
+                crate::subscription::fetch_account_identity(info.access_token.as_deref()?).ok()?;
+            (identity.org_uuid, Some(identity.oauth_account))
+        }
+        None => return None,
+    };
 
     let earliest = claude_records
         .iter()
@@ -478,7 +491,7 @@ pub fn bootstrap_if_needed_post_scan(claude_records: &[&UsageRecord]) -> Option<
         last_used_at: now,
         subscription_type: info.subscription_type,
         rate_limit_tier: info.rate_limit_tier,
-        oauth_account: None,
+        oauth_account,
     });
     registry.switch_log.push(SwitchEntry {
         at: earliest,

@@ -369,7 +369,7 @@ fn main() -> Result<()> {
         .iter()
         .filter(|r| r.provider == Provider::Claude)
         .collect();
-    let _ = accounts::bootstrap_if_needed_post_scan(&claude_refs);
+    let _ = accounts::bootstrap_if_needed_post_scan(&claude_refs, cli.offline);
     drop(claude_refs);
 
     let account_filter = cli.account.clone();
