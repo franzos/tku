@@ -115,8 +115,9 @@ struct UsageWindow {
 #[derive(Debug, Deserialize)]
 struct ExtraUsage {
     is_enabled: bool,
-    monthly_limit: f64,
-    used_credits: f64,
+    // null while extra usage is disabled
+    monthly_limit: Option<f64>,
+    used_credits: Option<f64>,
     #[serde(default)]
     currency: Option<String>,
 }
@@ -1666,8 +1667,12 @@ fn format_overage(extra: Option<&ExtraUsage>, exchange: &ExchangeRate, offline: 
     }
     // API returns cents, in the account's own billing currency.
     let currency = extra.currency.as_deref().unwrap_or("USD");
-    let used = exchange.to_usd(extra.used_credits / 100.0, currency, offline);
-    let limit = exchange.to_usd(extra.monthly_limit / 100.0, currency, offline);
+    let used = exchange.to_usd(extra.used_credits.unwrap_or(0.0) / 100.0, currency, offline);
+    let limit = exchange.to_usd(
+        extra.monthly_limit.unwrap_or(0.0) / 100.0,
+        currency,
+        offline,
+    );
     format!(
         "{} / {}",
         exchange.format_cost(Some(used)),
@@ -2068,6 +2073,15 @@ mod tests {
     }
 
     #[test]
+    fn parses_disabled_extra_usage_with_null_amounts() {
+        let u: UsageResponse = serde_json::from_str(
+            r#"{ "extra_usage": { "is_enabled": false, "monthly_limit": null, "used_credits": null } }"#,
+        )
+        .unwrap();
+        assert!(!u.extra_usage.unwrap().is_enabled);
+    }
+
+    #[test]
     fn migrates_v1_to_v2_under_current_org() {
         let store = parse_on_disk(V1_SAMPLE, "org-abc-123");
         assert_eq!(store.version, 2);
@@ -2432,8 +2446,8 @@ mod tests {
     fn eur_overage_credits_are_not_converted_twice() {
         let extra = ExtraUsage {
             is_enabled: true,
-            monthly_limit: 5000.0,
-            used_credits: 1234.0,
+            monthly_limit: Some(5000.0),
+            used_credits: Some(1234.0),
             currency: Some("EUR".to_string()),
         };
         // 1234 cents is already EUR 12.34, so it must display as EUR 12.34
@@ -2448,8 +2462,8 @@ mod tests {
     fn overage_credits_without_a_currency_are_treated_as_usd() {
         let extra = ExtraUsage {
             is_enabled: true,
-            monthly_limit: 5000.0,
-            used_credits: 1234.0,
+            monthly_limit: Some(5000.0),
+            used_credits: Some(1234.0),
             currency: None,
         };
         assert_eq!(
