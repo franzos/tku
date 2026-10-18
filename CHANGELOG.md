@@ -1,3 +1,15 @@
+## [0.1.26] - 2026-10-18
+
+### Changed
+- First-run account registration resolves the identity in `tku sub`, never in `tku bar`
+- Status-bar and report commands no longer verify a rotated token via the profile API
+- HTTP requests time out instead of hanging on a stalled network
+
+### Fixed
+- `sub` failed to parse usage when extra usage is disabled
+- Overage with no limit showed `$0.00` instead of unknown
+- Snapshot history taken before registration carries over to the registered account
+
 ## [0.1.25] - 2026-10-03
 
 ### Added
