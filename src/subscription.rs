@@ -746,12 +746,19 @@ pub struct AccountIdentity {
     pub oauth_account: serde_json::Value,
 }
 
-/// Fetch the live account identity from the profile API. Used by
-/// `accounts::add` to record the org UUID and stash an `oauthAccount` blob
-/// matching Claude Code's `.claude.json` shape, so `accounts::use_account`
-/// can keep that file's identity in sync with the swapped credentials.
+/// Fetch the live account identity from the profile API: the org UUID plus
+/// an `oauthAccount` blob matching Claude Code's `.claude.json` shape, so
+/// `accounts::use_account` can keep that file's identity in sync with the
+/// swapped credentials. Also primes the plan cache for that org.
 pub fn fetch_account_identity(access_token: &str) -> Result<AccountIdentity> {
     let profile = fetch_profile(access_token)?;
+    if let Some(org) = profile
+        .organization
+        .as_ref()
+        .and_then(|o| o.uuid.as_deref())
+    {
+        save_cached_profile(org, &profile);
+    }
     let account = profile
         .account
         .as_ref()
@@ -936,6 +943,31 @@ fn parse_on_disk(data: &str, migration_org: &str) -> OnDiskStore {
     }
 
     OnDiskStore::default_v2()
+}
+
+/// Snapshots taken before the account was registered live under "unknown";
+/// move them under the resolved org so cycle history and calibration carry over.
+pub fn adopt_unknown_snapshots(org_uuid: &str) {
+    let Some(path) = snapshot_path() else { return };
+    let Ok(data) = fs::read_to_string(&path) else {
+        return;
+    };
+    let mut on_disk = parse_on_disk(&data, org_uuid);
+    if on_disk.accounts.contains_key(org_uuid) {
+        return;
+    }
+    let Some(unknown) = on_disk.accounts.remove("unknown") else {
+        return;
+    };
+    on_disk.accounts.insert(org_uuid.to_string(), unknown);
+    match serde_json::to_string_pretty(&on_disk) {
+        Ok(data) => {
+            if let Err(e) = atomic_write(&path, data.as_bytes(), Some(0o600)) {
+                eprintln!("warning: failed to migrate snapshot history: {e}");
+            }
+        }
+        Err(e) => eprintln!("warning: failed to serialize snapshot history: {e}"),
+    }
 }
 
 fn load_snapshots(org_uuid: &str) -> SnapshotStore {
@@ -1660,23 +1692,21 @@ fn format_projection(pct: f64) -> String {
 
 fn format_overage(extra: Option<&ExtraUsage>, exchange: &ExchangeRate, offline: bool) -> String {
     let Some(extra) = extra else {
-        return "—".to_string();
+        return "\u{2014}".to_string();
     };
     if !extra.is_enabled {
         return "disabled".to_string();
     }
     // API returns cents, in the account's own billing currency.
     let currency = extra.currency.as_deref().unwrap_or("USD");
-    let used = exchange.to_usd(extra.used_credits.unwrap_or(0.0) / 100.0, currency, offline);
-    let limit = exchange.to_usd(
-        extra.monthly_limit.unwrap_or(0.0) / 100.0,
-        currency,
-        offline,
-    );
+    let cents = |c: Option<f64>| match c {
+        Some(c) => exchange.format_cost(Some(exchange.to_usd(c / 100.0, currency, offline))),
+        None => "\u{2014}".to_string(),
+    };
     format!(
         "{} / {}",
-        exchange.format_cost(Some(used)),
-        exchange.format_cost(Some(limit))
+        cents(extra.used_credits),
+        cents(extra.monthly_limit)
     )
 }
 
@@ -2455,6 +2485,34 @@ mod tests {
         assert_eq!(
             format_overage(Some(&extra), &eur_at(0.9), true),
             "\u{20ac}12.34 / \u{20ac}50.00"
+        );
+    }
+
+    #[test]
+    fn enabled_overage_with_null_limit_shows_unknown_limit() {
+        let extra = ExtraUsage {
+            is_enabled: true,
+            monthly_limit: None,
+            used_credits: Some(1234.0),
+            currency: Some("EUR".to_string()),
+        };
+        assert_eq!(
+            format_overage(Some(&extra), &eur_at(0.9), true),
+            "\u{20ac}12.34 / \u{2014}"
+        );
+    }
+
+    #[test]
+    fn enabled_overage_with_null_used_shows_unknown_used() {
+        let extra = ExtraUsage {
+            is_enabled: true,
+            monthly_limit: Some(5000.0),
+            used_credits: None,
+            currency: Some("EUR".to_string()),
+        };
+        assert_eq!(
+            format_overage(Some(&extra), &eur_at(0.9), true),
+            "\u{2014} / \u{20ac}50.00"
         );
     }
 

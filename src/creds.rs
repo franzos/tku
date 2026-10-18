@@ -492,7 +492,7 @@ mod tests {
             |filler: usize| format!("{{\"claudeAiOauth\":{{\"t\":\"{}\"}}}}", "x".repeat(filler));
         for account in ["u", "uu"] {
             let overhead = add_line(account, "").len() + 2 * shell(0).len();
-            if len >= overhead && (len - overhead) % 2 == 0 {
+            if len >= overhead && (len - overhead).is_multiple_of(2) {
                 let stash = shell((len - overhead) / 2).into_bytes();
                 assert_eq!(add_line(account, &to_hex(&stash)).len(), len);
                 return (account.to_string(), stash);

@@ -74,7 +74,7 @@ tku monthly --account work
 | `--breakdown` | Per-model breakdown within each period |
 | `--pricing-source <source>` | Pricing source: `litellm` (default), `openrouter`, `llmprices` |
 | `--currency <CODE>` | Currency for cost display (ISO 4217, e.g. `EUR`, `GBP`) |
-| `--offline` | Use cached pricing only |
+| `--offline` | Use cached pricing only; skips the profile API lookup on first-run account registration |
 | `--cli` | Suppress progress output (for scripting) |
 
 ### Columns
@@ -315,8 +315,9 @@ tku sub --plan --account personal
 Stashed credentials live at `~/.config/tku/accounts/claude/<name>.credentials.json` (mode 0600, atomic write). The registry + switch log are at `~/.config/tku/accounts/claude/registry.json`.
 
 **Notes**:
-- On first run with existing Claude Code credentials, tku auto-registers your current account as `default` and backfills attribution to the earliest record timestamp.
+- On first run with existing Claude Code credentials, tku auto-registers your current account as `default` and backfills attribution to the earliest record timestamp. Modern credentials don't carry `organizationUuid`, so this happens on the first `tku sub` (which resolves it via the profile API); other commands never touch the network for it.
 - `tku account add` needs a live access token - it resolves your `organizationUuid` via the Anthropic profile API (modern Claude Code credentials don't carry that field). Sign in to Claude Code first if your stash is stale.
+- With modern credentials, a token Claude Code rotated is copied into the active account's stash by `tku sub` and the `tku account` commands (they confirm the owner via the profile API); `tku bar` and the report commands never make that call. `tku account use` always snapshots before swapping.
 - After `tku account use`, both running and new Claude Code sessions pick up the swapped login on their next token refresh - no re-launch or re-login unless the refresh token itself has expired.
 - Long-running `claude` sessions cache their identity in memory and periodically rewrite `~/.claude.json`. If you swap accounts while one is open, that session can race-restore the previous `oauthAccount` blob - quit existing `claude` processes before swapping if you need `/status` to reflect the change immediately.
 - Swapping credentials outside tku (manual `cp`, `claude /login`, etc.) isn't reliably detected on modern creds, since the legacy `organizationUuid` field tku used as a signal is no longer written. Attribution in such windows is best-effort; prefer `tku account use` for clean handoffs.
