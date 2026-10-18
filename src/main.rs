@@ -330,7 +330,7 @@ fn main() -> Result<()> {
     // (background refresh, /login to the same account) since our last run,
     // mirror it into the active account's vault now. Otherwise the next
     // swap-back would restore a stale token and the user would 401.
-    accounts::reconcile_live_creds();
+    accounts::reconcile_live_creds(is_sub && !cli.offline);
 
     let mut store = storage::default_storage();
 
@@ -370,10 +370,8 @@ fn main() -> Result<()> {
         .filter(|r| r.provider == Provider::Claude)
         .collect();
     let _ = accounts::bootstrap_if_needed_post_scan(&claude_refs);
-    drop(claude_refs);
 
     let account_filter = cli.account.clone();
-    let account_registry = accounts::load_registry("claude");
 
     if let cli::Command::Subscription { live, plan, all } = mode {
         // `--all` shows every account; `--account <name>` scopes to one.
@@ -382,6 +380,9 @@ fn main() -> Result<()> {
         // `--account` is global and `--all` is subcommand-local).
         if all && account_filter.is_some() {
             bail!("`--all` and `--account` are mutually exclusive");
+        }
+        if !cli.offline {
+            accounts::bootstrap_via_profile_api(&claude_refs);
         }
         let exchange = exchange::load_exchange_rate(&currency, cli.offline);
         let pricing = pricing::load_pricing(&pricing_source, cli.offline)?;
@@ -417,6 +418,8 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|t| Provider::from_str(t).map_err(|_| ()));
 
+    drop(claude_refs);
+    let account_registry = accounts::load_registry("claude");
     let records: Vec<_> = records
         .into_iter()
         .filter(|r| match date_range {
