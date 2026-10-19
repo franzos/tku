@@ -1420,46 +1420,21 @@ pub fn rekey(
     }
 }
 
-/// Rekey every account whose cached blob names its account UUID from the org
-/// UUID to `<account_uuid>@<org_uuid>`, then mark the registry version 2. Runs once per
-/// registry; while another process holds the lock this one waits up to 30 s for it.
-pub fn migrate_to_account_ids() {
-    migrate_with_wait(std::time::Duration::from_secs(30));
+/// Rekeys every account whose cached blob names its account UUID from the org
+/// UUID to `<account_uuid>@<org_uuid>`, then marks the registry version 2.
+pub const ACCOUNT_IDS: crate::migrate::Migration = crate::migrate::Migration {
+    label: "account ids",
+    pending: account_ids_pending,
+    run: migrate_account_ids,
+};
+
+fn account_ids_pending() -> bool {
+    let registry = load_registry(TOOL_CLAUDE);
+    registry.version < REGISTRY_VERSION && !registry.accounts.is_empty()
 }
 
-fn migrate_with_wait(bound: std::time::Duration) {
-    let pending = |r: &Registry| r.version < REGISTRY_VERSION && !r.accounts.is_empty();
-    if !pending(&load_registry(TOOL_CLAUDE)) {
-        return;
-    }
-    let deadline = std::time::Instant::now() + bound;
-    let _lock = loop {
-        // Dot prefix: account names cannot start with '.', so no `account exec` lock collides.
-        let lock = crate::spawn::private_spawn_dir()
-            .and_then(|dir| crate::spawn::SpawnLock::acquire(&dir.join(".migrate.lock")));
-        match lock {
-            Ok(Some(lock)) => break lock,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Ok(None) => {
-                eprintln!(
-                    "tku: warning: another tku process holds the account id migration lock; \
-                     migration skipped"
-                );
-                return;
-            }
-            Err(e) => {
-                eprintln!("tku: warning: account id migration skipped: {e:#}");
-                return;
-            }
-        }
-    };
+fn migrate_account_ids(progress: &crate::progress::Progress) -> Result<String> {
     let mut registry = load_registry(TOOL_CLAUDE);
-    if !pending(&registry) {
-        return;
-    }
-
     let pairs: Vec<(String, String)> = registry
         .accounts
         .iter()
@@ -1469,29 +1444,35 @@ fn migrate_with_wait(bound: std::time::Duration) {
         })
         .collect();
     if !pairs.is_empty() {
+        progress.show("Loading the record cache...");
         let mut store = crate::storage::default_storage();
-        for (old, new) in &pairs {
+        for (i, (old, new)) in pairs.iter().enumerate() {
+            progress.count("Rekeying accounts", i + 1, pairs.len());
             rekey(&mut registry, store.as_mut(), old, new);
         }
+        progress.show("Writing the record cache...");
         if !store.flush() {
-            eprintln!(
-                "tku: warning: record cache not written; the account id migration will retry on the next run"
-            );
-            return;
+            bail!("record cache not written");
         }
     }
 
     registry.version = REGISTRY_VERSION;
-    if let Err(e) = save_registry(TOOL_CLAUDE, &registry) {
-        eprintln!("tku: warning: could not save the migrated account registry: {e:#}");
-        return;
+    save_registry(TOOL_CLAUDE, &registry).context("save the account registry")?;
+
+    let mut summary = format!("rekeyed {} account(s)", pairs.len());
+    let unresolved: Vec<&str> = registry
+        .accounts
+        .iter()
+        .filter(|a| a.is_provisional())
+        .map(|a| a.name.as_str())
+        .collect();
+    if !unresolved.is_empty() {
+        summary.push_str(&format!(
+            "; no account UUID cached yet for {} (`tku account use <name>` resolves it)",
+            unresolved.join(", ")
+        ));
     }
-    if !pairs.is_empty() {
-        eprintln!(
-            "tku: rekeyed {} account(s) from organization UUID to account and organization UUID",
-            pairs.len()
-        );
-    }
+    Ok(summary)
 }
 
 fn rekey_transcripts(name: &str, old: &str, new: &str) -> Result<()> {
@@ -2507,6 +2488,18 @@ mod tests {
         );
         assert_eq!(snapshot_keys(), ["org-1", "org-2"]);
         assert!(paths::profile_cache_file("org-1").unwrap().exists());
+    }
+
+    fn migrate_to_account_ids() {
+        migrate_with_wait(std::time::Duration::from_secs(30));
+    }
+
+    fn migrate_with_wait(bound: std::time::Duration) {
+        crate::migrate::run_all(
+            &[ACCOUNT_IDS],
+            bound,
+            &crate::progress::Progress::new(false),
+        );
     }
 
     #[test]

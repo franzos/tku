@@ -10,9 +10,11 @@ mod dedup;
 mod exchange;
 mod graph;
 mod http;
+mod migrate;
 mod output;
 mod paths;
 mod pricing;
+mod progress;
 mod providers;
 mod scrub;
 mod spawn;
@@ -21,7 +23,6 @@ mod subscription;
 mod types;
 mod watch;
 
-use std::io::{IsTerminal, Write};
 use std::str::FromStr;
 
 use anyhow::{bail, Result};
@@ -200,22 +201,17 @@ fn handle_scrub(mode: &cli::Command, format: &cli::OutputFormat, quiet: bool) ->
         export: export.clone(),
     };
     // Progress goes to stderr, so it stays out of `--format json` on stdout.
-    // Suppressed when stderr is redirected: the in-place `\r` redraw only makes
-    // sense on a terminal, and otherwise fills the log with one line per tick.
-    let quiet = quiet || !std::io::stderr().is_terminal();
-    let progress_cb = |phase: &str, current: usize, total: usize| {
-        if total == 0 {
-            eprint!("\x1b[2K\r{phase}... {current}");
-        } else {
-            eprint!("\x1b[2K\r{phase}... {current}/{total}");
-        }
-        let _ = std::io::stderr().flush();
-    };
-    let outcome = scrub::run(&opts, &state, if quiet { None } else { Some(&progress_cb) })?;
-    if !quiet {
-        eprint!("\x1b[2K\r");
-        let _ = std::io::stderr().flush();
-    }
+    let progress = progress::Progress::new(!quiet);
+    let progress_cb =
+        |phase: &str, current: usize, total: usize| progress.count(phase, current, total);
+    let outcome = scrub::run(
+        &opts,
+        &state,
+        progress
+            .is_active()
+            .then_some(&progress_cb as scrub::Progress),
+    )?;
+    progress.clear();
 
     match format {
         cli::OutputFormat::Json => scrub::report::print_json(&outcome),
@@ -227,7 +223,7 @@ fn handle_scrub(mode: &cli::Command, format: &cli::OutputFormat, quiet: bool) ->
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let mode = cli.effective_command();
-    accounts::migrate_to_account_ids();
+    migrate::run_pending(!cli.cli);
 
     // Account management subcommands: handled early; no record scan needed.
     if let cli::Command::Account { action } = &mode {
@@ -309,28 +305,21 @@ fn main() -> Result<()> {
 
     let mut store = storage::default_storage();
 
-    let show_progress = !cli.cli && !is_bar && !is_plot && !is_sub;
+    let progress = progress::Progress::new(!cli.cli && !is_bar && !is_plot && !is_sub);
     // Throttle is applied inside providers::discover_and_parse_with so the
     // per-file hot path stays tight. This callback itself can be cheap.
-    let progress_cb = |current: usize, total: usize| {
-        eprint!("\x1b[2K\rScanning sessions... {current}/{total}");
-        let _ = std::io::stderr().flush();
-    };
+    let progress_cb =
+        |current: usize, total: usize| progress.count("Scanning sessions", current, total);
     for provider in providers::all_providers() {
         provider.discover_and_parse(
             store.as_mut(),
-            if show_progress {
-                Some(&progress_cb)
-            } else {
-                None
-            },
+            progress
+                .is_active()
+                .then_some(&progress_cb as &dyn Fn(usize, usize)),
             cli.prune,
         );
     }
-    if show_progress {
-        eprint!("\x1b[2K\r");
-        let _ = std::io::stderr().flush();
-    }
+    progress.clear();
 
     store.flush();
     let all_records = store.drain_all();
