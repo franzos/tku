@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::Storage;
 use crate::atomic_write::atomic_write;
 use crate::paths;
-use crate::types::UsageRecord;
+use crate::types::{Provider, UsageRecord};
 
 /// Default ceiling on a provider's cache file. Configurable via
 /// `cache_max_bytes` in `config.toml`.
@@ -440,28 +440,35 @@ impl Storage for BitcodeStorage {
         }
     }
 
-    fn flush(&mut self) {
+    fn flush(&mut self) -> bool {
+        if !self.providers.values().any(|pc| pc.dirty) {
+            return true;
+        }
         let Some(dir) = paths::cache_dir() else {
-            return;
+            return false;
         };
         if let Err(e) = fs::create_dir_all(&dir) {
             eprintln!("tku: failed to create cache dir: {e}");
-            return;
+            return false;
         }
 
         let max_bytes = self.max_bytes;
+        let mut ok = true;
         for (name, pc) in &mut self.providers {
             if !pc.dirty {
                 continue;
             }
             let Some(data) = serialize_within(pc, max_bytes, name) else {
+                ok = false;
                 continue;
             };
             let Some(path) = paths::bitcode_cache_file(name) else {
+                ok = false;
                 continue;
             };
             if let Err(e) = atomic_write(&path, &data, None) {
                 eprintln!("tku: failed to write {name} cache: {e}");
+                ok = false;
                 continue;
             }
             // Only the approaching-the-ceiling case: once it is actually
@@ -478,6 +485,7 @@ impl Storage for BitcodeStorage {
                 );
             }
         }
+        ok
     }
 
     fn drain_all(&mut self) -> Vec<UsageRecord> {
@@ -489,12 +497,59 @@ impl Storage for BitcodeStorage {
         }
         all
     }
+
+    fn rekey_account(
+        &mut self,
+        old: &str,
+        new: &str,
+        old_dir: Option<&Path>,
+        new_dir: Option<&Path>,
+    ) {
+        let pc = self.provider_cache(Provider::Claude.as_str());
+        let mut changed = false;
+
+        let agg_prefix = format!("{AGG_MARKER}:");
+        for r in pc.files.values_mut().flat_map(|cf| &mut cf.records) {
+            if r.account_uuid.as_deref() != Some(old) {
+                continue;
+            }
+            if r.message_id.starts_with(&agg_prefix) {
+                let suffix = format!(":{old}:{}", r.fast_mode);
+                if let Some(head) = r.message_id.strip_suffix(&suffix) {
+                    r.message_id = format!("{head}:{new}:{}", r.fast_mode);
+                }
+            }
+            r.account_uuid = Some(new.to_string());
+            changed = true;
+        }
+
+        if let (Some(old_dir), Some(new_dir)) = (old_dir, new_dir) {
+            let moves: Vec<(String, String)> = pc
+                .files
+                .keys()
+                .filter_map(|k| Some((k.clone(), super::remap_path(k, old_dir, new_dir)?)))
+                .collect();
+            for (from, to) in moves {
+                // Never overwrite an existing entry: its records may be the only copy.
+                if pc.files.contains_key(&to) {
+                    continue;
+                }
+                if let Some(cf) = pc.files.remove(&from) {
+                    pc.files.insert(to, cf);
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            pc.dirty = true;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Provider;
 
     fn rec(ts: &str, model: &str, out: u64) -> UsageRecord {
         UsageRecord {
@@ -646,5 +701,144 @@ mod tests {
         assert_eq!(fs::read(aside[0].path()).unwrap(), b"garbage");
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn tagged(ts: &str, out: u64, account: Option<&str>) -> UsageRecord {
+        UsageRecord {
+            account_uuid: account.map(str::to_string),
+            ..rec(ts, "opus", out)
+        }
+    }
+
+    fn records_of(storage: &mut BitcodeStorage, key: &str) -> Vec<UsageRecord> {
+        storage.provider_cache("claude").files[key].records.clone()
+    }
+
+    #[test]
+    fn rekey_account_rewrites_tags_and_aggregate_message_ids() {
+        super::super::with_scratch_home("bitcode-rekey-agg", || {
+            let mut storage = BitcodeStorage::new();
+            let key = "/proj/a.jsonl";
+            storage.insert(
+                "claude",
+                Path::new(key),
+                0,
+                0,
+                vec![
+                    tagged("2020-01-01T01:00:00Z", 10, Some("old")),
+                    tagged("2020-01-01T02:00:00Z", 5, Some("old")),
+                    tagged("2020-01-02T01:00:00Z", 7, Some("old")),
+                ],
+            );
+            let cf = storage.provider_cache("claude").files.get_mut(key).unwrap();
+            assert!(compact_file(cf, Utc::now()));
+            storage.provider_cache("claude").dirty = false;
+
+            storage.rekey_account("old", "new", None, None);
+
+            assert!(storage.provider_cache("claude").dirty);
+            let rekeyed = records_of(&mut storage, key);
+            for r in &rekeyed {
+                assert_eq!(r.account_uuid.as_deref(), Some("new"));
+                assert!(r.message_id.ends_with(":new:false"), "{}", r.message_id);
+            }
+
+            let cf = storage.provider_cache("claude").files.get_mut(key).unwrap();
+            compact_file(cf, Utc::now());
+            let recompacted = records_of(&mut storage, key);
+            let ids =
+                |rs: &[UsageRecord]| rs.iter().map(|r| r.message_id.clone()).collect::<Vec<_>>();
+            assert_eq!(ids(&rekeyed), ids(&recompacted));
+            assert_eq!(recompacted[0].output_tokens, 15);
+        });
+    }
+
+    #[test]
+    fn rekey_account_leaves_other_accounts_and_untagged_records() {
+        super::super::with_scratch_home("bitcode-rekey-others", || {
+            let mut storage = BitcodeStorage::new();
+            storage.insert(
+                "claude",
+                Path::new("/proj/other.jsonl"),
+                0,
+                0,
+                vec![
+                    tagged("2020-01-01T01:00:00Z", 1, Some("other")),
+                    tagged("2020-01-01T02:00:00Z", 2, Some("other")),
+                ],
+            );
+            let cf = storage
+                .provider_cache("claude")
+                .files
+                .get_mut("/proj/other.jsonl")
+                .unwrap();
+            compact_file(cf, Utc::now());
+            storage.insert(
+                "claude",
+                Path::new("/proj/mixed.jsonl"),
+                0,
+                0,
+                vec![
+                    tagged("2020-01-01T01:00:00Z", 3, Some("old")),
+                    tagged("2020-01-01T02:00:00Z", 4, None),
+                ],
+            );
+            let other_before = records_of(&mut storage, "/proj/other.jsonl");
+
+            storage.rekey_account("old", "new", None, None);
+
+            let other_after = records_of(&mut storage, "/proj/other.jsonl");
+            assert_eq!(other_after.len(), 1);
+            assert_eq!(other_after[0].account_uuid.as_deref(), Some("other"));
+            assert_eq!(other_after[0].message_id, other_before[0].message_id);
+
+            let mixed = records_of(&mut storage, "/proj/mixed.jsonl");
+            assert_eq!(mixed[0].account_uuid.as_deref(), Some("new"));
+            assert_eq!(mixed[0].message_id, "msg-2020-01-01T01:00:00Z-3");
+            assert_eq!(mixed[1].account_uuid, None);
+        });
+    }
+
+    #[test]
+    fn rekey_account_remaps_file_paths_under_old_dir() {
+        super::super::with_scratch_home("bitcode-rekey-paths", || {
+            let mut storage = BitcodeStorage::new();
+            for key in [
+                "/old/proj/a.jsonl",
+                "/old/proj/c.jsonl",
+                "/new/proj/c.jsonl",
+                "/oldish/b.jsonl",
+            ] {
+                storage.insert(
+                    "claude",
+                    Path::new(key),
+                    0,
+                    0,
+                    vec![tagged("2020-01-01T01:00:00Z", 1, None)],
+                );
+            }
+            storage.provider_cache("claude").dirty = false;
+
+            storage.rekey_account(
+                "old",
+                "new",
+                Some(Path::new("/old")),
+                Some(Path::new("/new")),
+            );
+
+            let pc = storage.provider_cache("claude");
+            assert!(pc.dirty);
+            let mut keys: Vec<&str> = pc.files.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "/new/proj/a.jsonl",
+                    "/new/proj/c.jsonl",
+                    "/old/proj/c.jsonl",
+                    "/oldish/b.jsonl"
+                ]
+            );
+        });
     }
 }

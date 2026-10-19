@@ -323,16 +323,8 @@ Keychain item `Claude Code-credentials`, which tku writes through the system
 `security` tool; the first run may show a Keychain access prompt.
 
 Running and new Claude Code sessions pick up the new login on their next token
-refresh — no re-launch or re-login unless the refresh token itself has expired.
-
-Refuses by default if the current live login isn't saved (switching would
-silently lose it). Pass --force to overwrite anyway.")]
-    Use {
-        name: String,
-        /// Overwrite even when the current live login isn't saved
-        #[arg(long, short)]
-        force: bool,
-    },
+refresh — no re-launch or re-login unless the refresh token itself has expired.")]
+    Use { name: String },
     /// List saved accounts and show which one is active
     List,
     /// Show which saved account is currently active
@@ -372,7 +364,7 @@ Examples:\n\
     tku account exec business -- bash -i   # shell with CLAUDE_CONFIG_DIR set\n\
 \n\
 Session transcripts are kept out of the throwaway dir: `projects/` is a symlink\n\
-to ~/.local/share/tku/transcripts/claude/<org_uuid>/projects, so exec'd usage\n\
+to ~/.local/share/tku/transcripts/claude/<account_id>/projects, so exec'd usage\n\
 survives logout and shows up in every tku report. --ephemeral discards the\n\
 credentials and config, not the transcripts.\n\
 \n\

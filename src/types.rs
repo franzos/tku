@@ -100,8 +100,8 @@ pub struct UsageRecord {
     /// Fast mode, priced at a flat 2x on every token class.
     #[serde(default)]
     pub fast_mode: bool,
-    /// Organization UUID of the Claude account that produced this record,
-    /// captured at scan time from the live Claude Code login. None for
+    /// Id of the registered Claude account that produced this record (see
+    /// `accounts::Account::id`), assigned at scan time. None for
     /// non-Claude providers, for records cached before this field existed,
     /// or when credentials weren't readable during the scan. Filtering and
     /// per-account subscription views fall back to the timestamp-based

@@ -75,33 +75,27 @@ impl ProviderDriver for ClaudeProvider {
         // (sqlite schema bump, bitcode corruption) and re-parsed under a
         // different active account than the one that wrote them.
         //
-        // The registry was already updated with any implicit swap by
-        // `detect_implicit_swap_pre_scan()` in main, so the lookup reflects
-        // the current state. `live_uuid` is a fallback for records whose
-        // timestamps fall before the earliest switch entry (e.g. on the
-        // very first run before bootstrap has anchored to the earliest
-        // record) and for the rare case where the registry has no entries
-        // at all.
+        // `live_uuid`, the latest switch entry, is a fallback for records
+        // whose timestamps fall before the earliest switch entry.
         //
         // Exec'd sessions are the exception: they run concurrently with
         // whatever account is globally active, so the switch log would
         // confidently tag them with the wrong one. Their path carries the
-        // org_uuid, which is a strictly stronger signal.
+        // account id, which is a strictly stronger signal.
         let registry = crate::accounts::load_registry("claude");
-        let live_uuid = crate::accounts::current_claude_org_uuid()
-            .or_else(|| registry.latest_switch().map(|s| s.org_uuid.clone()));
+        let live_uuid = registry.latest_switch().map(|s| s.id.clone());
         let transcripts_base = crate::paths::transcripts_dir("claude");
         discover_and_parse_with(self.name(), files, storage, progress, prune, |path| {
             let mut records = parse_jsonl_file(path);
             let from_path = transcripts_base
                 .as_deref()
-                .and_then(|base| org_uuid_from_transcripts_path(base, path))
+                .and_then(|base| account_id_from_transcripts_path(base, path))
                 .map(str::to_string);
             for r in &mut records {
                 r.account_uuid = from_path.clone().or_else(|| {
                     registry
                         .account_at(r.timestamp)
-                        .map(|e| e.org_uuid.clone())
+                        .map(|e| e.id.clone())
                         .or_else(|| live_uuid.clone())
                 });
             }
@@ -130,7 +124,7 @@ fn compute_roots() -> Vec<PathBuf> {
 }
 
 /// `account exec` sessions write through a symlink into
-/// `<transcripts>/<org_uuid>/projects`. Roots point at the real directory, so
+/// `<transcripts>/<account id>/projects`. Roots point at the real directory, so
 /// neither the scanner nor the watcher depends on symlink traversal.
 ///
 /// Enumerated by listing the store, never from the registry: `remove_account`
@@ -153,10 +147,10 @@ fn spawn_transcript_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// The first path component under the transcripts base *is* the `org_uuid`, so
+/// The first path component under the transcripts base *is* the account id, so
 /// attribution survives an account being renamed, removed, or re-added under a
 /// reused name — none of which a timestamp lookup in the switch log would.
-fn org_uuid_from_transcripts_path<'a>(
+fn account_id_from_transcripts_path<'a>(
     base: &std::path::Path,
     path: &'a std::path::Path,
 ) -> Option<&'a str> {
@@ -373,33 +367,32 @@ mod tests {
     }
 
     #[test]
-    fn an_org_uuid_is_read_from_a_transcripts_path_and_nowhere_else() {
+    fn an_account_id_is_read_from_a_transcripts_path_and_nowhere_else() {
         let base = std::path::Path::new("/data/tku/transcripts/claude");
         assert_eq!(
-            org_uuid_from_transcripts_path(
+            account_id_from_transcripts_path(
                 base,
                 std::path::Path::new(
-                    "/data/tku/transcripts/claude/org-abc/projects/-home-p/s1.jsonl"
+                    "/data/tku/transcripts/claude/acct-abc/projects/-home-p/s1.jsonl"
                 )
             ),
-            Some("org-abc")
+            Some("acct-abc")
         );
         // Outside the base the caller must fall back to the switch log.
         assert_eq!(
-            org_uuid_from_transcripts_path(
+            account_id_from_transcripts_path(
                 base,
                 std::path::Path::new("/home/u/.claude/projects/-home-p/s1.jsonl")
             ),
             None
         );
-        assert_eq!(org_uuid_from_transcripts_path(base, base), None);
+        assert_eq!(account_id_from_transcripts_path(base, base), None);
     }
 
-    /// An org dir belonging to no registry entry still yields a root: a removed
-    /// account keeps its history, and a dropped root would prune it away.
+    /// An account dir belonging to no registry entry still yields a root: a
+    /// removed account keeps its history, and a dropped root would prune it away.
     #[test]
     fn transcript_roots_come_from_listing_not_the_registry() {
-        let _guard = crate::paths::ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!(
             "tku-claude-roots-{}-{}",
             std::process::id(),
@@ -413,10 +406,10 @@ mod tests {
         std::fs::create_dir_all(base.join("org-other").join("projects")).unwrap();
         std::fs::write(base.join("stray-file"), b"x").unwrap();
 
-        std::env::set_var("TKU_HOME", &home);
+        let env = crate::paths::TestHome::set(&home);
         let roots = spawn_transcript_roots();
         let claude_roots = compute_roots();
-        std::env::remove_var("TKU_HOME");
+        drop(env);
 
         assert_eq!(
             roots,

@@ -295,7 +295,7 @@ tku account rename work main
 tku account remove work
 ```
 
-Safeguards: `use` refuses to overwrite a live login that hasn't been saved (pass `--force` to override), and `remove` refuses to delete the currently-active account (same escape hatch).
+`use` replaces the live login without checking whether it's saved, so run `tku account add` for a new login before switching away from it. `remove` refuses to delete the currently-active account (pass `--force` to override).
 
 ```
 Accounts (claude):
@@ -316,11 +316,11 @@ Stashed credentials live at `~/.config/tku/accounts/claude/<name>.credentials.js
 
 **Notes**:
 - On first run with existing Claude Code credentials, tku auto-registers your current account as `default` and backfills attribution to the earliest record timestamp. Modern credentials don't carry `organizationUuid`, so this happens on the first `tku sub` (which resolves it via the profile API); other commands never touch the network for it.
-- `tku account add` needs a live access token - it resolves your `organizationUuid` via the Anthropic profile API (modern Claude Code credentials don't carry that field). Sign in to Claude Code first if your stash is stale.
+- `tku account add` needs a live access token - it resolves the login's account and organization UUID via the Anthropic profile API (modern Claude Code credentials don't carry either). Accounts are keyed by `<account_uuid>@<org_uuid>`, since one person keeps the same account UUID in every organization: two seats in one organization and one person in two organizations are separate accounts. `tku account list` shows the start of each half as `id` and `org`. Sign in to Claude Code first if your stash is stale.
 - With modern credentials, a token Claude Code rotated is copied into the active account's stash by `tku sub` and the `tku account` commands (they confirm the owner via the profile API); `tku bar` and the report commands never make that call. `tku account use` always snapshots before swapping.
 - After `tku account use`, both running and new Claude Code sessions pick up the swapped login on their next token refresh - no re-launch or re-login unless the refresh token itself has expired.
 - Long-running `claude` sessions cache their identity in memory and periodically rewrite `~/.claude.json`. If you swap accounts while one is open, that session can race-restore the previous `oauthAccount` blob - quit existing `claude` processes before swapping if you need `/status` to reflect the change immediately.
-- Swapping credentials outside tku (manual `cp`, `claude /login`, etc.) isn't reliably detected on modern creds, since the legacy `organizationUuid` field tku used as a signal is no longer written. Attribution in such windows is best-effort; prefer `tku account use` for clean handoffs.
+- Swapping credentials outside tku (manual `cp`, `claude /login`, etc.) isn't reliably detected on modern creds, since the credentials file carries no account identity tku could compare against. Attribution in such windows is best-effort; prefer `tku account use` for clean handoffs.
 - Only Claude accounts are supported for now. Codex and others may follow.
 
 ### Isolated one-shot sessions
@@ -342,7 +342,7 @@ tku account exec personal -- bash -i
 
 It seeds the private dir from the account's stashed credentials, symlinks your shared `skills/`, `plugins/`, `agents/`, `commands/`, and `CLAUDE.md` so the session behaves like your normal setup, copies and patches `.claude.json`/`settings.json`, and syncs any refreshed credentials back to the stash on exit. The dir lives under `$XDG_RUNTIME_DIR` (tmpfs, cleared on logout) when that is set, otherwise under tku's data dir (`~/.local/share/tku/spawn/` on Linux, `~/Library/Application Support/tku/spawn/` on macOS), never under your Claude Code config.
 
-Session transcripts are the exception: `projects/` inside the private dir is a symlink to `~/.local/share/tku/transcripts/claude/<org_uuid>/projects`, so what an `exec` session costs is counted like any other usage and survives logout. Only credentials and config are throwaway.
+Session transcripts are the exception: `projects/` inside the private dir is a symlink to `~/.local/share/tku/transcripts/claude/<account_uuid>@<org_uuid>/projects`, so what an `exec` session costs is counted like any other usage and survives logout. Only credentials and config are throwaway.
 
 | Flag | Description |
 |------|-------------|

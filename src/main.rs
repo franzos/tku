@@ -53,15 +53,7 @@ fn bar_period_label(period: &cli::BarPeriod) -> &'static str {
     }
 }
 
-/// Does this record belong to `account`?
-/// None account = no filter, always matches.
-///
-/// Two-stage attribution:
-/// 1. If the record carries an `account_uuid` (tagged at scan time from the
-///    live credentials file), match directly against the registry's
-///    name → uuid mapping. This is the precise path.
-/// 2. If no uuid is set (legacy cache, or creds were unreadable at scan
-///    time), fall back to the timestamp-based switch log via `account_at`.
+/// Does this record belong to `account`? `None` matches every record.
 fn matches_account(
     record: &types::UsageRecord,
     account: Option<&str>,
@@ -70,27 +62,14 @@ fn matches_account(
     let Some(name) = account else {
         return true;
     };
-    if record.provider != Provider::Claude {
-        return false;
-    }
-    if let Some(uuid) = record.account_uuid.as_deref() {
-        // Prefer the recorded uuid → name mapping. Fall through to
-        // switch-log lookup only when the uuid isn't yet registered (e.g. an
-        // implicit-detected account the user hasn't named via `account add`).
-        if let Some(a) = registry.find_by_org(uuid) {
-            return a.name == *name;
-        }
-    }
-    registry
-        .account_at(record.timestamp)
-        .map(|e| e.name == *name)
-        .unwrap_or(false)
+    record.provider == Provider::Claude
+        && registry.owner_of(record.account_uuid.as_deref(), record.timestamp) == Some(name)
 }
 
 fn handle_account(action: &cli::AccountAction) -> Result<()> {
     match action {
         cli::AccountAction::Add { name } => accounts::add(name),
-        cli::AccountAction::Use { name, force } => accounts::use_account(name, *force),
+        cli::AccountAction::Use { name } => accounts::use_account(name),
         cli::AccountAction::List => accounts::list(),
         cli::AccountAction::Current => accounts::current(),
         cli::AccountAction::Rename { old, new } => accounts::rename(old, new),
@@ -248,6 +227,7 @@ fn handle_scrub(mode: &cli::Command, format: &cli::OutputFormat, quiet: bool) ->
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let mode = cli.effective_command();
+    accounts::migrate_to_account_ids();
 
     // Account management subcommands: handled early; no record scan needed.
     if let cli::Command::Account { action } = &mode {
@@ -321,11 +301,6 @@ fn main() -> Result<()> {
         return watch::run(full, interval, &cli, &pricing_source, &currency, date_range);
     }
 
-    // Pre-scan: detect implicit credential swap so the registry's switch log
-    // already reflects any external swap before we tag records. Without
-    // this, per-record account_at(timestamp) lookups would resolve new
-    // records to the previous account.
-    accounts::detect_implicit_swap_pre_scan();
     // Reconcile vault with live creds: if Claude Code rotated the token
     // (background refresh, /login to the same account) since our last run,
     // mirror it into the active account's vault now. Otherwise the next
@@ -362,14 +337,10 @@ fn main() -> Result<()> {
 
     let records = dedup::dedup(all_records);
 
-    // Post-scan bootstrap: register the active credentials as "default" on
-    // first run. Implicit-swap detection already ran pre-scan; this only
-    // fires when the registry is still empty.
     let claude_refs: Vec<&types::UsageRecord> = records
         .iter()
         .filter(|r| r.provider == Provider::Claude)
         .collect();
-    let _ = accounts::bootstrap_if_needed_post_scan(&claude_refs);
 
     let account_filter = cli.account.clone();
 
@@ -519,4 +490,32 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accounts::test_support::{record, same_org_registry, ts};
+
+    #[test]
+    fn matches_account_separates_same_org_accounts() {
+        let registry = same_org_registry();
+        let a = record(Some("acct-a@org-1"), ts(5));
+        let b = record(Some("acct-b@org-1"), ts(5));
+        assert!(matches_account(&a, Some("alice"), &registry));
+        assert!(!matches_account(&a, Some("bob"), &registry));
+        assert!(matches_account(&b, Some("bob"), &registry));
+        assert!(!matches_account(&b, Some("alice"), &registry));
+    }
+
+    #[test]
+    fn matches_account_unknown_tag_falls_back_to_switch_log() {
+        let registry = same_org_registry();
+        let during_bob = record(Some("acct-gone"), ts(1));
+        assert!(matches_account(&during_bob, Some("bob"), &registry));
+        assert!(!matches_account(&during_bob, Some("alice"), &registry));
+        let before_log = record(Some("acct-gone"), ts(-1));
+        assert!(!matches_account(&before_log, Some("alice"), &registry));
+        assert!(!matches_account(&before_log, Some("bob"), &registry));
+    }
 }

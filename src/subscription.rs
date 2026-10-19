@@ -168,8 +168,6 @@ struct CachedProfile {
 struct Credentials {
     #[serde(rename = "claudeAiOauth")]
     claude_ai_oauth: Option<OAuthCredentials>,
-    #[serde(rename = "organizationUuid")]
-    organization_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -187,7 +185,7 @@ struct OAuthCredentials {
 // --- Snapshot persistence ---
 
 /// Current on-disk format (v2): a version tag plus a map of
-/// `organization_uuid → snapshots`. This lets us keep separate cycle
+/// `account id → snapshots`. This lets us keep separate cycle
 /// histories per account when the user swaps credentials.
 #[derive(Debug, Serialize, Deserialize)]
 struct OnDiskStore {
@@ -215,7 +213,7 @@ struct AccountSnapshots {
 /// Loaded from / saved into a single slot in the on-disk `OnDiskStore`.
 #[derive(Debug, Default)]
 struct SnapshotStore {
-    org_uuid: String,
+    id: String,
     snapshots: Vec<CycleSnapshot>,
 }
 
@@ -254,7 +252,7 @@ pub fn run(
     account: Option<&str>,
 ) -> Result<()> {
     // When `--account` is specified, load that account's stashed credentials
-    // and the org UUID it was registered under. Otherwise fall back to the
+    // and the id it was registered under. Otherwise fall back to the
     // currently-active Claude Code login. The subscription/usage API is
     // per-account: we have to use the matching OAuth token, or we'd be
     // reporting the wrong account's window.
@@ -270,7 +268,7 @@ pub fn run(
     }
 
     let store = crate::creds::live()?;
-    let (creds, requested_org) = if let Some(name) = account {
+    let (creds, requested_id) = if let Some(name) = account {
         let acct = registry.find_by_name(name).ok_or_else(|| {
             anyhow::anyhow!(
                 "Account '{name}' not found. Run `tku account list` to see available accounts."
@@ -279,15 +277,9 @@ pub fn run(
         // If the requested account is also the currently active one, prefer
         // the live login. Claude Code refreshes the live access token on
         // each run but never writes back to the stashed copy, so the stash
-        // for the active account drifts
-        // stale and would otherwise fail the expiry check below.
-        //
-        // Match by org_uuid when present; fall back to the latest switch-log
-        // entry, since Claude Code drops `organizationUuid` from creds after
-        // a token refresh and we'd otherwise misidentify the active account.
-        let live_org = crate::accounts::current_claude_org_uuid()
-            .or_else(|| registry.latest_switch().map(|s| s.org_uuid.clone()));
-        let use_live = live_org.as_deref() == Some(acct.org_uuid.as_str());
+        // for the active account drifts stale and would otherwise fail the
+        // expiry check below.
+        let use_live = registry.latest_switch().is_some_and(|s| s.id == acct.id);
         let creds = if use_live {
             read_live_credentials(&store)
                 .and_then(|c| {
@@ -309,7 +301,7 @@ pub fn run(
                 .with_context(|| format!("Cannot read {}", redact(&path)))?;
             serde_json::from_str(&data).context("Failed to parse stashed credentials")?
         };
-        (creds, Some(acct.org_uuid.clone()))
+        (creds, Some(acct.id.clone()))
     } else {
         match read_live_credentials(&store) {
             Ok(Some(c)) => (c, None),
@@ -339,14 +331,10 @@ pub fn run(
         }
     };
 
-    // Resolve the org UUID we should key snapshots under. With `--account`,
-    // prefer the registry's registered UUID — stashed creds may have been
-    // refreshed since registration and dropped the field. Without `--account`,
-    // use the live creds, falling back to the registry's latest switch entry
-    // to keep snapshots from getting stranded under an "unknown" key.
-    let org_uuid = requested_org
-        .or(creds.organization_uuid)
-        .or_else(|| registry.latest_switch().map(|s| s.org_uuid.clone()))
+    // Snapshots are keyed by the requested account, else the latest switch
+    // entry, so they don't get stranded under an "unknown" key.
+    let account_id = requested_id
+        .or_else(|| registry.latest_switch().map(|s| s.id.clone()))
         .unwrap_or_else(|| "unknown".to_string());
 
     let now_ms = Utc::now().timestamp_millis() as u64;
@@ -361,29 +349,13 @@ pub fn run(
         std::process::exit(1);
     }
 
-    // Filter records to the right account. Without a filter we keep all
-    // Claude records (single-account behavior). With `--account`, restrict
-    // by the recorded `account_uuid`, falling back to the timestamp-based
-    // switch log for legacy records that pre-date scan-time tagging.
-    let claude_records: Vec<&UsageRecord> = records
-        .iter()
-        .filter(|r| r.provider == Provider::Claude)
-        .filter(|r| match account {
-            None => true,
-            Some(name) => match r.account_uuid.as_deref() {
-                Some(uuid) => registry
-                    .find_by_org(uuid)
-                    .map(|a| a.name == *name)
-                    .unwrap_or(false),
-                None => registry
-                    .account_at(r.timestamp)
-                    .map(|e| e.name == *name)
-                    .unwrap_or(false),
-            },
-        })
-        .collect();
+    let claude_records = records.iter().filter(|r| r.provider == Provider::Claude);
+    let claude_records: Vec<&UsageRecord> = match account {
+        None => claude_records.collect(),
+        Some(name) => records_owned_by(claude_records, name, &registry),
+    };
 
-    let mut store = load_snapshots(&org_uuid);
+    let mut store = load_snapshots(&account_id);
 
     // Try to determine cycle boundaries from existing snapshots first
     let cached_cycle = current_cycle_from_snapshots(&store);
@@ -467,7 +439,7 @@ pub fn run(
     // Live plan: profile API → cached profile → OAuth claims. Falling back
     // silently keeps offline runs working; a stale-after-switch state is
     // bounded by the 24h profile cache.
-    let (live_plan, profile) = resolve_live_plan(&oauth.access_token, &org_uuid, offline);
+    let (live_plan, profile) = resolve_live_plan(&oauth.access_token, &account_id, offline);
     let oauth_plan = detect_plan(&oauth);
     let resolved_plan = live_plan.or(oauth_plan);
 
@@ -739,26 +711,44 @@ fn fetch_usage(access_token: &str) -> Result<UsageResponse> {
     serde_json::from_str(&body).context("Failed to parse usage response")
 }
 
-/// Identity fields needed to populate the live account's org UUID and
-/// reconstruct `.claude.json:oauthAccount` after a credential swap.
+/// Identity of a login: its account key, its org, and the
+/// `.claude.json:oauthAccount` blob to restore after a credential swap.
 pub struct AccountIdentity {
+    pub account_uuid: String,
     pub org_uuid: String,
     pub oauth_account: serde_json::Value,
 }
 
-/// Fetch the live account identity from the profile API: the org UUID plus
-/// an `oauthAccount` blob matching Claude Code's `.claude.json` shape, so
-/// `accounts::use_account` can keep that file's identity in sync with the
-/// swapped credentials. Also primes the plan cache for that org.
-pub fn fetch_account_identity(access_token: &str) -> Result<AccountIdentity> {
-    let profile = fetch_profile(access_token)?;
-    if let Some(org) = profile
-        .organization
-        .as_ref()
-        .and_then(|o| o.uuid.as_deref())
-    {
-        save_cached_profile(org, &profile);
+impl AccountIdentity {
+    /// Registry key of this login.
+    pub fn id(&self) -> String {
+        crate::accounts::account_key(&self.account_uuid, &self.org_uuid)
     }
+}
+
+/// Fetch the live account identity from the profile API: the account and
+/// org UUIDs plus an `oauthAccount` blob matching Claude Code's
+/// `.claude.json` shape, so `accounts::use_account` can keep that file's
+/// identity in sync with the swapped credentials. Also primes the plan cache
+/// under `cache_key`, or under the identity's own id when `None`.
+pub fn fetch_account_identity(
+    access_token: &str,
+    cache_key: Option<&str>,
+) -> Result<AccountIdentity> {
+    cache_identity_profile(&fetch_profile(access_token)?, cache_key)
+}
+
+fn cache_identity_profile(
+    profile: &ProfileResponse,
+    cache_key: Option<&str>,
+) -> Result<AccountIdentity> {
+    let identity = identity_from_profile(profile)?;
+    let key = cache_key.map_or_else(|| identity.id(), String::from);
+    save_cached_profile(&key, profile);
+    Ok(identity)
+}
+
+fn identity_from_profile(profile: &ProfileResponse) -> Result<AccountIdentity> {
     let account = profile
         .account
         .as_ref()
@@ -767,6 +757,10 @@ pub fn fetch_account_identity(access_token: &str) -> Result<AccountIdentity> {
         .organization
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Profile API did not return organization block"))?;
+    let account_uuid = account
+        .uuid
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Profile API did not return account.uuid"))?;
     let org_uuid = organization
         .uuid
         .clone()
@@ -776,7 +770,7 @@ pub fn fetch_account_identity(access_token: &str) -> Result<AccountIdentity> {
     // them to safe values — the UI display reads name/email/uuid, and
     // permission checks happen server-side against the access token.
     let oauth_account = serde_json::json!({
-        "accountUuid": account.uuid,
+        "accountUuid": account_uuid,
         "emailAddress": account.email,
         "organizationUuid": org_uuid,
         "organizationName": organization.name,
@@ -784,6 +778,7 @@ pub fn fetch_account_identity(access_token: &str) -> Result<AccountIdentity> {
         "workspaceRole": serde_json::Value::Null,
     });
     Ok(AccountIdentity {
+        account_uuid,
         org_uuid,
         oauth_account,
     })
@@ -804,12 +799,12 @@ fn fetch_profile(access_token: &str) -> Result<ProfileResponse> {
     serde_json::from_str(&body).context("Failed to parse profile response")
 }
 
-fn profile_cache_path(org_uuid: &str) -> Option<std::path::PathBuf> {
-    paths::profile_cache_file(org_uuid)
+fn profile_cache_path(account_id: &str) -> Option<std::path::PathBuf> {
+    paths::profile_cache_file(account_id)
 }
 
-fn load_cached_profile(org_uuid: &str) -> Option<ProfileResponse> {
-    let path = profile_cache_path(org_uuid)?;
+fn load_cached_profile(account_id: &str) -> Option<ProfileResponse> {
+    let path = profile_cache_path(account_id)?;
     let data = fs::read_to_string(&path).ok()?;
     let cached: CachedProfile = serde_json::from_str(&data).ok()?;
     let age = Utc::now().signed_duration_since(cached.captured_at);
@@ -819,8 +814,8 @@ fn load_cached_profile(org_uuid: &str) -> Option<ProfileResponse> {
     Some(cached.profile)
 }
 
-fn save_cached_profile(org_uuid: &str, profile: &ProfileResponse) {
-    let Some(path) = profile_cache_path(org_uuid) else {
+fn save_cached_profile(account_id: &str, profile: &ProfileResponse) {
+    let Some(path) = profile_cache_path(account_id) else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -848,19 +843,19 @@ fn save_cached_profile(org_uuid: &str, profile: &ProfileResponse) {
 /// Network failures fall back to a stale cache when present, then None.
 fn resolve_live_plan(
     access_token: &str,
-    org_uuid: &str,
+    account_id: &str,
     offline: bool,
 ) -> (Option<Plan>, Option<ProfileResponse>) {
     if offline {
         return (None, None);
     }
-    if let Some(p) = load_cached_profile(org_uuid) {
+    if let Some(p) = load_cached_profile(account_id) {
         let plan = plan_from_profile(&p);
         return (plan, Some(p));
     }
     match fetch_profile(access_token) {
         Ok(p) => {
-            save_cached_profile(org_uuid, &p);
+            save_cached_profile(account_id, &p);
             let plan = plan_from_profile(&p);
             (plan, Some(p))
         }
@@ -904,11 +899,11 @@ fn snapshot_path() -> Option<std::path::PathBuf> {
 }
 
 /// Parse the on-disk store, transparently migrating v1 (flat `snapshots`)
-/// to v2 (per-org map). All legacy snapshots are attributed to `migration_org`
+/// to v2 (per-account map). All legacy snapshots are attributed to `migration_id`
 /// — correct for single-account users (99% case); multi-account users who
 /// swapped manually before tku had account support have already-conflated
 /// data that can't be retroactively split.
-fn parse_on_disk(data: &str, migration_org: &str) -> OnDiskStore {
+fn parse_on_disk(data: &str, migration_id: &str) -> OnDiskStore {
     #[derive(Deserialize)]
     struct V2Probe {
         version: u32,
@@ -931,7 +926,7 @@ fn parse_on_disk(data: &str, migration_org: &str) -> OnDiskStore {
     if let Ok(v1) = serde_json::from_str::<V1>(data) {
         let mut accounts = BTreeMap::new();
         accounts.insert(
-            migration_org.to_string(),
+            migration_id.to_string(),
             AccountSnapshots {
                 snapshots: v1.snapshots,
             },
@@ -946,20 +941,20 @@ fn parse_on_disk(data: &str, migration_org: &str) -> OnDiskStore {
 }
 
 /// Snapshots taken before the account was registered live under "unknown";
-/// move them under the resolved org so cycle history and calibration carry over.
-pub fn adopt_unknown_snapshots(org_uuid: &str) {
+/// move them under the resolved account so cycle history and calibration carry over.
+pub fn adopt_unknown_snapshots(id: &str) {
     let Some(path) = snapshot_path() else { return };
     let Ok(data) = fs::read_to_string(&path) else {
         return;
     };
-    let mut on_disk = parse_on_disk(&data, org_uuid);
-    if on_disk.accounts.contains_key(org_uuid) {
+    let mut on_disk = parse_on_disk(&data, id);
+    if on_disk.accounts.contains_key(id) {
         return;
     }
     let Some(unknown) = on_disk.accounts.remove("unknown") else {
         return;
     };
-    on_disk.accounts.insert(org_uuid.to_string(), unknown);
+    on_disk.accounts.insert(id.to_string(), unknown);
     match serde_json::to_string_pretty(&on_disk) {
         Ok(data) => {
             if let Err(e) = atomic_write(&path, data.as_bytes(), Some(0o600)) {
@@ -970,22 +965,66 @@ pub fn adopt_unknown_snapshots(org_uuid: &str) {
     }
 }
 
-fn load_snapshots(org_uuid: &str) -> SnapshotStore {
+/// Move the snapshots of account `old` under `new`, merging when `new`
+/// already has some. No-op when the file or `old` is absent.
+pub fn rekey_snapshots(old: &str, new: &str) -> Result<()> {
+    let Some(path) = snapshot_path() else {
+        return Ok(());
+    };
+    let Ok(data) = fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let mut on_disk = parse_on_disk(&data, old);
+    let Some(moved) = on_disk.accounts.remove(old) else {
+        return Ok(());
+    };
+    let merged = match on_disk.accounts.remove(new) {
+        Some(existing) => merge_snapshots(existing.snapshots, moved.snapshots),
+        None => moved.snapshots,
+    };
+    on_disk
+        .accounts
+        .insert(new.to_string(), AccountSnapshots { snapshots: merged });
+    let data = serde_json::to_string_pretty(&on_disk)?;
+    atomic_write(&path, data.as_bytes(), Some(0o600))?;
+    Ok(())
+}
+
+/// Union of two histories, one entry per (cycle minute, plan) keeping the
+/// later capture, ordered by `cycle_end`. Never truncated.
+fn merge_snapshots(a: Vec<CycleSnapshot>, b: Vec<CycleSnapshot>) -> Vec<CycleSnapshot> {
+    let mut all: Vec<CycleSnapshot> = a.into_iter().chain(b).collect();
+    all.sort_by(|x, y| y.captured_at.cmp(&x.captured_at));
+    let mut seen: Vec<(DateTime<Utc>, Option<Plan>)> = Vec::new();
+    all.retain(|s| {
+        let key = (round_to_minute(s.cycle_end), s.plan);
+        if seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
+    });
+    all.sort_by_key(|s| s.cycle_end);
+    all
+}
+
+fn load_snapshots(id: &str) -> SnapshotStore {
     let Some(path) = snapshot_path() else {
         return SnapshotStore {
-            org_uuid: org_uuid.to_string(),
+            id: id.to_string(),
             snapshots: Vec::new(),
         };
     };
     let data = fs::read_to_string(&path).unwrap_or_default();
-    let on_disk = parse_on_disk(&data, org_uuid);
+    let on_disk = parse_on_disk(&data, id);
     let snapshots = on_disk
         .accounts
-        .get(org_uuid)
+        .get(id)
         .map(|a| a.snapshots.clone())
         .unwrap_or_default();
     SnapshotStore {
-        org_uuid: org_uuid.to_string(),
+        id: id.to_string(),
         snapshots,
     }
 }
@@ -1070,9 +1109,9 @@ fn save_snapshot(
 
     // Re-read + merge so we don't clobber other accounts' data on write.
     let existing_data = fs::read_to_string(&path).unwrap_or_default();
-    let mut on_disk = parse_on_disk(&existing_data, &store.org_uuid);
+    let mut on_disk = parse_on_disk(&existing_data, &store.id);
     on_disk.accounts.insert(
-        store.org_uuid.clone(),
+        store.id.clone(),
         AccountSnapshots {
             snapshots: store.snapshots.clone(),
         },
@@ -1752,8 +1791,7 @@ pub fn run_all(
         return Ok(());
     }
 
-    let active_org = crate::accounts::current_claude_org_uuid()
-        .or_else(|| registry.latest_switch().map(|s| s.org_uuid.clone()));
+    let active_id = registry.latest_switch().map(|s| s.id.clone());
 
     let claude_records: Vec<&UsageRecord> = records
         .iter()
@@ -1771,7 +1809,7 @@ pub fn run_all(
         .accounts
         .iter()
         .map(|account| {
-            let is_active = active_org.as_deref() == Some(account.org_uuid.as_str());
+            let is_active = active_id.as_deref() == Some(account.id.as_str());
             gather_account_row(
                 account,
                 is_active,
@@ -1866,6 +1904,17 @@ pub fn run_all(
     Ok(())
 }
 
+fn records_owned_by<'a>(
+    records: impl IntoIterator<Item = &'a UsageRecord>,
+    name: &str,
+    registry: &crate::accounts::Registry,
+) -> Vec<&'a UsageRecord> {
+    records
+        .into_iter()
+        .filter(|r| registry.owner_of(r.account_uuid.as_deref(), r.timestamp) == Some(name))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gather_account_row(
     account: &crate::accounts::Account,
@@ -1877,19 +1926,7 @@ fn gather_account_row(
     offline: bool,
     _live: bool,
 ) -> AccountRow {
-    // Records belonging to this account: prefer the recorded uuid, fall
-    // back to the timestamp-based switch log for legacy untagged records.
-    let account_records: Vec<&UsageRecord> = claude_records
-        .iter()
-        .copied()
-        .filter(|r| match r.account_uuid.as_deref() {
-            Some(uuid) => uuid == account.org_uuid.as_str(),
-            None => registry
-                .account_at(r.timestamp)
-                .map(|e| e.org_uuid == account.org_uuid)
-                .unwrap_or(false),
-        })
-        .collect();
+    let account_records = records_owned_by(claude_records.iter().copied(), &account.name, registry);
 
     let creds = if is_active {
         live_creds
@@ -1905,13 +1942,13 @@ fn gather_account_row(
     let now_ms = Utc::now().timestamp_millis() as u64;
     let creds_fresh = oauth.map(|o| now_ms <= o.expires_at).unwrap_or(false);
 
-    let mut store = load_snapshots(&account.org_uuid);
+    let mut store = load_snapshots(&account.id);
     let cached_cycle = current_cycle_from_snapshots(&store);
 
     // Live profile only for the active account — inactive tokens may be
     // stale and we don't want to spam the API per-account on every run.
     let live_plan = if is_active && creds_fresh {
-        oauth.and_then(|o| resolve_live_plan(&o.access_token, &account.org_uuid, offline).0)
+        oauth.and_then(|o| resolve_live_plan(&o.access_token, &account.id, offline).0)
     } else {
         None
     };
@@ -2528,5 +2565,294 @@ mod tests {
             format_overage(Some(&extra), &eur_at(0.9), true),
             "\u{20ac}11.11 / \u{20ac}45.00"
         );
+    }
+
+    fn profile(account_uuid: Option<&str>, org_uuid: Option<&str>) -> ProfileResponse {
+        serde_json::from_value(serde_json::json!({
+            "account": { "uuid": account_uuid, "email": "a@example.com" },
+            "organization": { "uuid": org_uuid, "name": "Org" },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn identity_requires_account_uuid() {
+        let err = identity_from_profile(&profile(None, Some("org-1")))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("account.uuid"), "{err}");
+    }
+
+    #[test]
+    fn identity_requires_org_uuid() {
+        let err = identity_from_profile(&profile(Some("acct-1"), None))
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("organization.uuid"), "{err}");
+    }
+
+    #[test]
+    fn identity_blob_carries_both_uuids() {
+        let identity = identity_from_profile(&profile(Some("acct-1"), Some("org-1"))).unwrap();
+        assert_eq!(identity.account_uuid, "acct-1");
+        assert_eq!(identity.org_uuid, "org-1");
+        assert_eq!(identity.oauth_account["accountUuid"], "acct-1");
+        assert_eq!(identity.oauth_account["organizationUuid"], "org-1");
+        assert_eq!(identity.oauth_account["emailAddress"], "a@example.com");
+        assert_eq!(identity.id(), "acct-1@org-1");
+    }
+
+    #[test]
+    fn identity_cache_is_saved_under_the_given_key() {
+        let dir = scratch_home("profile-key");
+        let home = paths::TestHome::set(&dir);
+        let p = profile(Some("acct-1"), Some("org-1"));
+
+        cache_identity_profile(&p, Some("org-1")).unwrap();
+        assert!(load_cached_profile("org-1").is_some());
+        assert!(load_cached_profile("acct-1@org-1").is_none());
+
+        cache_identity_profile(&p, None).unwrap();
+        assert!(load_cached_profile("acct-1@org-1").is_some());
+
+        drop(home);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn scratch_home(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tku-sub-test-{tag}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(dir.join("cache")).unwrap();
+        dir
+    }
+
+    fn snap(
+        cycle_end: &str,
+        captured_at: &str,
+        utilization: f64,
+        plan: Option<Plan>,
+    ) -> CycleSnapshot {
+        CycleSnapshot {
+            cycle_end: cycle_end.parse().unwrap(),
+            utilization,
+            captured_at: captured_at.parse().unwrap(),
+            cost_at_calibration: None,
+            plan,
+        }
+    }
+
+    fn write_store(accounts: &[(&str, Vec<CycleSnapshot>)]) {
+        let mut on_disk = OnDiskStore::default_v2();
+        for (id, snapshots) in accounts {
+            on_disk.accounts.insert(
+                (*id).to_string(),
+                AccountSnapshots {
+                    snapshots: snapshots.clone(),
+                },
+            );
+        }
+        let data = serde_json::to_string_pretty(&on_disk).unwrap();
+        fs::write(snapshot_path().unwrap(), data).unwrap();
+    }
+
+    fn read_store() -> OnDiskStore {
+        parse_on_disk(
+            &fs::read_to_string(snapshot_path().unwrap()).unwrap(),
+            "none",
+        )
+    }
+
+    #[test]
+    fn rekey_snapshots_moves_key() {
+        let dir = scratch_home("move");
+        let home = paths::TestHome::set(&dir);
+
+        rekey_snapshots("org-1", "acct-1").unwrap();
+        assert!(!snapshot_path().unwrap().exists());
+
+        write_store(&[
+            (
+                "org-1",
+                vec![snap(
+                    "2026-04-01T10:00:00Z",
+                    "2026-03-30T10:00:00Z",
+                    10.0,
+                    None,
+                )],
+            ),
+            (
+                "org-2",
+                vec![snap(
+                    "2026-04-01T10:00:00Z",
+                    "2026-03-30T10:00:00Z",
+                    20.0,
+                    None,
+                )],
+            ),
+        ]);
+        let before = fs::read_to_string(snapshot_path().unwrap()).unwrap();
+        rekey_snapshots("missing", "acct-9").unwrap();
+        assert_eq!(
+            fs::read_to_string(snapshot_path().unwrap()).unwrap(),
+            before
+        );
+
+        rekey_snapshots("org-1", "acct-1").unwrap();
+        let store = read_store();
+        assert!(!store.accounts.contains_key("org-1"));
+        assert_eq!(store.accounts["acct-1"].snapshots[0].utilization, 10.0);
+        assert_eq!(store.accounts["org-2"].snapshots[0].utilization, 20.0);
+        assert_eq!(store.version, 2);
+
+        drop(home);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekey_snapshots_merges_dedups_and_sorts() {
+        let dir = scratch_home("merge");
+        let home = paths::TestHome::set(&dir);
+
+        let weeks = |start: i64, n: i64| -> Vec<CycleSnapshot> {
+            (start..start + n)
+                .map(|w| CycleSnapshot {
+                    cycle_end: "2026-01-01T10:00:00Z".parse::<DateTime<Utc>>().unwrap()
+                        + Duration::weeks(w),
+                    utilization: 1.0,
+                    captured_at: "2025-12-01T00:00:00Z".parse().unwrap(),
+                    cost_at_calibration: None,
+                    plan: Some(Plan::Max5x),
+                })
+                .collect()
+        };
+        let mut old = weeks(0, 8);
+        old.push(snap(
+            "2026-06-01T10:00:20Z",
+            "2026-05-30T10:00:00Z",
+            30.0,
+            Some(Plan::Pro),
+        ));
+        let mut new = weeks(8, 8);
+        new.push(snap(
+            "2026-06-01T10:00:40Z",
+            "2026-05-31T10:00:00Z",
+            40.0,
+            Some(Plan::Pro),
+        ));
+        new.push(snap(
+            "2026-06-01T10:00:00Z",
+            "2026-05-29T10:00:00Z",
+            50.0,
+            Some(Plan::Max5x),
+        ));
+        write_store(&[("org-1", old), ("acct-1", new)]);
+
+        rekey_snapshots("org-1", "acct-1").unwrap();
+        let store = read_store();
+        assert!(!store.accounts.contains_key("org-1"));
+        let merged = &store.accounts["acct-1"].snapshots;
+        assert_eq!(merged.len(), 18);
+        assert!(merged.windows(2).all(|w| w[0].cycle_end <= w[1].cycle_end));
+        let june: Vec<_> = merged
+            .iter()
+            .filter(|s| s.cycle_end.format("%Y-%m-%d").to_string() == "2026-06-01")
+            .collect();
+        assert_eq!(june.len(), 2);
+        assert!(june
+            .iter()
+            .any(|s| s.plan == Some(Plan::Pro) && s.utilization == 40.0));
+        assert!(june
+            .iter()
+            .any(|s| s.plan == Some(Plan::Max5x) && s.utilization == 50.0));
+
+        drop(home);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn owned_ids(records: &[UsageRecord], name: &str) -> Vec<String> {
+        let registry = crate::accounts::test_support::same_org_registry();
+        records_owned_by(records, name, &registry)
+            .into_iter()
+            .map(|r| r.message_id.clone())
+            .collect()
+    }
+
+    struct UnitPricing(crate::cost::ModelPricing);
+    impl PricingMap for UnitPricing {
+        fn get(&self, _model: &str) -> Option<&crate::cost::ModelPricing> {
+            Some(&self.0)
+        }
+    }
+
+    /// Offline row cost of `name` in `same_org_registry`, each record priced at 2.0, with a
+    /// cached cycle around now for both accounts.
+    fn row_cost(records: &[UsageRecord], name: &str) -> Option<f64> {
+        let dir = scratch_home("row");
+        let home = paths::TestHome::set(&dir);
+        let now = Utc::now();
+        let cycle = vec![snap(
+            &(now + Duration::days(3)).to_rfc3339(),
+            &now.to_rfc3339(),
+            10.0,
+            None,
+        )];
+        write_store(&[("acct-a@org-1", cycle.clone()), ("acct-b@org-1", cycle)]);
+
+        let registry = crate::accounts::test_support::same_org_registry();
+        let account = registry.find_by_name(name).unwrap();
+        let refs: Vec<&UsageRecord> = records.iter().collect();
+        let pricing = UnitPricing(crate::cost::ModelPricing {
+            input_cost_per_token: 1.0,
+            output_cost_per_token: 1.0,
+            cache_read_input_token_cost: None,
+            cache_creation_input_token_cost: None,
+            cache_creation_1h_input_token_cost: None,
+            supports_fast_mode: false,
+        });
+        let row = gather_account_row(
+            account, false, None, &refs, &registry, &pricing, true, false,
+        );
+
+        drop(home);
+        let _ = fs::remove_dir_all(&dir);
+        row.cost
+    }
+
+    #[test]
+    fn gather_account_row_filters_same_org_accounts_separately() {
+        use crate::accounts::test_support::record;
+        let hour_ago = Utc::now() - Duration::hours(1);
+        let records = [
+            record(Some("acct-a@org-1"), hour_ago),
+            record(Some("acct-b@org-1"), hour_ago),
+            record(Some("acct-b@org-1"), hour_ago),
+        ];
+        assert_eq!(row_cost(&records, "alice"), Some(2.0));
+        assert_eq!(row_cost(&records, "bob"), Some(4.0));
+    }
+
+    #[test]
+    fn records_owned_by_unknown_tag_falls_back_to_switch_log() {
+        use crate::accounts::test_support::{record, ts};
+        let mut during_bob = record(Some("acct-gone"), ts(1));
+        during_bob.message_id = "bob".into();
+        let mut untagged = record(None, ts(5));
+        untagged.message_id = "alice".into();
+        let mut before_log = record(Some("acct-gone"), ts(-1));
+        before_log.message_id = "nobody".into();
+        let records = [during_bob, untagged, before_log];
+        assert_eq!(owned_ids(&records, "bob"), ["bob"]);
+        assert_eq!(owned_ids(&records, "alice"), ["alice"]);
+    }
+
+    #[test]
+    fn gather_account_row_unknown_tag_falls_back_to_switch_log() {
+        use crate::accounts::test_support::record;
+        let records = [record(Some("acct-gone"), Utc::now() - Duration::hours(1))];
+        assert_eq!(row_cost(&records, "alice"), Some(2.0));
+        assert_eq!(row_cost(&records, "bob"), Some(0.0));
     }
 }

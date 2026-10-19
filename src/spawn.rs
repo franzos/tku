@@ -21,7 +21,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use directories::BaseDirs;
 use notify::{EventKind, RecursiveMode, Watcher};
 
-use crate::accounts::{self, redact};
+use crate::accounts::{self, redact, Account, OauthIds};
 use crate::atomic_write::atomic_write;
 use crate::creds::{self, CREDS_FILE};
 
@@ -67,16 +67,13 @@ pub fn run(
         );
     }
 
-    // Guard (a): refuse if this account is the live ~/.claude login. Resolve the
-    // live org UUID from the strongest available witness: the creds file, then
-    // ~/.claude.json's oauthAccount (survives token refresh, catches an
-    // out-of-band /login), then the switch log.
-    let live_org = resolve_live_org(
-        accounts::current_claude_org_uuid(),
-        accounts::current_claude_oauth_org(),
-        registry.latest_switch().map(|s| s.org_uuid.clone()),
-    );
-    if is_already_live(&account.org_uuid, live_org.as_deref()) {
+    // Guard (a): refuse if this account is the live ~/.claude login, judged by
+    // ~/.claude.json's oauthAccount, else the switch log.
+    if is_already_live(
+        &account,
+        accounts::current_claude_oauth_ids().as_ref(),
+        registry.latest_switch().map(|s| s.id.as_str()),
+    ) {
         bail!(
             "Account '{name}' is already live as the active ~/.claude login.\n\
              Running it here too would share one single-use refresh token between two sessions \
@@ -86,14 +83,11 @@ pub fn run(
         );
     }
 
-    let parent = crate::paths::spawn_dir(TOOL)
-        .context("cannot determine a private runtime dir (set $XDG_RUNTIME_DIR or $HOME)")?;
-    create_dir_secure(&parent).with_context(|| format!("create {}", redact(&parent)))?;
-    ensure_private_dir(&parent)?;
+    let parent = private_spawn_dir()?;
 
     // Guard (b): per-account advisory lock. Held for the lifetime of this
     // process; auto-clears if a previous holder died without releasing it.
-    let lock_path = parent.join(format!("{name}.lock"));
+    let lock_path = lock_path(&parent, name);
     let _lock = match SpawnLock::acquire(&lock_path)? {
         Some(l) => l,
         None => bail!(
@@ -122,7 +116,7 @@ pub fn run(
     let live = creds::isolated(&dir);
 
     let home = BaseDirs::new().ok_or_else(|| anyhow!("cannot determine home directory"))?;
-    let transcripts = crate::paths::spawn_transcripts_dir(TOOL, &account.org_uuid)
+    let transcripts = crate::paths::spawn_transcripts_dir(TOOL, &account.id)
         .context("cannot determine a data dir for persistent transcripts")?;
     let seed = Seed {
         dir: &dir,
@@ -159,23 +153,23 @@ pub fn run(
         ),
     }
 
-    let code = launch_and_sync(&dir, &live, &stash_creds, name, &account.org_uuid, &command)?;
+    let expected = (account.id.as_str(), account.org_uuid.as_str());
+    let code = launch_and_sync(&dir, &live, &stash_creds, name, expected, &command)?;
     Ok(code)
 }
 
-/// True when `target_org` is the currently-live `~/.claude` account.
-fn is_already_live(target_org: &str, live_org: Option<&str>) -> bool {
-    live_org == Some(target_org)
-}
-
-/// Pick the strongest available witness of the live account's org UUID:
-/// the creds file, then `~/.claude.json`'s oauthAccount, then the switch log.
-fn resolve_live_org(
-    creds: Option<String>,
-    oauth: Option<String>,
-    switch: Option<String>,
-) -> Option<String> {
-    creds.or(oauth).or(switch)
+/// True when `account` is the currently-live `~/.claude` login. The
+/// `oauthAccount` block decides when it carries the field the account is keyed
+/// by (both UUIDs, or the org UUID while provisional); otherwise the switch log.
+fn is_already_live(account: &Account, oauth: Option<&OauthIds>, switch_id: Option<&str>) -> bool {
+    let verdict = oauth.and_then(|ids| {
+        if account.is_provisional() {
+            ids.org_uuid.as_deref().map(|org| org == account.org_uuid)
+        } else {
+            ids.id().map(|id| id == account.id)
+        }
+    });
+    verdict.unwrap_or(switch_id == Some(account.id.as_str()))
 }
 
 // --- Seeding ---
@@ -381,7 +375,7 @@ fn launch_and_sync(
     live: &creds::Store,
     stash_creds: &Path,
     name: &str,
-    expected_org: &str,
+    expected: (&str, &str),
     command: &[String],
 ) -> Result<i32> {
     let (tx, rx) = mpsc::channel::<()>();
@@ -417,7 +411,7 @@ fn launch_and_sync(
         if watcher.is_some() {
             match rx.recv_timeout(Duration::from_millis(400)) {
                 Ok(()) => {
-                    sync_back(live, &claude_json, stash_creds, name, expected_org);
+                    sync_back(live, &claude_json, stash_creds, name, expected);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -427,7 +421,7 @@ fn launch_and_sync(
         } else {
             std::thread::sleep(Duration::from_millis(400));
             if last_poll.elapsed() >= POLL_EVERY {
-                sync_back(live, &claude_json, stash_creds, name, expected_org);
+                sync_back(live, &claude_json, stash_creds, name, expected);
                 last_poll = Instant::now();
             }
         }
@@ -437,7 +431,7 @@ fn launch_and_sync(
     // Final sync: covers a token rotation that landed between the last watcher
     // event and the child exiting. Not optional: skipping it can leave the
     // stash holding an invalidated refresh token and brick the next spawn.
-    let ok = sync_back(live, &claude_json, stash_creds, name, expected_org);
+    let ok = sync_back(live, &claude_json, stash_creds, name, expected);
     finish(live, ok);
 
     Ok(status.code().unwrap_or(1))
@@ -513,9 +507,9 @@ fn sync_back(
     claude_json: &Path,
     stash: &Path,
     name: &str,
-    expected_org: &str,
+    expected: (&str, &str),
 ) -> bool {
-    match try_sync_back(live, claude_json, stash, expected_org) {
+    match try_sync_back(live, claude_json, stash, expected) {
         Ok(Sync::Written) => {
             eprintln!("tku: synced refreshed credentials for '{name}' back to the stash");
         }
@@ -540,7 +534,7 @@ fn try_sync_back(
     live: &creds::Store,
     claude_json: &Path,
     stash: &Path,
-    expected_org: &str,
+    expected: (&str, &str),
 ) -> Result<Sync> {
     let Some(bytes) = live.read()? else {
         return Ok(Sync::Unchanged);
@@ -558,8 +552,14 @@ fn try_sync_back(
     // If the in-session identity witness disagrees with the account we seeded,
     // a /login as someone else happened inside the exec: don't overwrite this
     // account's stash. Absent field: best-effort, proceed.
-    if let Some(org) = read_oauth_org(claude_json) {
-        if org != expected_org {
+    let (id, org_uuid) = expected;
+    if let Some(ids) = accounts::oauth_ids_at(claude_json) {
+        let mismatch = if id == org_uuid {
+            ids.org_uuid.is_some_and(|seen| seen != org_uuid)
+        } else {
+            ids.id().is_some_and(|seen| seen != id)
+        };
+        if mismatch {
             return Ok(Sync::AccountMismatch);
         }
     }
@@ -591,14 +591,6 @@ fn parse_login(bytes: &[u8]) -> Option<Login> {
     Some(Login {
         access_token: access.to_string(),
     })
-}
-
-/// `oauthAccount.organizationUuid` from a `.claude.json` at `path`, if present.
-fn read_oauth_org(path: &Path) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    v.pointer("/oauthAccount/organizationUuid")
-        .and_then(|o| o.as_str())
-        .map(String::from)
 }
 
 // --- Signals ---
@@ -637,16 +629,30 @@ fn reset_child_signals(_cmd: &mut Command) {}
 
 // --- Per-account advisory lock (pidfile + liveness check) ---
 
+/// The spawn dir for Claude, created owner-only if missing.
+pub(crate) fn private_spawn_dir() -> Result<PathBuf> {
+    let parent = crate::paths::spawn_dir(TOOL)
+        .context("cannot determine a private runtime dir (set $XDG_RUNTIME_DIR or $HOME)")?;
+    create_dir_secure(&parent).with_context(|| format!("create {}", redact(&parent)))?;
+    ensure_private_dir(&parent)?;
+    Ok(parent)
+}
+
+/// Per-account lockfile inside `private_spawn_dir`.
+pub(crate) fn lock_path(parent: &Path, name: &str) -> PathBuf {
+    parent.join(format!("{name}.lock"))
+}
+
 // A recycled PID could in theory keep a stale lock looking live; clear it by
 // removing the lockfile at its printed path.
-struct SpawnLock {
+pub(crate) struct SpawnLock {
     path: PathBuf,
 }
 
 impl SpawnLock {
     /// O_EXCL pidfile lock. Returns `Ok(None)` when a live process already
     /// holds it; clears a stale lock left by a dead holder and retries.
-    fn acquire(path: &Path) -> Result<Option<Self>> {
+    pub(crate) fn acquire(path: &Path) -> Result<Option<Self>> {
         for _ in 0..8 {
             match write_pidfile(path) {
                 Ok(()) => {
@@ -826,11 +832,100 @@ mod tests {
         p
     }
 
+    fn account(id: &str, org: &str) -> Account {
+        Account {
+            name: "a".into(),
+            id: id.into(),
+            org_uuid: org.into(),
+            added_at: chrono::Utc::now(),
+            last_used_at: chrono::Utc::now(),
+            subscription_type: None,
+            rate_limit_tier: None,
+            oauth_account: None,
+        }
+    }
+
+    fn ids(account: Option<&str>, org: Option<&str>) -> OauthIds {
+        OauthIds {
+            account_uuid: account.map(String::from),
+            org_uuid: org.map(String::from),
+        }
+    }
+
     #[test]
     fn guard_detects_live_account() {
-        assert!(is_already_live("org-abc", Some("org-abc")));
-        assert!(!is_already_live("org-abc", Some("org-xyz")));
-        assert!(!is_already_live("org-abc", None));
+        let resolved = account("acct-1@org-1", "org-1");
+        let provisional = account("org-1", "org-1");
+
+        // Account key match.
+        assert!(is_already_live(
+            &resolved,
+            Some(&ids(Some("acct-1"), Some("org-1"))),
+            None
+        ));
+        // Same org, other seat: a resolved account is not live.
+        assert!(!is_already_live(
+            &resolved,
+            Some(&ids(Some("acct-2"), Some("org-1"))),
+            None
+        ));
+        // Same person, other org.
+        assert!(!is_already_live(
+            &resolved,
+            Some(&ids(Some("acct-1"), Some("org-2"))),
+            None
+        ));
+        // Provisional account matches on org.
+        assert!(is_already_live(
+            &provisional,
+            Some(&ids(Some("acct-2"), Some("org-1"))),
+            None
+        ));
+        assert!(!is_already_live(
+            &provisional,
+            Some(&ids(None, Some("org-2"))),
+            None
+        ));
+        // Switch log match.
+        assert!(is_already_live(&resolved, None, Some("acct-1@org-1")));
+        assert!(!is_already_live(&resolved, None, Some("acct-2@org-1")));
+        // No witness.
+        assert!(!is_already_live(&resolved, None, None));
+        assert!(!is_already_live(&provisional, None, None));
+    }
+
+    #[test]
+    fn guard_falls_back_to_switch_log_without_the_applicable_field() {
+        let resolved = account("acct-1@org-1", "org-1");
+        let provisional = account("org-1", "org-1");
+
+        assert!(is_already_live(
+            &resolved,
+            Some(&ids(None, Some("org-1"))),
+            Some("acct-1@org-1")
+        ));
+        assert!(is_already_live(
+            &provisional,
+            Some(&ids(Some("acct-1"), None)),
+            Some("org-1")
+        ));
+    }
+
+    #[test]
+    fn guard_prefers_an_applicable_block_over_the_switch_log() {
+        let resolved = account("acct-1@org-1", "org-1");
+        let provisional = account("org-1", "org-1");
+
+        assert!(!is_already_live(
+            &resolved,
+            Some(&ids(Some("acct-2"), Some("org-1"))),
+            Some("acct-1@org-1")
+        ));
+        assert!(!is_already_live(
+            &provisional,
+            Some(&ids(None, Some("org-2"))),
+            Some("org-1")
+        ));
     }
 
     #[test]
@@ -852,7 +947,8 @@ mod tests {
         let claude_json = root.join(".claude.json");
         fs::write(
             &claude_json,
-            b"{\"projects\":{\"a\":1},\"oauthAccount\":{\"emailAddress\":\"old@x.io\"}}",
+            b"{\"projects\":{\"a\":1},\"oauthAccount\":{\"emailAddress\":\"old@x.io\",\
+              \"accountUuid\":\"acct-old\",\"organizationUuid\":\"org-new\"}}",
         )
         .unwrap();
 
@@ -861,6 +957,7 @@ mod tests {
 
         let blob = serde_json::json!({
             "emailAddress": "new@iota.org",
+            "accountUuid": "acct-new",
             "organizationUuid": "org-new",
         });
 
@@ -893,6 +990,10 @@ mod tests {
         assert_eq!(
             cfg.pointer("/oauthAccount/emailAddress").unwrap(),
             "new@iota.org"
+        );
+        assert_eq!(
+            accounts::oauth_ids_at(&dir.join(".claude.json")),
+            Some(ids(Some("acct-new"), Some("org-new")))
         );
 
         // Shared entries symlinked; settings copied.
@@ -1047,7 +1148,7 @@ mod tests {
             fs::write(&stash, b"{\"claudeAiOauth\":{\"accessToken\":\"tok\"}}").unwrap();
             let dir = root.join("spawn");
             fs::create_dir_all(&dir).unwrap();
-            let target = root.join("persistent").join("org-123").join("projects");
+            let target = root.join("persistent").join("acct-123").join("projects");
             Self {
                 root,
                 live: creds::Store::File(dir.join(CREDS_FILE)),
@@ -1208,42 +1309,41 @@ mod tests {
         )
     }
 
-    fn claude_json_with_org(org: &str) -> String {
-        format!("{{\"oauthAccount\":{{\"organizationUuid\":\"{org}\"}}}}")
+    const RESOLVED: (&str, &str) = ("acct-1@org-1", "org-1");
+    const PROVISIONAL: (&str, &str) = ("org-1", "org-1");
+
+    fn claude_json_with(account: &str, org: &str) -> String {
+        format!(
+            "{{\"oauthAccount\":{{\"accountUuid\":\"{account}\",\"organizationUuid\":\"{org}\"}}}}"
+        )
     }
 
     #[test]
-    fn resolve_live_org_prefers_strongest_witness() {
-        // Creds file wins over both fallbacks.
-        assert_eq!(
-            resolve_live_org(Some("a".into()), Some("b".into()), Some("c".into())),
-            Some("a".into())
-        );
-        // No creds field: ~/.claude.json oauthAccount org is preferred over the
-        // switch log.
-        assert_eq!(
-            resolve_live_org(None, Some("b".into()), Some("c".into())),
-            Some("b".into())
-        );
-        // Only the switch log remains.
-        assert_eq!(
-            resolve_live_org(None, None, Some("c".into())),
-            Some("c".into())
-        );
-        assert_eq!(resolve_live_org(None, None, None), None);
-    }
-
-    #[test]
-    fn read_oauth_org_parses_claude_json() {
+    fn oauth_ids_at_parses_claude_json() {
         let root = scratch("org");
         let cj = root.join(".claude.json");
-        fs::write(&cj, claude_json_with_org("org-live")).unwrap();
-        assert_eq!(read_oauth_org(&cj).as_deref(), Some("org-live"));
+        fs::write(&cj, claude_json_with("acct-live", "org-live")).unwrap();
+        assert_eq!(
+            accounts::oauth_ids_at(&cj),
+            Some(ids(Some("acct-live"), Some("org-live")))
+        );
 
-        // Missing field / file: None (best-effort, sync proceeds).
+        fs::write(
+            &cj,
+            b"{\"oauthAccount\":{\"organizationUuid\":\"org-live\"}}",
+        )
+        .unwrap();
+        assert_eq!(
+            accounts::oauth_ids_at(&cj),
+            Some(ids(None, Some("org-live")))
+        );
+
+        // Missing block, empty block, missing file: None (best-effort, sync proceeds).
+        fs::write(&cj, b"{\"oauthAccount\":{\"emailAddress\":\"a@b.io\"}}").unwrap();
+        assert!(accounts::oauth_ids_at(&cj).is_none());
         fs::write(&cj, b"{\"projects\":{}}").unwrap();
-        assert!(read_oauth_org(&cj).is_none());
-        assert!(read_oauth_org(&root.join("nope.json")).is_none());
+        assert!(accounts::oauth_ids_at(&cj).is_none());
+        assert!(accounts::oauth_ids_at(&root.join("nope.json")).is_none());
 
         fs::remove_dir_all(&root).unwrap();
     }
@@ -1256,20 +1356,20 @@ mod tests {
         let cj = root.join(".claude.json");
         let stash = root.join("stash.json");
         fs::write(&stash, login_blob("old")).unwrap();
-        // Matching account so the org check passes.
-        fs::write(&cj, claude_json_with_org("org-1")).unwrap();
+        // Matching account so the identity check passes.
+        fs::write(&cj, claude_json_with("acct-1", "org-1")).unwrap();
 
         // Unchanged token: no write.
         fs::write(&spawn_creds, login_blob("old")).unwrap();
         assert!(matches!(
-            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
+            try_sync_back(&live, &cj, &stash, RESOLVED).unwrap(),
             Sync::Unchanged
         ));
 
         // Complete rotated login: mirrored back.
         fs::write(&spawn_creds, login_blob("new")).unwrap();
         assert!(matches!(
-            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
+            try_sync_back(&live, &cj, &stash, RESOLVED).unwrap(),
             Sync::Written
         ));
         assert_eq!(
@@ -1282,7 +1382,7 @@ mod tests {
         // Missing spawn creds: no-op.
         fs::remove_file(&spawn_creds).unwrap();
         assert!(matches!(
-            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
+            try_sync_back(&live, &cj, &stash, RESOLVED).unwrap(),
             Sync::Unchanged
         ));
 
@@ -1297,7 +1397,7 @@ mod tests {
         let cj = root.join(".claude.json");
         let stash = root.join("stash.json");
         fs::write(&stash, login_blob("good")).unwrap();
-        fs::write(&cj, claude_json_with_org("org-1")).unwrap();
+        fs::write(&cj, claude_json_with("acct-1", "org-1")).unwrap();
 
         let bad = [
             // empty access token
@@ -1314,7 +1414,7 @@ mod tests {
         for blob in bad {
             fs::write(&spawn_creds, blob).unwrap();
             assert!(matches!(
-                try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
+                try_sync_back(&live, &cj, &stash, RESOLVED).unwrap(),
                 Sync::LoggedOut
             ));
         }
@@ -1336,13 +1436,16 @@ mod tests {
         let live = creds::Store::File(spawn_creds.clone());
         let cj = root.join(".claude.json");
         let stash = root.join("stash.json");
-        fs::write(&stash, login_blob("old")).unwrap();
-        fs::write(&spawn_creds, login_blob("new")).unwrap();
+        let check = |claude_json: &str, expected| {
+            fs::write(&stash, login_blob("old")).unwrap();
+            fs::write(&spawn_creds, login_blob("new")).unwrap();
+            fs::write(&cj, claude_json).unwrap();
+            try_sync_back(&live, &cj, &stash, expected).unwrap()
+        };
 
-        // Sibling .claude.json says a different account is logged in now.
-        fs::write(&cj, claude_json_with_org("org-other")).unwrap();
+        // Resolved account: another seat in the same org is a mismatch.
         assert!(matches!(
-            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
+            check(&claude_json_with("acct-2", "org-1"), RESOLVED),
             Sync::AccountMismatch
         ));
         // Stash preserved.
@@ -1352,19 +1455,34 @@ mod tests {
                 .access_token,
             "old"
         );
-
-        // Matching org: proceeds.
-        fs::write(&cj, claude_json_with_org("org-1")).unwrap();
         assert!(matches!(
-            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
+            check(&claude_json_with("acct-1", "org-1"), RESOLVED),
+            Sync::Written
+        ));
+        // Resolved account: the same person in another org is a mismatch.
+        assert!(matches!(
+            check(&claude_json_with("acct-1", "org-other"), RESOLVED),
+            Sync::AccountMismatch
+        ));
+
+        // Provisional account: compared by org.
+        assert!(matches!(
+            check(&claude_json_with("acct-2", "org-other"), PROVISIONAL),
+            Sync::AccountMismatch
+        ));
+        assert!(matches!(
+            check(&claude_json_with("acct-2", "org-1"), PROVISIONAL),
             Sync::Written
         ));
 
-        // Absent org field: best-effort proceed.
-        fs::write(&stash, login_blob("old")).unwrap();
-        fs::write(&cj, b"{\"projects\":{}}").unwrap();
+        // Absent field: best-effort proceed.
+        let org_only = "{\"oauthAccount\":{\"organizationUuid\":\"org-other\"}}";
+        assert!(matches!(check(org_only, RESOLVED), Sync::Written));
+        let acct_only = "{\"oauthAccount\":{\"accountUuid\":\"acct-2\"}}";
+        assert!(matches!(check(acct_only, PROVISIONAL), Sync::Written));
+        assert!(matches!(check(acct_only, RESOLVED), Sync::Written));
         assert!(matches!(
-            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
+            check("{\"projects\":{}}", RESOLVED),
             Sync::Written
         ));
 
@@ -1393,11 +1511,11 @@ mod tests {
         let cj = root.join(".claude.json");
         let stash = root.join("stash.json");
         fs::write(&stash, login_blob("old")).unwrap();
-        fs::write(&cj, claude_json_with_org("org-1")).unwrap();
+        fs::write(&cj, claude_json_with("acct-1", "org-1")).unwrap();
         fs::write(root.join("out.1"), format!("{}\n", login_blob("new"))).unwrap();
 
         assert!(matches!(
-            try_sync_back(&live, &cj, &stash, "org-1").unwrap(),
+            try_sync_back(&live, &cj, &stash, RESOLVED).unwrap(),
             Sync::Written
         ));
         assert_eq!(fs::read(&stash).unwrap(), login_blob("new").as_bytes());

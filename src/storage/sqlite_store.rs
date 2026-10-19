@@ -26,7 +26,10 @@ impl SqliteStorage {
             }
             None => Connection::open_in_memory().context("Failed to open in-memory sqlite")?,
         };
+        Self::with_connection(conn)
+    }
 
+    fn with_connection(conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
             .context("Failed to set sqlite pragmas")?;
 
@@ -251,8 +254,9 @@ impl Storage for SqliteStorage {
         }
     }
 
-    fn flush(&mut self) {
+    fn flush(&mut self) -> bool {
         // WAL mode — writes are already persisted
+        true
     }
 
     fn drain_all(&mut self) -> Vec<UsageRecord> {
@@ -311,5 +315,222 @@ impl Storage for SqliteStorage {
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+    }
+
+    fn rekey_account(
+        &mut self,
+        old: &str,
+        new: &str,
+        old_dir: Option<&Path>,
+        new_dir: Option<&Path>,
+    ) {
+        let provider = Provider::Claude.as_str();
+        let tx = match self.conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                eprintln!("tku: sqlite transaction failed: {e}");
+                return;
+            }
+        };
+
+        // The aggregate id must be rewritten first: it is selected by the old tag.
+        if let Err(e) = tx.execute(
+            "UPDATE records
+                SET message_id = replace(message_id, ':' || ?1 || ':', ':' || ?2 || ':')
+              WHERE message_id LIKE 'tku-agg:%' AND account_uuid = ?1
+                AND file_id IN (SELECT file_id FROM files WHERE provider = ?3)",
+            params![old, new, provider],
+        ) {
+            eprintln!("tku: sqlite rekey message ids failed: {e}");
+            return;
+        }
+        if let Err(e) = tx.execute(
+            "UPDATE records SET account_uuid = ?2
+              WHERE account_uuid = ?1
+                AND file_id IN (SELECT file_id FROM files WHERE provider = ?3)",
+            params![old, new, provider],
+        ) {
+            eprintln!("tku: sqlite rekey records failed: {e}");
+            return;
+        }
+
+        if let (Some(old_dir), Some(new_dir)) = (old_dir, new_dir) {
+            let files: Vec<(i64, String)> = match tx
+                .prepare("SELECT file_id, path FROM files WHERE provider = ?1")
+                .and_then(|mut stmt| {
+                    stmt.query_map(params![provider], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect()
+                }) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("tku: sqlite rekey file query failed: {e}");
+                    return;
+                }
+            };
+            for (file_id, path) in files {
+                let Some(to) = super::remap_path(&path, old_dir, new_dir) else {
+                    continue;
+                };
+                // A target already cached keeps its entry; this one stays put.
+                if let Err(e) = tx.execute(
+                    "UPDATE OR IGNORE files SET path = ?1 WHERE file_id = ?2",
+                    params![to, file_id],
+                ) {
+                    eprintln!("tku: sqlite rekey file path failed: {e}");
+                    return;
+                }
+            }
+        }
+
+        if let Err(e) = tx.commit() {
+            eprintln!("tku: sqlite rekey commit failed: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> SqliteStorage {
+        SqliteStorage::with_connection(Connection::open_in_memory().unwrap()).unwrap()
+    }
+
+    fn rec(ts: &str, out: u64, account: Option<&str>) -> UsageRecord {
+        UsageRecord {
+            provider: Provider::Claude,
+            session_id: "s1".into(),
+            timestamp: ts.parse().unwrap(),
+            project: "p".into(),
+            model: "opus".into(),
+            message_id: format!("msg-{ts}-{out}"),
+            request_id: format!("req-{ts}-{out}"),
+            input_tokens: 1,
+            output_tokens: out,
+            cache_creation_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            fast_mode: false,
+            account_uuid: account.map(str::to_string),
+        }
+    }
+
+    fn agg(day: &str, account: &str) -> UsageRecord {
+        UsageRecord {
+            message_id: format!("tku-agg:s1:{day}:opus:{account}:false"),
+            request_id: "tku-agg".into(),
+            ..rec(&format!("{day}T01:00:00Z"), 1, Some(account))
+        }
+    }
+
+    fn paths(s: &SqliteStorage) -> Vec<String> {
+        let mut stmt = s
+            .conn
+            .prepare("SELECT path FROM files ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn rekey_account_rewrites_tags_and_aggregate_message_ids() {
+        super::super::with_scratch_home("sqlite-rekey-agg", || {
+            let mut s = store();
+            s.insert(
+                "claude",
+                Path::new("/proj/a.jsonl"),
+                0,
+                0,
+                vec![agg("2020-01-01", "old"), agg("2020-01-02", "old")],
+            );
+
+            s.rekey_account("old", "new", None, None);
+
+            let records = s.drain_all();
+            assert_eq!(records.len(), 2);
+            for r in &records {
+                assert_eq!(r.account_uuid.as_deref(), Some("new"));
+                assert!(r.message_id.ends_with(":new:false"), "{}", r.message_id);
+            }
+        });
+    }
+
+    #[test]
+    fn rekey_account_leaves_other_accounts_and_untagged_records() {
+        super::super::with_scratch_home("sqlite-rekey-others", || {
+            let mut s = store();
+            s.insert(
+                "claude",
+                Path::new("/proj/a.jsonl"),
+                0,
+                0,
+                vec![
+                    agg("2020-01-01", "other"),
+                    rec("2020-01-02T01:00:00Z", 2, Some("old")),
+                    rec("2020-01-02T02:00:00Z", 3, None),
+                ],
+            );
+            s.insert(
+                "codex",
+                Path::new("/codex/a.jsonl"),
+                0,
+                0,
+                vec![rec("2020-01-03T01:00:00Z", 4, Some("old"))],
+            );
+
+            s.rekey_account("old", "new", None, None);
+
+            let mut records = s.drain_all();
+            records.sort_by_key(|r| r.output_tokens);
+            assert_eq!(records[0].account_uuid.as_deref(), Some("other"));
+            assert_eq!(
+                records[0].message_id,
+                "tku-agg:s1:2020-01-01:opus:other:false"
+            );
+            assert_eq!(records[1].account_uuid.as_deref(), Some("new"));
+            assert_eq!(records[1].message_id, "msg-2020-01-02T01:00:00Z-2");
+            assert_eq!(records[2].account_uuid, None);
+            assert_eq!(records[3].account_uuid.as_deref(), Some("old"));
+        });
+    }
+
+    #[test]
+    fn rekey_account_remaps_file_paths_under_old_dir() {
+        super::super::with_scratch_home("sqlite-rekey-paths", || {
+            let mut s = store();
+            for key in [
+                "/old/proj/a.jsonl",
+                "/old/proj/c.jsonl",
+                "/new/proj/c.jsonl",
+                "/oldish/b.jsonl",
+            ] {
+                s.insert(
+                    "claude",
+                    Path::new(key),
+                    0,
+                    0,
+                    vec![rec("2020-01-01T01:00:00Z", 1, None)],
+                );
+            }
+
+            s.rekey_account(
+                "old",
+                "new",
+                Some(Path::new("/old")),
+                Some(Path::new("/new")),
+            );
+
+            assert_eq!(
+                paths(&s),
+                [
+                    "/new/proj/a.jsonl",
+                    "/new/proj/c.jsonl",
+                    "/old/proj/c.jsonl",
+                    "/oldish/b.jsonl"
+                ]
+            );
+        });
     }
 }

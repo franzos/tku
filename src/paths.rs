@@ -76,10 +76,10 @@ pub fn subscription_snapshot_file(tool: &str) -> Option<PathBuf> {
     cache_dir().map(|d| d.join(format!("subscription-{tool}.json")))
 }
 
-/// Cached OAuth profile response per Claude org_uuid: `profile-<org>.json`.
+/// Cached OAuth profile response per Claude account id: `profile-<id>.json`.
 /// Used to detect plan switches without hammering the API on every run.
-pub fn profile_cache_file(org_uuid: &str) -> Option<PathBuf> {
-    cache_dir().map(|d| d.join(format!("profile-{org_uuid}.json")))
+pub fn profile_cache_file(account_id: &str) -> Option<PathBuf> {
+    cache_dir().map(|d| d.join(format!("profile-{account_id}.json")))
 }
 
 // --- Config files ---
@@ -128,12 +128,12 @@ pub fn transcripts_dir(tool: &str) -> Option<PathBuf> {
     data_dir().map(|d| d.join("transcripts").join(tool))
 }
 
-/// Where an exec'd session's transcripts actually live. Keyed by `org_uuid`
+/// Where an exec'd session's transcripts actually live. Keyed by account id
 /// rather than account name: names are mutable and reusable, so a name-keyed
 /// store would silently re-attribute an earlier login's history to whatever
 /// account later took the name.
-pub fn spawn_transcripts_dir(tool: &str, org_uuid: &str) -> Option<PathBuf> {
-    transcripts_dir(tool).map(|d| d.join(org_uuid).join("projects"))
+pub fn spawn_transcripts_dir(tool: &str, account_id: &str) -> Option<PathBuf> {
+    transcripts_dir(tool).map(|d| d.join(account_id).join("projects"))
 }
 
 /// Serialises tests that point `TKU_HOME` somewhere of their own. The variable
@@ -141,31 +141,68 @@ pub fn spawn_transcripts_dir(tool: &str, org_uuid: &str) -> Option<PathBuf> {
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Points `TKU_HOME` and `XDG_RUNTIME_DIR` at a scratch dir while holding
+/// `ENV_LOCK`; restores both on drop. `spawn_dir` prefers the runtime dir, so
+/// setting `TKU_HOME` alone would leave lock files in the real one.
+#[cfg(test)]
+pub(crate) struct TestHome {
+    runtime: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TestHome {
+    pub(crate) fn set(dir: &std::path::Path) -> Self {
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        std::env::set_var("TKU_HOME", dir);
+        std::env::set_var("XDG_RUNTIME_DIR", dir);
+        Self {
+            runtime,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestHome {
+    fn drop(&mut self) {
+        std::env::remove_var("TKU_HOME");
+        match self.runtime.take() {
+            Some(rt) => std::env::set_var("XDG_RUNTIME_DIR", rt),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn transcript_paths_follow_tku_home() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join("tku-paths-test");
-        std::env::set_var("TKU_HOME", &tmp);
+        let _home = TestHome::set(&tmp);
 
         assert_eq!(
             transcripts_dir("claude"),
             Some(tmp.join("data").join("transcripts").join("claude"))
         );
         assert_eq!(
-            spawn_transcripts_dir("claude", "org-123"),
+            spawn_transcripts_dir("claude", "acct-123"),
             Some(
                 tmp.join("data")
                     .join("transcripts")
                     .join("claude")
-                    .join("org-123")
+                    .join("acct-123")
                     .join("projects")
             )
         );
-
-        std::env::remove_var("TKU_HOME");
+        assert_eq!(
+            spawn_dir("claude"),
+            Some(tmp.join("tku").join("spawn").join("claude"))
+        );
     }
 }
