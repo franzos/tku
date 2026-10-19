@@ -1,3 +1,14 @@
+## [0.1.27] - 2026-10-19
+
+### Changed
+- Accounts are keyed by account and organization UUID, not organization alone
+- Existing registries migrate once at startup; usage, snapshots and exec transcripts follow
+- `account use` no longer takes `--force`
+
+### Fixed
+- `account add` refused a second login in the same organization
+- `account exec` identified the live login by organization only
+
 ## [0.1.26] - 2026-10-18
 
 ### Changed
