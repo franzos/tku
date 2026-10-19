@@ -1,3 +1,12 @@
+## [0.1.28] - 2026-10-19
+
+### Changed
+- Data migrations show progress, lock waits and a result line
+- Session scan progress only draws on a terminal
+
+### Fixed
+- Account id migration could stall silently for up to 30 s
+
 ## [0.1.27] - 2026-10-19
 
 ### Changed
