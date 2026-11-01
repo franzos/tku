@@ -37,8 +37,8 @@ pub fn config_dir() -> Option<PathBuf> {
     }
 }
 
-/// Data directory root. Home-based per-user location; used as the `spawn_dir`
-/// fallback when `$XDG_RUNTIME_DIR` is unset.
+/// Data directory root. Home-based per-user location; holds the usage archive
+/// and is the `spawn_dir` fallback when `$XDG_RUNTIME_DIR` is unset.
 pub fn data_dir() -> Option<PathBuf> {
     if let Some(h) = tku_home() {
         Some(h.join("data"))
@@ -60,26 +60,28 @@ pub fn exchange_cache_file() -> Option<PathBuf> {
     cache_dir().map(|d| d.join("exchange.json"))
 }
 
-/// Per-provider bitcode cache file, e.g. `claude.bin`.
+/// Cached OAuth profile response per Claude account id: `profile-<id>.json`.
+/// Used to detect plan switches without hammering the API on every run.
+pub fn profile_cache_file(account_id: &str) -> Option<PathBuf> {
+    cache_dir().map(|d| d.join(format!("profile-{account_id}.json")))
+}
+
+// --- Data files (the usage archive; often the only copy, so not in the cache dir) ---
+
+/// Per-provider bitcode store file, e.g. `claude.bin`.
 pub fn bitcode_cache_file(provider: &str) -> Option<PathBuf> {
-    cache_dir().map(|d| d.join(format!("{provider}.bin")))
+    data_dir().map(|d| d.join(format!("{provider}.bin")))
 }
 
 /// Sqlite records database (feature = "sqlite").
 #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 pub fn sqlite_db_file() -> Option<PathBuf> {
-    cache_dir().map(|d| d.join("records.db"))
+    data_dir().map(|d| d.join("records.db"))
 }
 
 /// Subscription snapshot store, one per tool: `subscription-claude.json`.
 pub fn subscription_snapshot_file(tool: &str) -> Option<PathBuf> {
-    cache_dir().map(|d| d.join(format!("subscription-{tool}.json")))
-}
-
-/// Cached OAuth profile response per Claude account id: `profile-<id>.json`.
-/// Used to detect plan switches without hammering the API on every run.
-pub fn profile_cache_file(account_id: &str) -> Option<PathBuf> {
-    cache_dir().map(|d| d.join(format!("profile-{account_id}.json")))
+    data_dir().map(|d| d.join(format!("subscription-{tool}.json")))
 }
 
 // --- Config files ---

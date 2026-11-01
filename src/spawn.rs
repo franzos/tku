@@ -677,6 +677,27 @@ impl SpawnLock {
             redact(path)
         )
     }
+
+    /// `acquire`, retried until `wait` has passed. Returns `Ok(None)` on timeout;
+    /// `on_wait` gets the time waited so far before each retry.
+    pub(crate) fn acquire_wait(
+        path: &Path,
+        wait: Duration,
+        on_wait: impl Fn(Duration),
+    ) -> Result<Option<Self>> {
+        let started = Instant::now();
+        loop {
+            if let Some(lock) = Self::acquire(path)? {
+                return Ok(Some(lock));
+            }
+            let waited = started.elapsed();
+            if waited >= wait {
+                return Ok(None);
+            }
+            on_wait(waited);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 impl Drop for SpawnLock {

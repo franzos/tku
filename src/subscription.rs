@@ -904,6 +904,11 @@ fn snapshot_path() -> Option<std::path::PathBuf> {
 /// swapped manually before tku had account support have already-conflated
 /// data that can't be retroactively split.
 fn parse_on_disk(data: &str, migration_id: &str) -> OnDiskStore {
+    parse_known(data, migration_id).unwrap_or_else(OnDiskStore::default_v2)
+}
+
+/// [`parse_on_disk`], or `None` when `data` is neither a v1 nor a v2 store.
+fn parse_known(data: &str, migration_id: &str) -> Option<OnDiskStore> {
     #[derive(Deserialize)]
     struct V2Probe {
         version: u32,
@@ -912,10 +917,10 @@ fn parse_on_disk(data: &str, migration_id: &str) -> OnDiskStore {
     }
     if let Ok(v2) = serde_json::from_str::<V2Probe>(data) {
         if v2.version >= 2 {
-            return OnDiskStore {
+            return Some(OnDiskStore {
                 version: v2.version,
                 accounts: v2.accounts,
-            };
+            });
         }
     }
 
@@ -931,13 +936,13 @@ fn parse_on_disk(data: &str, migration_id: &str) -> OnDiskStore {
                 snapshots: v1.snapshots,
             },
         );
-        return OnDiskStore {
+        return Some(OnDiskStore {
             version: 2,
             accounts,
-        };
+        });
     }
 
-    OnDiskStore::default_v2()
+    None
 }
 
 /// Snapshots taken before the account was registered live under "unknown";
@@ -988,6 +993,29 @@ pub fn rekey_snapshots(old: &str, new: &str) -> Result<()> {
     let data = serde_json::to_string_pretty(&on_disk)?;
     atomic_write(&path, data.as_bytes(), Some(0o600))?;
     Ok(())
+}
+
+/// Two raw store files merged per account through [`merge_snapshots`]. Errors
+/// when either is not a v1 or v2 store, so an unknown shape is never replaced.
+pub(crate) fn merge_store_files(dest: &str, src: &str) -> Result<String> {
+    let parse = |data: &str| -> Result<OnDiskStore> {
+        if data.trim().is_empty() {
+            return Ok(OnDiskStore::default_v2());
+        }
+        parse_known(data, "unknown").ok_or_else(|| anyhow::anyhow!("unrecognized format"))
+    };
+    let mut merged = parse(dest).context("destination is not a snapshot store")?;
+    for (id, theirs) in parse(src)
+        .context("source is not a snapshot store")?
+        .accounts
+    {
+        let snapshots = match merged.accounts.remove(&id) {
+            Some(ours) => merge_snapshots(ours.snapshots, theirs.snapshots),
+            None => theirs.snapshots,
+        };
+        merged.accounts.insert(id, AccountSnapshots { snapshots });
+    }
+    Ok(serde_json::to_string_pretty(&merged)?)
 }
 
 /// Union of two histories, one entry per (cycle minute, plan) keeping the
@@ -2626,6 +2654,7 @@ mod tests {
             Utc::now().timestamp_nanos_opt().unwrap()
         ));
         fs::create_dir_all(dir.join("cache")).unwrap();
+        fs::create_dir_all(dir.join("data")).unwrap();
         dir
     }
 

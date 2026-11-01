@@ -59,6 +59,7 @@ tku monthly --account work
 | `account` | Manage stashed Claude accounts (add/use/list/current/rename/remove/exec) |
 | `bar` | JSON output for status bars (waybar, i3bar, polybar) |
 | `scrub` | Find and redact secrets in local session files |
+| `cache` | Maintain the parsed-session cache (ingest/import-sqlite) |
 
 ## Options
 
@@ -220,7 +221,7 @@ Claude Pro — 45% used, resets Mar 13, 3:00pm
 └─────────────────┴───────┴─────────┴────────┴─────────┘
 ```
 
-Usage % for the current week is fetched live; previous weeks show the last captured snapshot (saved each time you run `tku sub`). Cost is always computed from local session records. Requires a Claude Code OAuth login (see [Accounts](#accounts) for where it lives).
+Usage % for the current week is fetched live; previous weeks show the last captured snapshot (saved to `subscription-claude.json` in tku's data dir each time you run `tku sub`). Cost is always computed from local session records. Requires a Claude Code OAuth login (see [Accounts](#accounts) for where it lives).
 
 ### Multi-account overview
 
@@ -449,11 +450,36 @@ tku caches parsed session data so repeated runs skip unchanged files. Two backen
 
 The cache is also the only long-term record of your usage. Coding tools delete their own transcripts — Claude Code drops sessions older than `cleanupPeriodDays` (30 by default) — so cached records routinely outlive the file they came from. Nothing removes them on its own: a source file disappearing leaves its records in place, and an unreadable or unrecognized cache file is renamed to `*.quarantine-<timestamp>` rather than overwritten.
 
-Only two things delete records. `--prune` does, explicitly and permanently. And if the cache exceeds `cache_max_bytes`, it first drops records that reporting would have deduplicated anyway, then collapses sessions older than 180, 90, and finally 30 days into one record per day, model and account — day-level totals are unaffected, intra-day detail is not — and only if that still isn't enough does it drop the oldest sessions whose transcripts are already gone. If the transcripts still on disk exceed the ceiling by themselves, the ceiling gives way and the file is written oversized with a warning. Every run warns once the cache passes 85% of the ceiling.
+Only `--prune` deletes records, explicitly and permanently. `cache_max_bytes` triggers compaction: once the cache exceeds it, tku drops duplicate records that reporting would have discarded anyway, then collapses sessions older than 180, 90, and finally 30 days into one record per day, model and account. Day-level totals are unaffected, intra-day detail is not. A cache that is still over the ceiling after that is written as is, with a warning. Every run warns once the cache passes 85% of the ceiling.
+
+### Ingesting on session end
+
+The cache only learns about a transcript when tku runs while the file still exists. `tku cache ingest` scans every provider into the cache and exits: no pricing fetch, no report, no account reconciliation, nothing on stdout. Errors go to stderr with a non-zero exit. It doesn't accept `--prune`.
+
+To run it whenever a Claude Code session ends, add a `SessionEnd` hook to `~/.claude/settings.json` (tku doesn't edit that file):
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tku cache ingest >/dev/null 2>&1 &"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Claude Code cancels `SessionEnd` hooks after 1.5 seconds by default, and its `async` option doesn't help here because `claude -p` kills async hooks at teardown. The trailing `&` detaches the ingest instead, and the redirect lets the hook return immediately (which also means errors from that run aren't shown).
 
 ### Bitcode (default)
 
-Binary serialization using [bitcode](https://crates.io/crates/bitcode). One file per provider in `~/.cache/tku/`.
+Binary serialization using [bitcode](https://crates.io/crates/bitcode). One file per provider in tku's data dir (`~/.local/share/tku/` on Linux, `~/Library/Application Support/tku/` on macOS). Stores found in the cache dir (`~/.cache/tku/`) are moved there on startup and merged into any already present; a second `records.db` stays where it is, and every run warns with the `tku cache import-sqlite --db` command for it until it's imported and removed.
 
 ```bash
 cargo build --release
@@ -461,7 +487,7 @@ cargo build --release
 
 ### SQLite
 
-SQLite with WAL mode. Single database file at `~/.cache/tku/records.db`.
+SQLite with WAL mode. Single database file at `records.db` in the data dir.
 
 ```bash
 cargo build --release --features sqlite
@@ -476,7 +502,7 @@ cargo build --release --features sqlite
 ./target/release/tku cache import-sqlite            # add --dry-run to see what it would do
 ```
 
-It reads the database read-only, writes into the bitcode cache whichever backend the build defaults to, and leaves alone any path the bitcode cache already knows. Afterwards the normal build picks the records up.
+It reads `records.db` in the data dir (`--db <file>` reads another one) read-only, writes into the bitcode store in the same dir whichever backend the build defaults to, and leaves alone any path the bitcode store already knows. Afterwards the normal build picks the records up.
 
 A sqlite build also recreates its database when it finds an older schema. It copies the old one to `records.db.quarantine-<timestamp>` first and prints the import command for it.
 

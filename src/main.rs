@@ -88,9 +88,25 @@ fn handle_account(action: &cli::AccountAction) -> Result<()> {
     }
 }
 
+fn ingest(prune: bool) -> Result<()> {
+    if prune {
+        bail!("cache ingest does not accept --prune");
+    }
+    let mut store = storage::default_storage();
+    for provider in providers::all_providers() {
+        provider.discover_and_parse(store.as_mut(), None, false);
+    }
+    if !store.flush() {
+        bail!("record cache not written");
+    }
+    Ok(())
+}
+
 #[cfg(feature = "sqlite")]
-fn handle_cache(action: &cli::CacheAction) -> Result<()> {
-    let cli::CacheAction::ImportSqlite { db, dry_run } = action;
+fn handle_cache(action: &cli::CacheAction, prune: bool) -> Result<()> {
+    let cli::CacheAction::ImportSqlite { db, dry_run } = action else {
+        return ingest(prune);
+    };
     let path = db
         .clone()
         .or_else(paths::sqlite_db_file)
@@ -117,8 +133,10 @@ fn handle_cache(action: &cli::CacheAction) -> Result<()> {
 }
 
 #[cfg(not(feature = "sqlite"))]
-fn handle_cache(action: &cli::CacheAction) -> Result<()> {
-    let cli::CacheAction::ImportSqlite { .. } = action;
+fn handle_cache(action: &cli::CacheAction, prune: bool) -> Result<()> {
+    if let cli::CacheAction::Ingest = action {
+        return ingest(prune);
+    }
     anyhow::bail!(
         "this build cannot read sqlite. Rebuild with the feature and run the import once:\n\
          \n    cargo build --release --features sqlite\n    \
@@ -235,7 +253,7 @@ fn main() -> Result<()> {
     }
 
     if let cli::Command::Cache { action } = &mode {
-        return handle_cache(action);
+        return handle_cache(action, cli.prune);
     }
 
     let config = config::load_config();

@@ -87,3 +87,16 @@ fn tmp_path(path: &Path) -> PathBuf {
     name.push(format!(".{}.tmp", std::process::id()));
     path.with_file_name(name)
 }
+
+/// fsync a directory so a rename or create inside it survives a crash.
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}

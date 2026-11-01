@@ -284,7 +284,7 @@ present in the bitcode cache are left alone: a live file's current parse always
 wins over whatever the older store recorded for it."
     )]
     ImportSqlite {
-        /// Sqlite database to read (default: records.db in the cache dir).
+        /// Sqlite database to read (default: records.db in the data dir).
         /// Not `--from`: that is the global date filter.
         #[arg(long, value_name = "FILE")]
         db: Option<std::path::PathBuf>,
@@ -292,6 +292,8 @@ wins over whatever the older store recorded for it."
         #[arg(long)]
         dry_run: bool,
     },
+    /// Scan every provider into the cache and exit silently (for a `SessionEnd` hook)
+    Ingest,
 }
 
 #[derive(Subcommand, Debug, Clone)]

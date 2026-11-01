@@ -47,6 +47,9 @@ const AGG_MARKER: &str = "tku-agg";
 /// quarantined rather than overwritten, so nothing is lost to a bad bump.
 const CACHE_FORMAT_VERSION: u32 = 0x746b_7501;
 
+/// How long `flush` waits for another process to finish writing the store.
+const STORE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// One file per provider: `~/.cache/tku/{provider}.bin`
 ///
 /// Each provider's data is loaded/flushed independently so adding
@@ -55,20 +58,58 @@ const CACHE_FORMAT_VERSION: u32 = 0x746b_7501;
 /// Despite the name this is an archive as much as a cache: source transcripts
 /// are deleted by the tools that write them (Claude Code drops sessions past
 /// `cleanupPeriodDays`), so records here routinely outlive their source file
-/// and cannot be re-derived. The ceiling is honoured by compacting old records
-/// to daily totals rather than dropping them; records are only ever deleted by
-/// an explicit `--prune`, or as a last resort once compaction cannot free
-/// enough — and then the ceiling yields before anything still on disk does.
+/// and cannot be re-derived. The ceiling triggers compaction of old records to
+/// daily totals; a store still over it is written as is. Records are only
+/// deleted by an explicit `--prune`.
 pub struct BitcodeStorage {
     providers: HashMap<String, ProviderCache>,
     max_bytes: u64,
 }
 
 #[derive(Serialize, Deserialize, Default)]
-struct ProviderCache {
+pub(crate) struct ProviderCache {
     files: HashMap<String, CachedFile>,
     #[serde(skip)]
     dirty: bool,
+    #[serde(skip)]
+    changes: Changes,
+}
+
+/// What this process did to a provider since its last flush, so the flush can
+/// merge with whatever another process wrote in the meantime.
+#[derive(Default)]
+pub(crate) struct Changes {
+    /// Keys inserted, or the targets of a path remap.
+    touched: HashSet<String>,
+    /// Keys pruned, or the sources of a path remap.
+    removed: HashSet<String>,
+    rekeys: Vec<Rekey>,
+}
+
+struct Rekey {
+    old: String,
+    new: String,
+    dirs: Option<(PathBuf, PathBuf)>,
+}
+
+impl Changes {
+    /// Every key of `pc` touched, so a merge keeps its entries unless the other side's are newer.
+    pub(crate) fn touching_all(pc: &ProviderCache) -> Self {
+        Self {
+            touched: pc.files.keys().cloned().collect(),
+            ..Self::default()
+        }
+    }
+
+    fn touch(&mut self, key: &str) {
+        self.removed.remove(key);
+        self.touched.insert(key.to_string());
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.touched.remove(key);
+        self.removed.insert(key.to_string());
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,9 +123,7 @@ impl BitcodeStorage {
     pub fn new() -> Self {
         Self {
             providers: HashMap::new(),
-            max_bytes: crate::config::load_config()
-                .cache_max_bytes
-                .unwrap_or(DEFAULT_MAX_CACHE_BYTES),
+            max_bytes: configured_max_bytes(),
         }
     }
 
@@ -106,6 +145,12 @@ impl BitcodeStorage {
     }
 }
 
+pub(crate) fn configured_max_bytes() -> u64 {
+    crate::config::load_config()
+        .cache_max_bytes
+        .unwrap_or(DEFAULT_MAX_CACHE_BYTES)
+}
+
 /// Read one provider's file, quarantining anything unreadable.
 ///
 /// Never returns an empty cache while leaving a non-empty file in place: an
@@ -115,37 +160,50 @@ fn load_provider(provider: &str, max_bytes: u64) -> ProviderCache {
     let Some(path) = paths::bitcode_cache_file(provider) else {
         return ProviderCache::default();
     };
+    read_provider(&path, max_bytes, true).unwrap_or_else(|e| {
+        // Readable-but-not-read (permissions, I/O error). Leave it alone
+        // and run without a cache rather than replace what we can't see.
+        eprintln!("tku: cannot read {provider} cache ({e}); running without it this time");
+        ProviderCache::default()
+    })
+}
+
+/// [`load_provider`] for a known path. Errors when the file exists but could
+/// not be read, or is unusable and `quarantine_bad` is false; a missing, empty
+/// or quarantined file is an empty cache.
+pub(crate) fn read_provider(
+    path: &Path,
+    max_bytes: u64,
+    quarantine_bad: bool,
+) -> std::io::Result<ProviderCache> {
     // Pre-flight size check. `fs::read` allocates a Vec sized to the file, so
     // a runaway file would OOM the process before we could compact it. The
     // bound is absolute, not a multiple of the ceiling: lowering `cache_max_bytes`
     // must compact an existing store down, not refuse to open it.
-    if let Ok(meta) = fs::metadata(&path) {
+    if let Ok(meta) = fs::metadata(path) {
         if meta.len() > max_bytes.saturating_mul(2).max(ABSOLUTE_READ_LIMIT) {
-            quarantine(
-                &path,
-                &format!("{} bytes, over twice the ceiling", meta.len()),
-            );
-            return ProviderCache::default();
+            let why = format!("{} bytes, over twice the ceiling", meta.len());
+            if !quarantine_bad {
+                return Err(std::io::Error::other(why));
+            }
+            quarantine(path, &why);
+            return Ok(ProviderCache::default());
         }
     }
-    let data = match fs::read(&path) {
+    let data = match fs::read(path) {
         Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ProviderCache::default(),
-        Err(e) => {
-            // Readable-but-not-read (permissions, I/O error). Leave it alone
-            // and run without a cache rather than replace what we can't see.
-            eprintln!("tku: cannot read {provider} cache ({e}); running without it this time");
-            return ProviderCache::default();
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ProviderCache::default()),
+        Err(e) => return Err(e),
     };
     if data.is_empty() {
-        return ProviderCache::default();
+        return Ok(ProviderCache::default());
     }
     match decode_cache(&data) {
-        Some(pc) => pc,
+        Some(pc) => Ok(pc),
+        None if !quarantine_bad => Err(std::io::Error::other("unrecognized format")),
         None => {
-            quarantine(&path, "unrecognized format");
-            ProviderCache::default()
+            quarantine(path, "unrecognized format");
+            Ok(ProviderCache::default())
         }
     }
 }
@@ -172,6 +230,66 @@ fn quarantine(path: &Path, why: &str) {
 fn decode_cache(data: &[u8]) -> Option<ProviderCache> {
     let (version, cache): (u32, ProviderCache) = bitcode::deserialize(data).ok()?;
     (version == CACHE_FORMAT_VERSION).then_some(cache)
+}
+
+/// Fold `disk` into `mem`, where `changes` is what this process did to `mem`.
+///
+/// Removed keys are never taken from disk. A touched key keeps the in-memory
+/// entry unless the on-disk `mtime_secs` is newer. Every other key on disk
+/// replaces the in-memory entry, so another process's compaction or dedup
+/// survives; keys only in memory are kept. Recorded rekeys are replayed on
+/// entries taken from disk. With empty `changes`, `disk` wins every key it has.
+pub(crate) fn merge_from_disk(mem: &mut ProviderCache, disk: ProviderCache, changes: &Changes) {
+    let disk_keys: HashSet<String> = disk.files.keys().cloned().collect();
+    for (mut key, mut cf) in disk.files {
+        if changes.removed.contains(&key) {
+            continue;
+        }
+        for rekey in &changes.rekeys {
+            rekey_records(&mut cf.records, &rekey.old, &rekey.new);
+            if let Some((old_dir, new_dir)) = &rekey.dirs {
+                if let Some(to) = super::remap_path(&key, old_dir, new_dir) {
+                    // Same rule as `rekey_account`: an existing target keeps the source key.
+                    if !mem.files.contains_key(&to) && !disk_keys.contains(&to) {
+                        key = to;
+                    }
+                }
+            }
+        }
+        if changes.removed.contains(&key) {
+            continue;
+        }
+        if changes.touched.contains(&key)
+            && mem
+                .files
+                .get(&key)
+                .is_some_and(|m| m.mtime_secs >= cf.mtime_secs)
+        {
+            continue;
+        }
+        mem.files.insert(key, cf);
+    }
+}
+
+/// Retag the records of account `old` as `new`, including the account segment
+/// of aggregate message ids. Returns whether any record changed.
+fn rekey_records(records: &mut [UsageRecord], old: &str, new: &str) -> bool {
+    let agg_prefix = format!("{AGG_MARKER}:");
+    let mut changed = false;
+    for r in records {
+        if r.account_uuid.as_deref() != Some(old) {
+            continue;
+        }
+        if r.message_id.starts_with(&agg_prefix) {
+            let suffix = format!(":{old}:{}", r.fast_mode);
+            if let Some(head) = r.message_id.strip_suffix(&suffix) {
+                r.message_id = format!("{head}:{new}:{}", r.fast_mode);
+            }
+        }
+        r.account_uuid = Some(new.to_string());
+        changed = true;
+    }
+    changed
 }
 
 /// Collapse every record in `cf` to one per `(day, model, account, fast_mode)`
@@ -277,7 +395,11 @@ fn compact(pc: &mut ProviderCache, cutoff: DateTime<Utc>) -> bool {
 /// compaction step — the caller writes it regardless. Dropping records to hit a
 /// size target would delete history that no longer exists anywhere else, so the
 /// ceiling yields rather than the archive.
-fn serialize_within(pc: &mut ProviderCache, max_bytes: u64, provider: &str) -> Option<Vec<u8>> {
+pub(crate) fn serialize_within(
+    pc: &mut ProviderCache,
+    max_bytes: u64,
+    provider: &str,
+) -> Option<Vec<u8>> {
     let mut data = serialize(pc, provider)?;
     if data.len() as u64 <= max_bytes {
         return Some(data);
@@ -307,67 +429,16 @@ fn serialize_within(pc: &mut ProviderCache, max_bytes: u64, provider: &str) -> O
             return Some(data);
         }
     }
-    // Last resort, and the only eviction that actually shrinks anything:
-    // see `evict_oldest_orphans`.
-    let dropped = evict_oldest_orphans(pc, max_bytes, provider)?;
-    data = serialize(pc, provider)?;
     let config = paths::config_file()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "config.toml".into());
-    if data.len() as u64 <= max_bytes {
-        eprintln!(
-            "tku: {provider} cache still over the {} ceiling after compaction; \
-             dropped the {dropped} oldest sessions whose transcripts are already gone ({}). \
-             That history is not recoverable — raise cache_max_bytes in {config} to stop this.",
-            human(max_bytes),
-            human(data.len() as u64)
-        );
-    } else {
-        eprintln!(
-            "tku: {provider} cache is {} and cannot be brought under the {} ceiling: \
-             the transcripts still on disk alone exceed it. Writing it anyway rather than \
-             deleting records that are still readable. Raise cache_max_bytes in {config}.",
-            human(data.len() as u64),
-            human(max_bytes)
-        );
-    }
+    eprintln!(
+        "tku: {provider} cache is {} and compaction could not get it under the {} ceiling. \
+         Writing it as is; no records were dropped. Raise cache_max_bytes in {config}.",
+        human(data.len() as u64),
+        human(max_bytes)
+    );
     Some(data)
-}
-
-/// Drop whole files, oldest source mtime first, until the payload fits —
-/// considering only entries whose source transcript no longer exists.
-///
-/// Evicting an entry whose file is still on disk frees nothing: the next run
-/// re-parses and re-inserts it, so the cache oscillates at the same size while
-/// paying the parse each time. Orphans are the only entries that stay gone,
-/// which also makes them the only ones whose loss is permanent — hence last
-/// resort, after every compaction step, and loudly.
-fn evict_oldest_orphans(pc: &mut ProviderCache, max_bytes: u64, provider: &str) -> Option<usize> {
-    let mut by_age: Vec<(i64, String)> = pc
-        .files
-        .iter()
-        .filter(|(k, _)| !Path::new(k.as_str()).exists())
-        .map(|(k, cf)| (cf.mtime_secs, k.clone()))
-        .collect();
-    if by_age.is_empty() {
-        return Some(0);
-    }
-    by_age.sort_unstable();
-
-    // Re-serialize in batches rather than per file: the goal is to get back
-    // under a ceiling already blown, not to find the minimal cut.
-    let batch = (by_age.len() / 20).max(1);
-    let mut dropped = 0;
-    for chunk in by_age.chunks(batch) {
-        for (_, key) in chunk {
-            pc.files.remove(key);
-            dropped += 1;
-        }
-        if serialize(pc, provider)?.len() as u64 <= max_bytes {
-            break;
-        }
-    }
-    Some(dropped)
 }
 
 fn serialize(pc: &ProviderCache, provider: &str) -> Option<Vec<u8>> {
@@ -380,9 +451,83 @@ fn serialize(pc: &ProviderCache, provider: &str) -> Option<Vec<u8>> {
     }
 }
 
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     format!("{:.1} MiB", bytes as f64 / MIB)
+}
+
+/// Take the store lock beside `path`, waiting up to [`STORE_LOCK_WAIT`].
+/// `None` (after a warning) when it could not be taken.
+pub(crate) fn lock_store(path: &Path, provider: &str) -> Option<StoreLock> {
+    let dir = path.parent()?;
+    if let Err(e) = fs::create_dir_all(dir) {
+        eprintln!("tku: failed to create {}: {e}", dir.display());
+        return None;
+    }
+    let lock_path = dir.join(".store.lock");
+    match StoreLock::acquire_wait(&lock_path, STORE_LOCK_WAIT) {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            eprintln!(
+                "tku: another tku process held the store lock for {}s; {provider} cache not saved this run",
+                STORE_LOCK_WAIT.as_secs()
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "tku: cannot lock {} ({e}); {provider} cache not saved this run",
+                lock_path.display()
+            );
+            None
+        }
+    }
+}
+
+/// `flock` on the store's lock file, released by the kernel when the file is
+/// closed, including on crash, so a dead holder never leaves it stale.
+pub(crate) struct StoreLock {
+    _file: fs::File,
+}
+
+impl StoreLock {
+    /// `Ok(None)` when another process still holds it after `wait`.
+    fn acquire_wait(path: &Path, wait: std::time::Duration) -> std::io::Result<Option<Self>> {
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let file = opts.open(path)?;
+        let started = std::time::Instant::now();
+        loop {
+            if try_flock(&file)? {
+                return Ok(Some(Self { _file: file }));
+            }
+            if started.elapsed() >= wait {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn try_flock(file: &fs::File) -> std::io::Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `flock` only operates on the descriptor, which `file` keeps open.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EWOULDBLOCK) | Some(libc::EINTR) => Ok(false),
+        _ => Err(e),
+    }
+}
+
+#[cfg(not(unix))]
+fn try_flock(_file: &fs::File) -> std::io::Result<bool> {
+    Ok(true)
 }
 
 impl Storage for BitcodeStorage {
@@ -404,6 +549,7 @@ impl Storage for BitcodeStorage {
     ) {
         let pc = self.provider_cache(provider);
         let key = file_path.to_string_lossy().to_string();
+        pc.changes.touch(&key);
         pc.files.insert(
             key,
             CachedFile {
@@ -428,7 +574,14 @@ impl Storage for BitcodeStorage {
             .filter(|(k, _)| !known.contains(*k))
             .map(|(_, cf)| cf.records.len())
             .sum();
-        pc.files.retain(|k, _| known.contains(k));
+        let changes = &mut pc.changes;
+        pc.files.retain(|k, _| {
+            let keep = known.contains(k);
+            if !keep {
+                changes.remove(k);
+            }
+            keep
+        });
         if pc.files.len() != before {
             eprintln!(
                 "tku: --prune deleted {} {provider} records from {} source files that no longer exist. \
@@ -444,41 +597,50 @@ impl Storage for BitcodeStorage {
         if !self.providers.values().any(|pc| pc.dirty) {
             return true;
         }
-        let Some(dir) = paths::cache_dir() else {
-            return false;
-        };
-        if let Err(e) = fs::create_dir_all(&dir) {
-            eprintln!("tku: failed to create cache dir: {e}");
-            return false;
-        }
-
         let max_bytes = self.max_bytes;
         let mut ok = true;
         for (name, pc) in &mut self.providers {
             if !pc.dirty {
                 continue;
             }
-            let Some(data) = serialize_within(pc, max_bytes, name) else {
+            let Some(path) = paths::bitcode_cache_file(name) else {
                 ok = false;
                 continue;
             };
-            let Some(path) = paths::bitcode_cache_file(name) else {
+            let Some(_lock) = lock_store(&path, name) else {
+                ok = false;
+                continue;
+            };
+            let disk = match read_provider(&path, max_bytes, false) {
+                Ok(disk) => disk,
+                Err(e) => {
+                    eprintln!("tku: cannot read {name} cache ({e}); not overwriting it");
+                    ok = false;
+                    continue;
+                }
+            };
+            let changes = std::mem::take(&mut pc.changes);
+            merge_from_disk(pc, disk, &changes);
+            let Some(data) = serialize_within(pc, max_bytes, name) else {
+                pc.changes = changes;
                 ok = false;
                 continue;
             };
             if let Err(e) = atomic_write(&path, &data, None) {
                 eprintln!("tku: failed to write {name} cache: {e}");
+                pc.changes = changes;
                 ok = false;
                 continue;
             }
+            pc.dirty = false;
             // Only the approaching-the-ceiling case: once it is actually
             // exceeded, `serialize_within` has already said what it did.
             let used = data.len() as u64;
             if used <= max_bytes && used as f64 >= max_bytes as f64 * WARN_FRACTION {
                 eprintln!(
                     "tku: {name} cache at {:.0}% of the {} ceiling ({}). \
-                     Records older than 180 days will be compacted to daily totals when it fills; \
-                     raise cache_max_bytes to keep full detail.",
+                     Past the ceiling, records older than 180 days are compacted to daily totals \
+                     (totals are kept, intra-day detail is not); raise cache_max_bytes to keep full detail.",
                     used as f64 / max_bytes as f64 * 100.0,
                     human(max_bytes),
                     human(used)
@@ -489,6 +651,10 @@ impl Storage for BitcodeStorage {
     }
 
     fn drain_all(&mut self) -> Vec<UsageRecord> {
+        // A provider whose transcripts are all gone is never loaded by `is_cached`.
+        for p in Provider::iter() {
+            self.provider_cache(p.as_str());
+        }
         let mut all = Vec::new();
         for (_, mut pc) in self.providers.drain() {
             for (_, cf) in pc.files.drain() {
@@ -506,21 +672,8 @@ impl Storage for BitcodeStorage {
         new_dir: Option<&Path>,
     ) {
         let pc = self.provider_cache(Provider::Claude.as_str());
-        let mut changed = false;
-
-        let agg_prefix = format!("{AGG_MARKER}:");
-        for r in pc.files.values_mut().flat_map(|cf| &mut cf.records) {
-            if r.account_uuid.as_deref() != Some(old) {
-                continue;
-            }
-            if r.message_id.starts_with(&agg_prefix) {
-                let suffix = format!(":{old}:{}", r.fast_mode);
-                if let Some(head) = r.message_id.strip_suffix(&suffix) {
-                    r.message_id = format!("{head}:{new}:{}", r.fast_mode);
-                }
-            }
-            r.account_uuid = Some(new.to_string());
-            changed = true;
+        for cf in pc.files.values_mut() {
+            rekey_records(&mut cf.records, old, new);
         }
 
         if let (Some(old_dir), Some(new_dir)) = (old_dir, new_dir) {
@@ -535,15 +688,21 @@ impl Storage for BitcodeStorage {
                     continue;
                 }
                 if let Some(cf) = pc.files.remove(&from) {
+                    pc.changes.remove(&from);
+                    pc.changes.touch(&to);
                     pc.files.insert(to, cf);
-                    changed = true;
                 }
             }
         }
-
-        if changed {
-            pc.dirty = true;
-        }
+        pc.changes.rekeys.push(Rekey {
+            old: old.to_string(),
+            new: new.to_string(),
+            dirs: old_dir
+                .zip(new_dir)
+                .map(|(o, n)| (o.to_path_buf(), n.to_path_buf())),
+        });
+        // Dirty even when nothing changed here, so the flush replays the rekey on disk entries.
+        pc.dirty = true;
     }
 }
 
@@ -672,6 +831,38 @@ mod tests {
             .map(|r| r.output_tokens)
             .sum();
         assert_eq!(total, 14, "the shared record must be counted once");
+    }
+
+    #[test]
+    fn over_ceiling_orphans_are_written_whole() {
+        let mut pc = ProviderCache::default();
+        for f in 0..5 {
+            let records = (1..=20)
+                .map(|d| rec(&format!("2020-01-{d:02}T01:00:00Z"), "opus", f * 100 + d))
+                .collect();
+            pc.files
+                .insert(format!("/nonexistent/tku-test/{f}.jsonl"), file(records));
+        }
+        let keys: HashSet<String> = pc.files.keys().cloned().collect();
+        let sum = |pc: &ProviderCache| -> (u64, u64) {
+            pc.files
+                .values()
+                .flat_map(|cf| &cf.records)
+                .fold((0, 0), |(i, o), r| {
+                    (i + r.input_tokens, o + r.output_tokens)
+                })
+        };
+        let before = sum(&pc);
+
+        let data = serialize_within(&mut pc, 64, "claude").unwrap();
+        assert!(
+            data.len() > 64,
+            "compacted payload must still exceed the ceiling"
+        );
+
+        let decoded = decode_cache(&data).unwrap();
+        assert_eq!(decoded.files.keys().cloned().collect::<HashSet<_>>(), keys);
+        assert_eq!(sum(&decoded), before);
     }
 
     #[test]
@@ -840,5 +1031,242 @@ mod tests {
                 ]
             );
         });
+    }
+
+    /// An instance whose claude cache has been read from disk.
+    fn loaded() -> BitcodeStorage {
+        let mut storage = BitcodeStorage::new();
+        storage.provider_cache("claude");
+        storage
+    }
+
+    fn insert_at(storage: &mut BitcodeStorage, key: &str, mtime: i64, records: Vec<UsageRecord>) {
+        storage.insert("claude", Path::new(key), mtime, 0, records);
+    }
+
+    fn sorted_keys(storage: &mut BitcodeStorage) -> Vec<String> {
+        let mut keys: Vec<String> = storage
+            .provider_cache("claude")
+            .files
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn store_lock_excludes_a_second_holder_until_dropped() {
+        let dir = std::env::temp_dir().join(format!("tku-store-lock-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".store.lock");
+        let wait = std::time::Duration::ZERO;
+
+        let first = StoreLock::acquire_wait(&path, wait).unwrap();
+        assert!(first.is_some());
+        assert!(StoreLock::acquire_wait(&path, wait).unwrap().is_none());
+        drop(first);
+        assert!(StoreLock::acquire_wait(&path, wait).unwrap().is_some());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flush_keeps_inserts_from_both_instances() {
+        super::super::with_scratch_home("bitcode-merge-both", || {
+            let mut a = loaded();
+            let mut b = loaded();
+            insert_at(
+                &mut a,
+                "/a.jsonl",
+                1,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 1)],
+            );
+            insert_at(
+                &mut b,
+                "/b.jsonl",
+                1,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 2)],
+            );
+            assert!(a.flush());
+            assert!(b.flush());
+
+            assert_eq!(sorted_keys(&mut loaded()), ["/a.jsonl", "/b.jsonl"]);
+        });
+    }
+
+    #[test]
+    fn flush_does_not_resurrect_a_pruned_key() {
+        super::super::with_scratch_home("bitcode-merge-prune", || {
+            let mut seed = loaded();
+            insert_at(
+                &mut seed,
+                "/gone.jsonl",
+                1,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 1)],
+            );
+            insert_at(
+                &mut seed,
+                "/kept.jsonl",
+                1,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 2)],
+            );
+            assert!(seed.flush());
+
+            let mut a = loaded();
+            let mut b = loaded();
+            insert_at(
+                &mut b,
+                "/new.jsonl",
+                1,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 3)],
+            );
+            assert!(b.flush());
+            a.prune("claude", &[PathBuf::from("/kept.jsonl")]);
+            assert!(a.flush());
+
+            assert_eq!(sorted_keys(&mut loaded()), ["/kept.jsonl", "/new.jsonl"]);
+        });
+    }
+
+    #[test]
+    fn flush_takes_a_newer_on_disk_entry_over_a_touched_one() {
+        super::super::with_scratch_home("bitcode-merge-mtime", || {
+            let mut a = loaded();
+            let mut b = loaded();
+            insert_at(
+                &mut a,
+                "/newer-on-disk.jsonl",
+                10,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 1)],
+            );
+            insert_at(
+                &mut a,
+                "/older-on-disk.jsonl",
+                10,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 1)],
+            );
+            insert_at(
+                &mut b,
+                "/newer-on-disk.jsonl",
+                20,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 2)],
+            );
+            insert_at(
+                &mut b,
+                "/older-on-disk.jsonl",
+                5,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 2)],
+            );
+            assert!(b.flush());
+            assert!(a.flush());
+
+            let mut c = loaded();
+            let files = &c.provider_cache("claude").files;
+            assert_eq!(files["/newer-on-disk.jsonl"].mtime_secs, 20);
+            assert_eq!(files["/newer-on-disk.jsonl"].records[0].output_tokens, 2);
+            assert_eq!(files["/older-on-disk.jsonl"].mtime_secs, 10);
+            assert_eq!(files["/older-on-disk.jsonl"].records[0].output_tokens, 1);
+        });
+    }
+
+    #[test]
+    fn flush_keeps_another_instances_compaction() {
+        super::super::with_scratch_home("bitcode-merge-compact", || {
+            let mut seed = loaded();
+            insert_at(
+                &mut seed,
+                "/x.jsonl",
+                1,
+                vec![
+                    rec("2020-01-01T01:00:00Z", "opus", 1),
+                    rec("2020-01-01T02:00:00Z", "opus", 2),
+                ],
+            );
+            assert!(seed.flush());
+
+            let mut a = loaded();
+            let mut b = loaded();
+            a.max_bytes = 64;
+            a.provider_cache("claude").dirty = true;
+            assert!(a.flush());
+            insert_at(
+                &mut b,
+                "/y.jsonl",
+                1,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 3)],
+            );
+            assert!(b.flush());
+
+            let x = records_of(&mut loaded(), "/x.jsonl");
+            assert_eq!(x.len(), 1);
+            assert_eq!(x[0].output_tokens, 3);
+            assert!(x[0].message_id.starts_with(AGG_MARKER));
+        });
+    }
+
+    #[test]
+    fn flush_replays_rekeys_on_entries_from_disk() {
+        super::super::with_scratch_home("bitcode-merge-rekey", || {
+            let mut seed = loaded();
+            insert_at(
+                &mut seed,
+                "/old/proj/a.jsonl",
+                1,
+                vec![tagged("2020-01-01T01:00:00Z", 1, Some("old"))],
+            );
+            assert!(seed.flush());
+
+            let mut a = loaded();
+            let mut b = loaded();
+            insert_at(
+                &mut b,
+                "/old/proj/b.jsonl",
+                1,
+                vec![tagged("2020-01-01T01:00:00Z", 2, Some("old"))],
+            );
+            assert!(b.flush());
+            a.rekey_account(
+                "old",
+                "new",
+                Some(Path::new("/old")),
+                Some(Path::new("/new")),
+            );
+            assert!(a.flush());
+
+            let mut c = loaded();
+            assert_eq!(
+                sorted_keys(&mut c),
+                ["/new/proj/a.jsonl", "/new/proj/b.jsonl"]
+            );
+            for cf in c.provider_cache("claude").files.values() {
+                for r in &cf.records {
+                    assert_eq!(r.account_uuid.as_deref(), Some("new"));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn merge_with_no_changes_lets_disk_win() {
+        let mut mem = ProviderCache::default();
+        mem.files.insert(
+            "/both.jsonl".into(),
+            file(vec![rec("2020-01-01T01:00:00Z", "opus", 1)]),
+        );
+        mem.files.insert("/mem.jsonl".into(), file(vec![]));
+        let mut disk = ProviderCache::default();
+        disk.files.insert(
+            "/both.jsonl".into(),
+            file(vec![rec("2020-01-01T01:00:00Z", "opus", 2)]),
+        );
+        disk.files.insert("/disk.jsonl".into(), file(vec![]));
+
+        merge_from_disk(&mut mem, disk, &Changes::default());
+
+        let mut keys: Vec<&str> = mem.files.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["/both.jsonl", "/disk.jsonl", "/mem.jsonl"]);
+        assert_eq!(mem.files["/both.jsonl"].records[0].output_tokens, 2);
     }
 }

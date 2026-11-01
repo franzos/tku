@@ -1,6 +1,7 @@
 pub mod bitcode_store;
 #[cfg(feature = "sqlite")]
 pub mod import;
+pub mod relocate;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_store;
 

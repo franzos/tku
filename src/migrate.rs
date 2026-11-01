@@ -2,7 +2,7 @@
 //! through here so the user always sees what is running, what it waits on and
 //! how it ended.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 
@@ -19,7 +19,10 @@ pub struct Migration {
 }
 
 /// In order; a failed upgrade stops the ones after it.
-const MIGRATIONS: &[Migration] = &[crate::accounts::ACCOUNT_IDS];
+pub(crate) const MIGRATIONS: &[Migration] = &[
+    crate::storage::relocate::RELOCATE,
+    crate::accounts::ACCOUNT_IDS,
+];
 
 const LOCK_WAIT: Duration = Duration::from_secs(30);
 
@@ -57,22 +60,16 @@ pub(crate) fn run_all(migrations: &[Migration], wait: Duration, progress: &Progr
 fn acquire(wait: Duration, progress: &Progress) -> Result<SpawnLock> {
     // Dot prefix: account names cannot start with '.', so no `account exec` lock collides.
     let path = private_spawn_dir()?.join(".migrate.lock");
-    let started = Instant::now();
-    loop {
-        if let Some(lock) = SpawnLock::acquire(&path)? {
-            return Ok(lock);
-        }
-        let waited = started.elapsed();
-        if waited >= wait {
-            return Err(anyhow!(
-                "another tku process held the upgrade lock for {}s",
-                wait.as_secs()
-            ));
-        }
+    SpawnLock::acquire_wait(&path, wait, |waited| {
         progress.show(format_args!(
             "Waiting for another tku process to finish the upgrade... {}s",
             waited.as_secs()
         ));
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    })?
+    .ok_or_else(|| {
+        anyhow!(
+            "another tku process held the upgrade lock for {}s",
+            wait.as_secs()
+        )
+    })
 }

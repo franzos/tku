@@ -2156,6 +2156,7 @@ mod tests {
             Utc::now().timestamp_nanos_opt().unwrap()
         ));
         fs::create_dir_all(dir.join("cache")).unwrap();
+        fs::create_dir_all(dir.join("data")).unwrap();
         let home = paths::TestHome::set(&dir);
         (dir, home)
     }
@@ -2330,11 +2331,15 @@ mod tests {
         let snapshots = paths::subscription_snapshot_file(TOOL_CLAUDE).unwrap();
         let data = r#"{"version":2,"accounts":{"org-1":{"snapshots":[]}}}"#;
         fs::write(&snapshots, data).unwrap();
-        let cache = paths::cache_dir().unwrap();
-        fs::set_permissions(&cache, fs::Permissions::from_mode(0o500)).unwrap();
+        let dirs = [paths::cache_dir().unwrap(), paths::data_dir().unwrap()];
+        for d in &dirs {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o500)).unwrap();
+        }
 
         rekey(&mut registry, &mut store, "org-1", "acct-1@org-1");
-        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+        for d in &dirs {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o700)).unwrap();
+        }
 
         assert_eq!(fs::read_to_string(&snapshots).unwrap(), data);
         assert_eq!(registry.accounts[0].id, "acct-1@org-1");
@@ -2721,10 +2726,10 @@ mod tests {
         let file = seed_migration(1);
         let target = moved(&file, "org-1", "acct-1@org-1");
 
-        let cache = paths::cache_dir().unwrap();
-        fs::set_permissions(&cache, fs::Permissions::from_mode(0o500)).unwrap();
+        let data = paths::data_dir().unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o500)).unwrap();
         migrate_to_account_ids();
-        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
 
         let (version, accounts, _) = registry_ids();
         assert_eq!(
