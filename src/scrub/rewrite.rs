@@ -154,6 +154,32 @@ fn verify_absence(v: &Value, m: &Matcher) -> Result<()> {
     }
 }
 
+/// Assert no secret survives in `input`, raw or in any decoded string leaf.
+///
+/// For a file the scan flagged but the sweep left alone: a value spelled with
+/// an escape the matcher has no form for (`\u0063`, `\/`) never matches raw.
+pub fn assert_absent(input: &str, m: &Matcher, jsonl: bool) -> Result<()> {
+    let check = |text: &str| -> Result<()> {
+        match serde_json::from_str::<Value>(text) {
+            Ok(v) => verify_absence(&v, m),
+            Err(_) => match m.survivors(text) {
+                Some(found) => bail!("secret survived (len {})", found.len()),
+                None => Ok(()),
+            },
+        }
+    };
+    if !jsonl {
+        return check(input)
+            .map_err(|e| anyhow::anyhow!("{e}, in an encoding the sweep cannot match"));
+    }
+    for (i, line) in input.lines().enumerate() {
+        check(line).map_err(|e| {
+            anyhow::anyhow!("line {}: {e}, in an encoding the sweep cannot match", i + 1)
+        })?;
+    }
+    Ok(())
+}
+
 /// Rewrite `input`, returning `None` when nothing matched.
 ///
 /// On `Err` the caller must leave the file untouched.
@@ -305,6 +331,17 @@ mod tests {
         let m = matcher(&[("aws-access-key-id", secret, "deadbeef")]);
         let err = rewrite_text(line, &m, true).unwrap_err().to_string();
         assert!(err.contains("survived"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn an_escaped_only_survivor_is_caught_without_a_raw_match() {
+        let secret = concat!("AKIAQN", "PYDW3K2LMNOPQR");
+        let line = r#"{"b":"\u0041KIAQNPYDW3K2LMNOPQR"}"#;
+        let m = matcher(&[("aws-access-key-id", secret, "deadbeef")]);
+        assert!(rewrite_text(line, &m, true).unwrap().is_none());
+        let err = assert_absent(line, &m, true).unwrap_err().to_string();
+        assert!(err.contains("survived"), "unexpected error: {err}");
+        assert!(assert_absent(r#"{"b":"clean"}"#, &m, true).is_ok());
     }
 
     #[test]

@@ -776,6 +776,7 @@ pub fn run(opts: &Options, state: &ScrubState, progress: Option<Progress>) -> Re
         })
         .collect();
 
+    let flagged: Vec<bool> = scans.iter().map(|s| !s.values.is_empty()).collect();
     let allowed = state.allowed_set();
     let mut stats: BTreeMap<String, ValueStat> = BTreeMap::new();
     let mut raw_sites: HashMap<String, Vec<RawSite>> = HashMap::new();
@@ -872,8 +873,12 @@ pub fn run(opts: &Options, state: &ScrubState, progress: Option<Progress>) -> Re
         let written = AtomicUsize::new(0);
         let results: Vec<(PathBuf, Result<bool>)> = files
             .par_iter()
-            .map(|f| {
-                let out = (f.path.clone(), rewrite_file(f, &matcher, opts.stale_after));
+            .zip(flagged.par_iter())
+            .map(|(f, &flagged)| {
+                let out = (
+                    f.path.clone(),
+                    rewrite_file(f, &matcher, opts.stale_after, flagged),
+                );
                 if let Some(cb) = progress {
                     let n = written.fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_multiple_of(PROGRESS_EVERY) || n == total {
@@ -917,8 +922,14 @@ pub fn run(opts: &Options, state: &ScrubState, progress: Option<Progress>) -> Re
     Ok(outcome)
 }
 
-/// Returns true when the file was rewritten.
-fn rewrite_file(file: &ScrubFile, matcher: &Matcher, stale_after: Duration) -> Result<bool> {
+/// Returns true when the file was rewritten. `flagged` marks a file the scan
+/// found a value in, which a no-op sweep must then prove is gone.
+fn rewrite_file(
+    file: &ScrubFile,
+    matcher: &Matcher,
+    stale_after: Duration,
+    flagged: bool,
+) -> Result<bool> {
     let data = match std::fs::read_to_string(&file.path) {
         Ok(d) => d,
         // Already counted as unreadable during the scan; reporting it again as
@@ -928,6 +939,9 @@ fn rewrite_file(file: &ScrubFile, matcher: &Matcher, stale_after: Duration) -> R
     };
     let jsonl = matches!(file.kind, TargetKind::Jsonl);
     let Some(out) = rewrite::rewrite_text(&data, matcher, jsonl)? else {
+        if flagged {
+            rewrite::assert_absent(&data, matcher, jsonl)?;
+        }
         return Ok(false);
     };
 
@@ -1079,7 +1093,7 @@ mod tests {
         }];
         let matcher = Matcher::new(&secrets).unwrap();
 
-        assert!(rewrite_file(&file, &matcher, Duration::from_secs(0)).is_err());
+        assert!(rewrite_file(&file, &matcher, Duration::from_secs(0), true).is_err());
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(after.contains(KEY), "file must be left untouched");
         assert!(after.contains("\"b\":2"));
@@ -1410,7 +1424,7 @@ mod tests {
         }])
         .unwrap();
 
-        assert!(!rewrite_file(&file, &matcher, Duration::from_secs(0)).unwrap());
+        assert!(!rewrite_file(&file, &matcher, Duration::from_secs(0), true).unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1449,7 +1463,7 @@ mod tests {
             fp: "a3f91c04".to_string(),
         }])
         .unwrap();
-        assert!(rewrite_file(&d.files[0], &matcher, Duration::from_secs(0)).unwrap());
+        assert!(rewrite_file(&d.files[0], &matcher, Duration::from_secs(0), true).unwrap());
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(!after.contains(KEY));
