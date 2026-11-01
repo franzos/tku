@@ -1,3 +1,17 @@
+## [0.1.29] - 2026-11-01
+
+### Added
+- `tku cache ingest` for a Claude Code `SessionEnd` hook
+
+### Changed
+- Usage archive and snapshots moved from the cache dir to the data dir
+- Over the size ceiling, the store compacts and never drops records
+- Concurrent runs merge the store instead of overwriting each other
+
+### Fixed
+- Records of providers with no transcripts left were missing from reports
+- Scrub missed secrets written with JSON escapes
+
 ## [0.1.28] - 2026-10-19
 
 ### Changed
