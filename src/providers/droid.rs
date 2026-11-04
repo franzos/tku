@@ -181,5 +181,6 @@ fn parse_settings_file(path: &Path) -> Vec<UsageRecord> {
         cache_read_input_tokens: cache_read,
         fast_mode: false,
         account_uuid: None,
+        aggregate: false,
     }]
 }

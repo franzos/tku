@@ -1,9 +1,13 @@
 pub mod bitcode_store;
+mod format;
 #[cfg(feature = "sqlite")]
 pub mod import;
+mod legacy;
 pub mod relocate;
+mod rollup;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_store;
+pub mod upgrade;
 
 use std::path::{Path, PathBuf};
 
@@ -37,8 +41,13 @@ pub trait Storage {
 
     /// Persist any pending changes to disk. No-op if nothing changed.
     /// Takes `&mut self` so a backend can compact before writing.
+    /// A backend may defer changes that are safe to redo from source, such as
+    /// inserts of live files; those stay pending and are not a failure.
     /// Returns false when a pending change could not be persisted.
     fn flush(&mut self) -> bool;
+
+    /// Make every later `flush` write all pending changes, deferred ones included.
+    fn force_write(&mut self) {}
 
     /// Move all cached records out of the store. Call after flush().
     fn drain_all(&mut self) -> Vec<UsageRecord>;
@@ -63,13 +72,10 @@ fn remap_path(path: &str, old_dir: &Path, new_dir: &Path) -> Option<String> {
     Some(new_dir.join(rest).to_string_lossy().into_owned())
 }
 
-/// Run `f` with `TKU_HOME` and `XDG_RUNTIME_DIR` pointing at a fresh scratch
-/// dir, so a store under test never loads or writes the real cache.
+/// Run `f` under a [`crate::paths::TestHome`] on a fresh scratch dir, so a
+/// store under test never loads or writes the real cache or walks real transcripts.
 #[cfg(test)]
-fn with_scratch_home<R>(tag: &str, f: impl FnOnce() -> R) -> R {
-    let _guard = crate::paths::ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+pub(crate) fn with_scratch_home<R>(tag: &str, f: impl FnOnce() -> R) -> R {
     let dir = std::env::temp_dir().join(format!(
         "tku-storage-test-{tag}-{}-{}",
         std::process::id(),
@@ -79,17 +85,11 @@ fn with_scratch_home<R>(tag: &str, f: impl FnOnce() -> R) -> R {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let prev_runtime = std::env::var_os("XDG_RUNTIME_DIR");
-    std::env::set_var("TKU_HOME", &dir);
-    std::env::set_var("XDG_RUNTIME_DIR", &dir);
+    let home = crate::paths::TestHome::set(&dir);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
-    std::env::remove_var("TKU_HOME");
-    match prev_runtime {
-        Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
-        None => std::env::remove_var("XDG_RUNTIME_DIR"),
-    }
+    drop(home);
     let _ = std::fs::remove_dir_all(&dir);
     result.unwrap_or_else(|e| std::panic::resume_unwind(e))
 }

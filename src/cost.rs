@@ -109,6 +109,7 @@ mod tests {
             cache_read_input_tokens: 0,
             fast_mode: false,
             account_uuid: None,
+            aggregate: false,
         }
     }
 

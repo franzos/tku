@@ -84,9 +84,11 @@ fn scan_and_filter(
 ) -> Vec<crate::types::UsageRecord> {
     let mut store = crate::storage::default_storage();
 
-    for provider in crate::providers::all_providers() {
-        provider.discover_and_parse(store.as_mut(), None, cli.prune);
-    }
+    crate::providers::scan_all(
+        store.as_mut(),
+        &crate::progress::Progress::new(false),
+        cli.prune,
+    );
 
     store.flush();
     let all_records = store.drain_all();

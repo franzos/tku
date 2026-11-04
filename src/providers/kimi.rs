@@ -177,5 +177,6 @@ fn extract_record(
         cache_read_input_tokens: cache_read,
         fast_mode: false,
         account_uuid: None,
+        aggregate: false,
     })
 }

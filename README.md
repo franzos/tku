@@ -450,7 +450,13 @@ tku caches parsed session data so repeated runs skip unchanged files. Two backen
 
 The cache is also the only long-term record of your usage. Coding tools delete their own transcripts — Claude Code drops sessions older than `cleanupPeriodDays` (30 by default) — so cached records routinely outlive the file they came from. Nothing removes them on its own: a source file disappearing leaves its records in place, and an unreadable or unrecognized cache file is renamed to `*.quarantine-<timestamp>` rather than overwritten.
 
-Only `--prune` deletes records, explicitly and permanently. `cache_max_bytes` triggers compaction: once the cache exceeds it, tku drops duplicate records that reporting would have discarded anyway, then collapses sessions older than 180, 90, and finally 30 days into one record per day, model and account. Day-level totals are unaffected, intra-day detail is not. A cache that is still over the ceiling after that is written as is, with a warning. Every run warns once the cache passes 85% of the ceiling.
+Only `--prune` deletes records, explicitly and permanently. Session files untouched for `rollup_after_days` (180 by default) are collapsed into one record per session, day, project, model and account, which keeps startup time roughly flat as history grows. Day-level totals and costs are unaffected; intra-day detail is not, so `model-burn` active-time figures for that older history are approximate. A message copied into several files (resumed or forked sessions, subagent copies) is counted once. `cache_max_bytes` is the backstop: past it, tku rolls up files older than 180, 90, and finally 30 days, and a cache still over the ceiling after that is written as is, with a warning. Every run warns once the cache passes 85% of the ceiling.
+
+Claude Code writes one line per content block of a reply, and only the last carries the final output count. tku keeps the most complete copy of each message.
+
+A store written by an older tku is upgraded on the first run, with progress and a result line. The old file is kept beside it as `claude.bin.legacy` (`records.db.legacy` for sqlite); delete it once you're happy with the numbers. An older binary that meets an upgraded store sets it aside rather than overwriting it, and the next run of a current one folds it back in.
+
+During an active session, runs that only see live transcripts (modified in the last five minutes) don't rewrite the store; those files are re-read next time anyway.
 
 ### Ingesting on session end
 
@@ -504,7 +510,7 @@ cargo build --release --features sqlite
 
 It reads `records.db` in the data dir (`--db <file>` reads another one) read-only, writes into the bitcode store in the same dir whichever backend the build defaults to, and leaves alone any path the bitcode store already knows. Afterwards the normal build picks the records up.
 
-A sqlite build also recreates its database when it finds an older schema. It copies the old one to `records.db.quarantine-<timestamp>` first and prints the import command for it.
+A sqlite build upgrades a version 4 database in place. One older than that is recreated: it copies the old one to `records.db.quarantine-<timestamp>` first and prints the import command for it.
 
 ### Comparison
 
@@ -526,6 +532,7 @@ Optional config file at `~/.config/tku/config.toml`:
 pricing_source = "litellm"  # litellm | openrouter | llmprices
 currency = "EUR"             # any ISO 4217 code
 cache_max_bytes = 536870912  # ceiling per provider cache file (default 512 MiB)
+rollup_after_days = 180      # collapse session files older than this into daily totals
 
 [spawn]
 ephemeral = false            # default dir mode for `account exec` (see Accounts)

@@ -79,6 +79,7 @@ impl std::str::FromStr for Provider {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct UsageRecord {
     pub provider: Provider,
     pub session_id: String,
@@ -108,6 +109,39 @@ pub struct UsageRecord {
     /// switch log when this is None.
     #[serde(default)]
     pub account_uuid: Option<String>,
+    /// A rollup of several messages, whose `message_id` is [`aggregate_id`].
+    /// Skipped by serde so the legacy positional bitcode shape is unchanged.
+    #[serde(skip)]
+    pub aggregate: bool,
+}
+
+/// The `request_id` of every aggregate.
+pub(crate) const AGG_MARKER: &str = "tku-agg";
+
+/// Message id of the aggregate for `r`'s (session, UTC day, project, model,
+/// account, fast mode).
+pub fn aggregate_id(r: &UsageRecord) -> String {
+    format!(
+        "{AGG_MARKER}:{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        r.session_id,
+        r.timestamp.date_naive(),
+        r.project,
+        r.model,
+        r.account_uuid.as_deref().unwrap_or(""),
+        r.fast_mode
+    )
+}
+
+/// Flag a legacy `tku-agg:` record as an aggregate and give it its
+/// [`aggregate_id`]. Returns whether `r` was one.
+pub fn adopt_legacy_aggregate(r: &mut UsageRecord) -> bool {
+    if r.aggregate || !r.message_id.starts_with("tku-agg:") {
+        return false;
+    }
+    r.aggregate = true;
+    r.message_id = aggregate_id(r);
+    r.request_id = AGG_MARKER.to_string();
+    true
 }
 
 #[derive(Debug, Clone, Default)]
@@ -187,5 +221,69 @@ impl ModelBucketDetail {
         self.cache_creation_input_tokens += cache_creation_input_tokens;
         self.cache_read_input_tokens += cache_read_input_tokens;
         merge_cost(&mut self.cost, cost);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record() -> UsageRecord {
+        UsageRecord {
+            provider: Provider::Claude,
+            session_id: "s1".into(),
+            timestamp: "2026-01-01T23:30:00Z".parse().unwrap(),
+            project: "a:b".into(),
+            model: "opus".into(),
+            message_id: "msg".into(),
+            request_id: "req".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            fast_mode: true,
+            account_uuid: Some("org-1".into()),
+            aggregate: false,
+        }
+    }
+
+    #[test]
+    fn aggregate_id_joins_the_key_fields() {
+        assert_eq!(
+            aggregate_id(&record()),
+            "tku-agg:s1\u{1f}2026-01-01\u{1f}a:b\u{1f}opus\u{1f}org-1\u{1f}true"
+        );
+        let untagged = UsageRecord {
+            account_uuid: None,
+            fast_mode: false,
+            ..record()
+        };
+        assert_eq!(
+            aggregate_id(&untagged),
+            "tku-agg:s1\u{1f}2026-01-01\u{1f}a:b\u{1f}opus\u{1f}\u{1f}false"
+        );
+    }
+
+    #[test]
+    fn a_legacy_aggregate_is_flagged_and_given_its_id() {
+        let mut r = UsageRecord {
+            message_id: "tku-agg:s1:2026-01-01:opus:org-1:true".into(),
+            request_id: "tku-agg".into(),
+            ..record()
+        };
+        assert!(adopt_legacy_aggregate(&mut r));
+        assert!(r.aggregate);
+        assert_eq!(r.message_id, aggregate_id(&r));
+        assert_eq!(r.request_id, "tku-agg");
+        assert!(!adopt_legacy_aggregate(&mut r));
+    }
+
+    #[test]
+    fn a_raw_record_is_not_adopted() {
+        let mut r = record();
+        assert!(!adopt_legacy_aggregate(&mut r));
+        assert!(!r.aggregate);
+        assert_eq!(r.message_id, "msg");
     }
 }

@@ -155,6 +155,7 @@ fn parse_session_file(path: &Path) -> Vec<UsageRecord> {
             cache_read_input_tokens: cached,
             fast_mode: false,
             account_uuid: None,
+            aggregate: false,
         });
     }
 

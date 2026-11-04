@@ -274,5 +274,6 @@ fn extract_token_event(
         cache_read_input_tokens: cached,
         fast_mode: false,
         account_uuid: None,
+        aggregate: false,
     })
 }

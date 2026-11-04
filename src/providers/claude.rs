@@ -314,6 +314,7 @@ fn extract_record(
         fast_mode: usage.get("speed").and_then(|v| v.as_str()) == Some("fast"),
         // Filled in by discover_and_parse via per-record account_at lookup.
         account_uuid: None,
+        aggregate: false,
     })
 }
 
@@ -436,5 +437,43 @@ mod tests {
         assert!(parse(&line("\"fast\"")).fast_mode);
         assert!(!parse(&line("\"standard\"")).fast_mode);
         assert!(!parse(&line("null")).fast_mode);
+    }
+
+    #[test]
+    fn streamed_duplicate_lines_are_stored_as_one_record() {
+        crate::storage::with_scratch_home("claude-streamed", || {
+            let home = PathBuf::from(std::env::var_os("TKU_HOME").unwrap());
+            let root = home.join("projects");
+            let dir = root.join("-home-p");
+            std::fs::create_dir_all(&dir).unwrap();
+            let line = |ts: &str, out: u64| {
+                format!(
+                    r#"{{"type":"assistant","timestamp":"{ts}","requestId":"req_5","message":{{"id":"msg_5","model":"claude-opus-5","usage":{{"input_tokens":3,"output_tokens":{out}}}}}}}"#
+                )
+            };
+            let body = [
+                line("2026-09-12T10:00:00.100Z", 6),
+                line("2026-09-12T10:00:00.200Z", 6),
+                line("2026-09-12T10:00:03.000Z", 410),
+            ]
+            .join("\n");
+            std::fs::write(dir.join("s1.jsonl"), body + "\n").unwrap();
+
+            let mut storage = crate::storage::bitcode_store::BitcodeStorage::new();
+            let files = discover_files(&[root], "jsonl");
+            assert_eq!(files.len(), 1);
+            discover_and_parse_with("claude", files, &mut storage, None, false, |p| {
+                parse_jsonl_file(p)
+            });
+
+            let records = storage.drain_all();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].output_tokens, 410);
+            assert_eq!(records[0].input_tokens, 3);
+            assert_eq!(
+                records[0].timestamp,
+                "2026-09-12T10:00:00.100Z".parse::<DateTime<Utc>>().unwrap()
+            );
+        });
     }
 }

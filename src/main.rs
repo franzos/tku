@@ -93,9 +93,8 @@ fn ingest(prune: bool) -> Result<()> {
         bail!("cache ingest does not accept --prune");
     }
     let mut store = storage::default_storage();
-    for provider in providers::all_providers() {
-        provider.discover_and_parse(store.as_mut(), None, false);
-    }
+    providers::scan_all(store.as_mut(), &progress::Progress::new(false), false);
+    store.force_write();
     if !store.flush() {
         bail!("record cache not written");
     }
@@ -241,7 +240,9 @@ fn handle_scrub(mode: &cli::Command, format: &cli::OutputFormat, quiet: bool) ->
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let mode = cli.effective_command();
-    migrate::run_pending(!cli.cli);
+    // Status polls skip a held upgrade lock; the legacy write guard keeps the old store safe.
+    let wait_for_lock = !matches!(mode, cli::Command::Bar { .. } | cli::Command::Watch { .. });
+    migrate::run_pending(!cli.cli, wait_for_lock);
 
     // Account management subcommands: handled early; no record scan needed.
     if let cli::Command::Account { action } = &mode {
@@ -324,20 +325,7 @@ fn main() -> Result<()> {
     let mut store = storage::default_storage();
 
     let progress = progress::Progress::new(!cli.cli && !is_bar && !is_plot && !is_sub);
-    // Throttle is applied inside providers::discover_and_parse_with so the
-    // per-file hot path stays tight. This callback itself can be cheap.
-    let progress_cb =
-        |current: usize, total: usize| progress.count("Scanning sessions", current, total);
-    for provider in providers::all_providers() {
-        provider.discover_and_parse(
-            store.as_mut(),
-            progress
-                .is_active()
-                .then_some(&progress_cb as &dyn Fn(usize, usize)),
-            cli.prune,
-        );
-    }
-    progress.clear();
+    providers::scan_all(store.as_mut(), &progress, cli.prune);
 
     store.flush();
     let all_records = store.drain_all();

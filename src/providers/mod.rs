@@ -71,6 +71,19 @@ pub trait Provider {
     );
 }
 
+/// Scan every provider's sources into `storage`, with a `Scanning sessions` count on `progress`.
+pub fn scan_all(storage: &mut dyn Storage, progress: &crate::progress::Progress, prune: bool) {
+    let progress_cb =
+        |current: usize, total: usize| progress.count("Scanning sessions", current, total);
+    let cb = progress
+        .is_active()
+        .then_some(&progress_cb as &dyn Fn(usize, usize));
+    for provider in all_providers() {
+        provider.discover_and_parse(storage, cb, prune);
+    }
+    progress.clear();
+}
+
 /// Collect all provider root directories for file watching.
 pub fn all_watch_paths() -> Vec<PathBuf> {
     all_providers()

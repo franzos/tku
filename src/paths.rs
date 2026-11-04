@@ -143,14 +143,28 @@ pub fn spawn_transcripts_dir(tool: &str, account_id: &str) -> Option<PathBuf> {
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Points `TKU_HOME` and `XDG_RUNTIME_DIR` at a scratch dir while holding
-/// `ENV_LOCK`; restores both on drop. `spawn_dir` prefers the runtime dir, so
-/// setting `TKU_HOME` alone would leave lock files in the real one.
+/// Points `TKU_HOME`, `XDG_RUNTIME_DIR` and `HOME` at a scratch dir and unsets
+/// the XDG base and provider root variables while holding `ENV_LOCK`; restores
+/// all of them on drop. `spawn_dir` prefers the runtime dir and provider roots
+/// resolve from `HOME`, so `TKU_HOME` alone would still reach the real ones.
 #[cfg(test)]
 pub(crate) struct TestHome {
-    runtime: Option<std::ffi::OsString>,
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
+
+#[cfg(test)]
+const TEST_UNSET: &[&str] = &[
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "AMP_DATA_DIR",
+    "CODEX_HOME",
+    "FACTORY_HOME",
+    "GEMINI_HOME",
+    "KIMI_HOME",
+    "OPENCODE_DATA_DIR",
+    "PI_AGENT_DIR",
+];
 
 #[cfg(test)]
 impl TestHome {
@@ -158,23 +172,30 @@ impl TestHome {
         let lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
-        std::env::set_var("TKU_HOME", dir);
-        std::env::set_var("XDG_RUNTIME_DIR", dir);
-        Self {
-            runtime,
-            _lock: lock,
+        let set = ["TKU_HOME", "XDG_RUNTIME_DIR", "HOME"];
+        let saved = set
+            .iter()
+            .chain(TEST_UNSET)
+            .map(|&k| (k, std::env::var_os(k)))
+            .collect();
+        for k in set {
+            std::env::set_var(k, dir);
         }
+        for k in TEST_UNSET {
+            std::env::remove_var(k);
+        }
+        Self { saved, _lock: lock }
     }
 }
 
 #[cfg(test)]
 impl Drop for TestHome {
     fn drop(&mut self) {
-        std::env::remove_var("TKU_HOME");
-        match self.runtime.take() {
-            Some(rt) => std::env::set_var("XDG_RUNTIME_DIR", rt),
-            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        for (k, v) in self.saved.drain(..) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
         }
     }
 }

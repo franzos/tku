@@ -1591,6 +1591,7 @@ pub(crate) mod test_support {
             cache_read_input_tokens: 0,
             fast_mode: false,
             account_uuid: tag.map(String::from),
+            aggregate: false,
         }
     }
 }
@@ -2204,6 +2205,7 @@ mod tests {
             cache_read_input_tokens: 0,
             fast_mode: false,
             account_uuid: Some("org-1".into()),
+            aggregate: false,
         };
         store.insert("claude", file, 0, 0, vec![record]);
         store
@@ -2352,8 +2354,17 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    const AGG_ORG: &str = "tku-agg:s:2026-01-01:opus:org-1:false";
-    const AGG_ACCT: &str = "tku-agg:s:2026-01-01:opus:acct-1@org-1:false";
+    const AGG_ORG: &str = "tku-agg:s\u{1f}2026-01-01\u{1f}p\u{1f}opus\u{1f}org-1\u{1f}false";
+    const AGG_ACCT: &str =
+        "tku-agg:s\u{1f}2026-01-01\u{1f}p\u{1f}opus\u{1f}acct-1@org-1\u{1f}false";
+
+    fn migration_aggregate(account: &str, timestamp: DateTime<Utc>) -> UsageRecord {
+        let mut r = migration_record(account, "", timestamp);
+        r.aggregate = true;
+        r.message_id = crate::types::aggregate_id(&r);
+        r.request_id = crate::types::AGG_MARKER.to_string();
+        r
+    }
 
     fn migration_record(account: &str, message_id: &str, timestamp: DateTime<Utc>) -> UsageRecord {
         UsageRecord {
@@ -2371,6 +2382,7 @@ mod tests {
             cache_read_input_tokens: 0,
             fast_mode: false,
             account_uuid: Some(account.into()),
+            aggregate: false,
         }
     }
 
@@ -2425,7 +2437,7 @@ mod tests {
             0,
             vec![
                 migration_record("org-1", "m1", Utc::now()),
-                migration_record("org-1", AGG_ORG, old),
+                migration_aggregate("org-1", old),
             ],
         );
         store.insert(

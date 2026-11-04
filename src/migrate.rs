@@ -21,13 +21,20 @@ pub struct Migration {
 /// In order; a failed upgrade stops the ones after it.
 pub(crate) const MIGRATIONS: &[Migration] = &[
     crate::storage::relocate::RELOCATE,
+    crate::storage::upgrade::STORE_FORMAT,
     crate::accounts::ACCOUNT_IDS,
 ];
 
 const LOCK_WAIT: Duration = Duration::from_secs(30);
 
-pub fn run_pending(progress: bool) {
-    run_all(MIGRATIONS, LOCK_WAIT, &Progress::new(progress));
+/// Without `wait_for_lock`, a held upgrade lock skips the upgrades for this run.
+pub fn run_pending(progress: bool, wait_for_lock: bool) {
+    let wait = if wait_for_lock {
+        LOCK_WAIT
+    } else {
+        Duration::ZERO
+    };
+    run_all(MIGRATIONS, wait, &Progress::new(progress));
 }
 
 pub(crate) fn run_all(migrations: &[Migration], wait: Duration, progress: &Progress) {
@@ -67,9 +74,73 @@ fn acquire(wait: Duration, progress: &Progress) -> Result<SpawnLock> {
         ));
     })?
     .ok_or_else(|| {
-        anyhow!(
-            "another tku process held the upgrade lock for {}s",
-            wait.as_secs()
-        )
+        if wait.is_zero() {
+            anyhow!("another tku process holds the upgrade lock")
+        } else {
+            anyhow!(
+                "another tku process held the upgrade lock for {}s",
+                wait.as_secs()
+            )
+        }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    static SKIPPED_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static WAITED_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    const SKIPPED: Migration = Migration {
+        label: "test",
+        pending: || true,
+        run: |_| {
+            SKIPPED_RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok(String::new())
+        },
+    };
+
+    const WAITED: Migration = Migration {
+        label: "test",
+        pending: || true,
+        run: |_| {
+            WAITED_RUNS.fetch_add(1, Ordering::SeqCst);
+            Ok(String::new())
+        },
+    };
+
+    fn hold_lock() -> SpawnLock {
+        SpawnLock::acquire(&private_spawn_dir().unwrap().join(".migrate.lock"))
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn held_lock_without_waiting_skips_at_once() {
+        crate::storage::with_scratch_home("migrate-nowait", || {
+            let _lock = hold_lock();
+            let started = Instant::now();
+            run_all(&[SKIPPED, SKIPPED], Duration::ZERO, &Progress::new(false));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert_eq!(SKIPPED_RUNS.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn held_lock_with_waiting_runs_once_released() {
+        crate::storage::with_scratch_home("migrate-wait", || {
+            let lock = hold_lock();
+            let holder = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                drop(lock);
+            });
+            run_all(&[WAITED], LOCK_WAIT, &Progress::new(false));
+            holder.join().unwrap();
+            assert_eq!(WAITED_RUNS.load(Ordering::SeqCst), 1);
+        });
+    }
 }

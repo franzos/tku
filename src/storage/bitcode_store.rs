@@ -2,20 +2,19 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
+use chrono::{Duration, Utc};
 
-use super::Storage;
+use super::{format, legacy, rollup, Storage};
 use crate::atomic_write::atomic_write;
 use crate::paths;
-use crate::types::{Provider, UsageRecord};
+use crate::types::{self, Provider, UsageRecord};
 
 /// Default ceiling on a provider's cache file. Configurable via
 /// `cache_max_bytes` in `config.toml`.
 ///
 /// The limit is set by rewrite cost, not disk: `flush` re-serializes the whole
 /// provider file on every run that saw a new session, so the ceiling is also
-/// the worst-case write per run. Compaction keeps a normal corpus far below it.
+/// the worst-case write per run. Rollups keep a normal corpus far below it.
 pub const DEFAULT_MAX_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Fraction of the ceiling at which every run starts warning.
@@ -27,28 +26,17 @@ const WARN_FRACTION: f64 = 0.85;
 /// otherwise compact back down.
 const ABSOLUTE_READ_LIMIT: u64 = 1024 * 1024 * 1024;
 
-/// Record ages tried in turn when the ceiling is reached. Anything older than
-/// the cutoff is collapsed to one record per day; the first step that brings
-/// the file under the ceiling wins.
+/// Ages tried in turn when the ceiling is reached: files whose newest record is
+/// older are rolled up to daily totals; the first step that brings the file
+/// under the ceiling wins.
 const COMPACT_CUTOFF_DAYS: &[i64] = &[180, 90, 30];
 
-/// Marks a record produced by [`compact_file`]. Also the `request_id`, which
-/// with the per-file `message_id` keeps aggregates unique under the dedup key.
-const AGG_MARKER: &str = "tku-agg";
-
-/// Prefix written ahead of every cache payload; bump on any `UsageRecord`
-/// shape change. bitcode is positionally packed and carries no schema, so a
-/// stale cache can decode into a new struct as plausible garbage instead of
-/// failing — the marker is what makes that impossible.
-///
-/// The store is the only copy of usage for sessions the tool has since deleted,
-/// so a bump must *migrate*, never discard: add the previous decoder to
-/// [`decode_cache`] and upgrade in place. A payload no decoder understands is
-/// quarantined rather than overwritten, so nothing is lost to a bad bump.
-const CACHE_FORMAT_VERSION: u32 = 0x746b_7501;
-
 /// How long `flush` waits for another process to finish writing the store.
-const STORE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const STORE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A file modified within this many seconds is live: its insert alone does not
+/// make `flush` write, since the next run re-parses it from source anyway.
+const LIVE_WINDOW_SECS: i64 = 300;
 
 /// One file per provider: `~/.cache/tku/{provider}.bin`
 ///
@@ -58,21 +46,52 @@ const STORE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Despite the name this is an archive as much as a cache: source transcripts
 /// are deleted by the tools that write them (Claude Code drops sessions past
 /// `cleanupPeriodDays`), so records here routinely outlive their source file
-/// and cannot be re-derived. The ceiling triggers compaction of old records to
-/// daily totals; a store still over it is written as is. Records are only
-/// deleted by an explicit `--prune`.
+/// and cannot be re-derived. Files older than `rollup_after_days` are rolled up
+/// to daily totals on flush, the ceiling rolls up younger ones, and a store
+/// still over it is written as is. Records are only deleted by an explicit `--prune`.
 pub struct BitcodeStorage {
     providers: HashMap<String, ProviderCache>,
     max_bytes: u64,
+    rollup_days: u32,
+    /// Write dirty providers even when only live files changed.
+    force: bool,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Default)]
 pub(crate) struct ProviderCache {
-    files: HashMap<String, CachedFile>,
-    #[serde(skip)]
-    dirty: bool,
-    #[serde(skip)]
-    changes: Changes,
+    pub(crate) files: HashMap<String, CachedFile>,
+    /// Decoded from the legacy format; `flush` keeps writing that format, see [`write_legacy`].
+    pub(crate) legacy: bool,
+    pub(crate) dirty: bool,
+    /// A change that cannot be redone from source is pending; see [`LIVE_WINDOW_SECS`].
+    pub(crate) needs_write: bool,
+    pub(crate) changes: Changes,
+}
+
+/// A file's key, `mtime_secs`, `size`, `sealed` and records.
+#[cfg(test)]
+type FileSnapshot<'a> = (&'a str, i64, u64, &'a [u64], &'a [UsageRecord]);
+
+#[cfg(test)]
+impl ProviderCache {
+    /// Every file's content, sorted by key, for comparing caches in tests.
+    pub(crate) fn snapshot(&self) -> Vec<FileSnapshot<'_>> {
+        let mut files: Vec<_> = self
+            .files
+            .iter()
+            .map(|(k, cf)| {
+                (
+                    k.as_str(),
+                    cf.mtime_secs,
+                    cf.size,
+                    cf.sealed.as_slice(),
+                    cf.records.as_slice(),
+                )
+            })
+            .collect();
+        files.sort_unstable_by_key(|f| f.0);
+        files
+    }
 }
 
 /// What this process did to a provider since its last flush, so the flush can
@@ -112,11 +131,13 @@ impl Changes {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct CachedFile {
-    mtime_secs: i64,
-    size: u64,
-    records: Vec<UsageRecord>,
+#[derive(Clone)]
+pub(crate) struct CachedFile {
+    pub(crate) mtime_secs: i64,
+    pub(crate) size: u64,
+    pub(crate) records: Vec<UsageRecord>,
+    /// Stable fingerprints of the messages rolled up into this file's records.
+    pub(crate) sealed: Vec<u64>,
 }
 
 impl BitcodeStorage {
@@ -124,6 +145,8 @@ impl BitcodeStorage {
         Self {
             providers: HashMap::new(),
             max_bytes: configured_max_bytes(),
+            rollup_days: configured_rollup_days(),
+            force: false,
         }
     }
 
@@ -134,6 +157,50 @@ impl BitcodeStorage {
     pub fn contains(&mut self, provider: &str, file_path: &Path) -> bool {
         let key = file_path.to_string_lossy().to_string();
         self.provider_cache(provider).files.contains_key(&key)
+    }
+
+    /// Every fingerprint sealed in this provider's files.
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+    pub(crate) fn sealed_fingerprints(&mut self, provider: &str) -> HashSet<u64> {
+        self.provider_cache(provider)
+            .files
+            .values()
+            .flat_map(|cf| cf.sealed.iter().copied())
+            .collect()
+    }
+
+    /// Whether this provider's store is still in the legacy format, which cannot hold seals.
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
+    pub(crate) fn is_legacy(&mut self, provider: &str) -> bool {
+        self.provider_cache(provider).legacy
+    }
+
+    /// [`Storage::insert`] of a file that already sealed the fingerprints in `sealed`.
+    pub(crate) fn insert_sealed(
+        &mut self,
+        provider: &str,
+        file_path: &Path,
+        mtime: i64,
+        size: u64,
+        records: Vec<UsageRecord>,
+        sealed: Vec<u64>,
+    ) {
+        let pc = self.provider_cache(provider);
+        let key = file_path.to_string_lossy().to_string();
+        pc.changes.touch(&key);
+        pc.files.insert(
+            key,
+            CachedFile {
+                mtime_secs: mtime,
+                size,
+                records: crate::dedup::dedup(records),
+                sealed,
+            },
+        );
+        pc.dirty = true;
+        if Utc::now().timestamp() - mtime > LIVE_WINDOW_SECS {
+            pc.needs_write = true;
+        }
     }
 
     /// Load (or create) the cache for a specific provider, lazily.
@@ -151,6 +218,10 @@ pub(crate) fn configured_max_bytes() -> u64 {
         .unwrap_or(DEFAULT_MAX_CACHE_BYTES)
 }
 
+pub(crate) fn configured_rollup_days() -> u32 {
+    crate::config::load_config().rollup_after_days()
+}
+
 /// Read one provider's file, quarantining anything unreadable.
 ///
 /// Never returns an empty cache while leaving a non-empty file in place: an
@@ -160,22 +231,25 @@ fn load_provider(provider: &str, max_bytes: u64) -> ProviderCache {
     let Some(path) = paths::bitcode_cache_file(provider) else {
         return ProviderCache::default();
     };
-    read_provider(&path, max_bytes, true).unwrap_or_else(|e| {
-        // Readable-but-not-read (permissions, I/O error). Leave it alone
-        // and run without a cache rather than replace what we can't see.
-        eprintln!("tku: cannot read {provider} cache ({e}); running without it this time");
-        ProviderCache::default()
-    })
+    match read_provider(&path, max_bytes, true) {
+        Ok(pc) => pc.unwrap_or_default(),
+        Err(e) => {
+            // Readable-but-not-read (permissions, I/O error). Leave it alone
+            // and run without a cache rather than replace what we can't see.
+            eprintln!("tku: cannot read {provider} cache ({e}); running without it this time");
+            ProviderCache::default()
+        }
+    }
 }
 
 /// [`load_provider`] for a known path. Errors when the file exists but could
 /// not be read, or is unusable and `quarantine_bad` is false; a missing, empty
-/// or quarantined file is an empty cache.
+/// or quarantined file is `None`.
 pub(crate) fn read_provider(
     path: &Path,
     max_bytes: u64,
     quarantine_bad: bool,
-) -> std::io::Result<ProviderCache> {
+) -> std::io::Result<Option<ProviderCache>> {
     // Pre-flight size check. `fs::read` allocates a Vec sized to the file, so
     // a runaway file would OOM the process before we could compact it. The
     // bound is absolute, not a multiple of the ceiling: lowering `cache_max_bytes`
@@ -187,23 +261,23 @@ pub(crate) fn read_provider(
                 return Err(std::io::Error::other(why));
             }
             quarantine(path, &why);
-            return Ok(ProviderCache::default());
+            return Ok(None);
         }
     }
     let data = match fs::read(path) {
         Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ProviderCache::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     if data.is_empty() {
-        return Ok(ProviderCache::default());
+        return Ok(None);
     }
-    match decode_cache(&data) {
-        Some(pc) => Ok(pc),
+    match decode(&data) {
+        Some(pc) => Ok(Some(pc)),
         None if !quarantine_bad => Err(std::io::Error::other("unrecognized format")),
         None => {
             quarantine(path, "unrecognized format");
-            Ok(ProviderCache::default())
+            Ok(None)
         }
     }
 }
@@ -227,9 +301,22 @@ fn quarantine(path: &Path, why: &str) {
     }
 }
 
-fn decode_cache(data: &[u8]) -> Option<ProviderCache> {
-    let (version, cache): (u32, ProviderCache) = bitcode::deserialize(data).ok()?;
-    (version == CACHE_FORMAT_VERSION).then_some(cache)
+/// Decode a native or legacy payload. `None` for anything else, which the
+/// caller quarantines rather than overwrites: the store may be the only copy.
+fn decode(data: &[u8]) -> Option<ProviderCache> {
+    if format::is_native(data) {
+        format::decode(data)
+    } else {
+        legacy::decode(data)
+    }
+}
+
+/// Whether `flush` writes the legacy format: the disk copy read under the lock
+/// decides, and a missing or empty file keeps the format memory was loaded in.
+///
+/// A native disk copy means another process migrated and upgraded every legacy entry.
+fn write_legacy(mem_legacy: bool, disk: Option<&ProviderCache>) -> bool {
+    disk.map_or(mem_legacy, |d| d.legacy)
 }
 
 /// Fold `disk` into `mem`, where `changes` is what this process did to `mem`.
@@ -271,157 +358,54 @@ pub(crate) fn merge_from_disk(mem: &mut ProviderCache, disk: ProviderCache, chan
     }
 }
 
-/// Retag the records of account `old` as `new`, including the account segment
-/// of aggregate message ids. Returns whether any record changed.
+/// Retag the records of account `old` as `new`, recomputing aggregate message
+/// ids. Returns whether any record changed.
 fn rekey_records(records: &mut [UsageRecord], old: &str, new: &str) -> bool {
-    let agg_prefix = format!("{AGG_MARKER}:");
     let mut changed = false;
     for r in records {
         if r.account_uuid.as_deref() != Some(old) {
             continue;
         }
-        if r.message_id.starts_with(&agg_prefix) {
-            let suffix = format!(":{old}:{}", r.fast_mode);
-            if let Some(head) = r.message_id.strip_suffix(&suffix) {
-                r.message_id = format!("{head}:{new}:{}", r.fast_mode);
-            }
-        }
         r.account_uuid = Some(new.to_string());
+        if r.aggregate {
+            r.message_id = types::aggregate_id(r);
+        }
         changed = true;
     }
     changed
 }
 
-/// Collapse every record in `cf` to one per `(day, model, account, fast_mode)`
-/// when the whole file predates `cutoff`. Returns whether anything changed.
+/// Serialize, rolling up progressively younger files until the payload fits.
 ///
-/// Reporting groups by day, so totals and per-day rows are unaffected; what is
-/// lost is intra-day resolution (burn rate) and per-message detail for old
-/// sessions. A file with any record at or after the cutoff is left alone, so
-/// live sessions keep full detail.
-fn compact_file(cf: &mut CachedFile, cutoff: DateTime<Utc>) -> bool {
-    if cf.records.len() < 2 || cf.records.iter().any(|r| r.timestamp >= cutoff) {
-        return false;
-    }
-
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, UsageRecord> = HashMap::new();
-    for r in cf.records.drain(..) {
-        let key = format!(
-            "{}:{}:{}:{}:{}",
-            r.session_id,
-            r.timestamp.date_naive(),
-            r.model,
-            r.account_uuid.as_deref().unwrap_or(""),
-            r.fast_mode
-        );
-        match groups.get_mut(&key) {
-            Some(agg) => {
-                agg.input_tokens += r.input_tokens;
-                agg.output_tokens += r.output_tokens;
-                agg.cache_creation_input_tokens += r.cache_creation_input_tokens;
-                agg.cache_creation_1h_input_tokens += r.cache_creation_1h_input_tokens;
-                agg.cache_read_input_tokens += r.cache_read_input_tokens;
-                // Keep the earliest timestamp so the record stays inside the
-                // day it actually belongs to.
-                if r.timestamp < agg.timestamp {
-                    agg.timestamp = r.timestamp;
-                }
-            }
-            None => {
-                let mut agg = r;
-                // Deterministic and unique per (file, day, model, account,
-                // speed): re-compacting an already-compacted file is a no-op,
-                // and the same session restored from two places still dedups.
-                agg.message_id = format!("{AGG_MARKER}:{key}");
-                agg.request_id = AGG_MARKER.to_string();
-                order.push(key.clone());
-                groups.insert(key, agg);
-            }
-        }
-    }
-
-    cf.records = order
-        .into_iter()
-        .filter_map(|k| groups.remove(&k))
-        .collect();
-    true
-}
-
-/// Drop records that `dedup` would discard at read time anyway.
-///
-/// A resumed or forked session replays earlier messages into the new
-/// transcript, so the same `(message_id, request_id)` legitimately appears in
-/// several files. Reporting collapses them; the store keeps every copy. Files
-/// are visited in sorted order so the surviving copy is the same on every run.
-///
-/// Returns how many records were dropped.
-fn dedup_cache(pc: &mut ProviderCache) -> usize {
-    let mut keys: Vec<String> = pc.files.keys().cloned().collect();
-    keys.sort_unstable();
-
-    let mut seen: HashSet<u64> = HashSet::new();
-    let mut dropped = 0;
-    for key in keys {
-        let Some(cf) = pc.files.get_mut(&key) else {
-            continue;
-        };
-        let before = cf.records.len();
-        cf.records.retain(|r| {
-            seen.insert(crate::dedup::fingerprint(
-                r.provider,
-                &r.message_id,
-                &r.request_id,
-                r.account_uuid.as_deref(),
-            ))
-        });
-        dropped += before - cf.records.len();
-    }
-    dropped
-}
-
-/// Compact every file older than `cutoff`. Returns whether anything changed.
-fn compact(pc: &mut ProviderCache, cutoff: DateTime<Utc>) -> bool {
-    let mut changed = false;
-    for cf in pc.files.values_mut() {
-        changed |= compact_file(cf, cutoff);
-    }
-    changed
-}
-
-/// Serialize, compacting progressively older records until the payload fits.
-///
-/// Returns the payload plus whether the ceiling was still exceeded after every
-/// compaction step — the caller writes it regardless. Dropping records to hit a
-/// size target would delete history that no longer exists anywhere else, so the
-/// ceiling yields rather than the archive.
+/// A payload still over the ceiling after every step is returned and written
+/// as is. Dropping records to hit a size target would delete history that no
+/// longer exists anywhere else, so the ceiling yields rather than the archive.
+/// The pre-rollup entries of every file it rolls up are appended to `undo`.
 pub(crate) fn serialize_within(
     pc: &mut ProviderCache,
     max_bytes: u64,
     provider: &str,
+    undo: &mut rollup::Undo,
 ) -> Option<Vec<u8>> {
     let mut data = serialize(pc, provider)?;
     if data.len() as u64 <= max_bytes {
         return Some(data);
     }
-    // Must run before any compaction: aggregates carry synthetic message ids,
-    // so a duplicate that survives into one would be summed twice and never
-    // collapsed again. Costs nothing observable — read-time dedup discards
-    // these records anyway.
-    if dedup_cache(pc) > 0 {
-        data = serialize(pc, provider)?;
-        if data.len() as u64 <= max_bytes {
-            return Some(data);
-        }
-    }
-    for &days in COMPACT_CUTOFF_DAYS {
-        let cutoff = Utc::now() - Duration::days(days);
-        if !compact(pc, cutoff) {
+    // The legacy format cannot carry `sealed`, so a legacy store is never rolled up.
+    let steps = if pc.legacy {
+        &[][..]
+    } else {
+        COMPACT_CUTOFF_DAYS
+    };
+    for &days in steps {
+        let changed = rollup::rollup(&mut pc.files, Utc::now() - Duration::days(days));
+        if changed.is_empty() {
             continue;
         }
+        undo.extend(changed);
         data = serialize(pc, provider)?;
         eprintln!(
-            "tku: {provider} cache over the {} ceiling; compacted records older than {days} days to {}",
+            "tku: {provider} cache over the {} ceiling; rolled up files older than {days} days to {}",
             human(max_bytes),
             human(data.len() as u64)
         );
@@ -433,7 +417,7 @@ pub(crate) fn serialize_within(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "config.toml".into());
     eprintln!(
-        "tku: {provider} cache is {} and compaction could not get it under the {} ceiling. \
+        "tku: {provider} cache is {} and rollups could not get it under the {} ceiling. \
          Writing it as is; no records were dropped. Raise cache_max_bytes in {config}.",
         human(data.len() as u64),
         human(max_bytes)
@@ -441,13 +425,54 @@ pub(crate) fn serialize_within(
     Some(data)
 }
 
+/// Put back the entries a failed flush rolled up: an unwritten seal must not
+/// survive in memory while the disk copy lets another file seal the same message.
+fn restore(pc: &mut ProviderCache, undo: rollup::Undo) {
+    for (key, cf) in undo.into_iter().rev() {
+        pc.files.insert(key, cf);
+    }
+}
+
+/// Encode `pc` natively, or in the legacy format when `pc.legacy` is set.
 fn serialize(pc: &ProviderCache, provider: &str) -> Option<Vec<u8>> {
-    match bitcode::serialize(&(CACHE_FORMAT_VERSION, pc)) {
+    if !pc.legacy {
+        return Some(format::encode(pc));
+    }
+    match legacy::encode(pc) {
         Ok(d) => Some(d),
         Err(e) => {
             eprintln!("tku: failed to serialize {provider} cache: {e}");
             None
         }
+    }
+}
+
+/// Append `pc`'s records to `out` in sorted key order, dropping raw copies of
+/// messages sealed in a different file.
+fn drain_sorted(pc: ProviderCache, out: &mut Vec<UsageRecord>) {
+    let mut files: Vec<(String, CachedFile)> = pc.files.into_iter().collect();
+    files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let sealed_in: HashMap<u64, usize> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (_, cf))| cf.sealed.iter().map(move |&fp| (fp, i)))
+        .collect();
+    for (i, (_, cf)) in files.into_iter().enumerate() {
+        if sealed_in.is_empty() {
+            out.extend(cf.records);
+            continue;
+        }
+        out.extend(cf.records.into_iter().filter(|r| {
+            r.aggregate
+                || (r.message_id.is_empty() && r.request_id.is_empty())
+                || sealed_in
+                    .get(&crate::dedup::stable_fingerprint(
+                        r.provider,
+                        &r.message_id,
+                        &r.request_id,
+                    ))
+                    .is_none_or(|&owner| owner == i)
+        }));
     }
 }
 
@@ -459,13 +484,7 @@ pub(crate) fn human(bytes: u64) -> String {
 /// Take the store lock beside `path`, waiting up to [`STORE_LOCK_WAIT`].
 /// `None` (after a warning) when it could not be taken.
 pub(crate) fn lock_store(path: &Path, provider: &str) -> Option<StoreLock> {
-    let dir = path.parent()?;
-    if let Err(e) = fs::create_dir_all(dir) {
-        eprintln!("tku: failed to create {}: {e}", dir.display());
-        return None;
-    }
-    let lock_path = dir.join(".store.lock");
-    match StoreLock::acquire_wait(&lock_path, STORE_LOCK_WAIT) {
+    match try_lock_store(path, STORE_LOCK_WAIT) {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {
             eprintln!(
@@ -476,12 +495,25 @@ pub(crate) fn lock_store(path: &Path, provider: &str) -> Option<StoreLock> {
         }
         Err(e) => {
             eprintln!(
-                "tku: cannot lock {} ({e}); {provider} cache not saved this run",
-                lock_path.display()
+                "tku: cannot lock the store beside {} ({e}); {provider} cache not saved this run",
+                path.display()
             );
             None
         }
     }
+}
+
+/// The store lock beside `path`, waiting up to `wait`. `Ok(None)` when another
+/// process still holds it.
+pub(crate) fn try_lock_store(
+    path: &Path,
+    wait: std::time::Duration,
+) -> std::io::Result<Option<StoreLock>> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("store path has no parent"))?;
+    fs::create_dir_all(dir)?;
+    StoreLock::acquire_wait(&dir.join(".store.lock"), wait)
 }
 
 /// `flock` on the store's lock file, released by the kernel when the file is
@@ -547,18 +579,7 @@ impl Storage for BitcodeStorage {
         size: u64,
         records: Vec<UsageRecord>,
     ) {
-        let pc = self.provider_cache(provider);
-        let key = file_path.to_string_lossy().to_string();
-        pc.changes.touch(&key);
-        pc.files.insert(
-            key,
-            CachedFile {
-                mtime_secs: mtime,
-                size,
-                records,
-            },
-        );
-        pc.dirty = true;
+        self.insert_sealed(provider, file_path, mtime, size, records, Vec::new());
     }
 
     fn prune(&mut self, provider: &str, existing: &[PathBuf]) {
@@ -590,6 +611,7 @@ impl Storage for BitcodeStorage {
                 before - pc.files.len()
             );
             pc.dirty = true;
+            pc.needs_write = true;
         }
     }
 
@@ -598,9 +620,12 @@ impl Storage for BitcodeStorage {
             return true;
         }
         let max_bytes = self.max_bytes;
+        let rollup_days = self.rollup_days;
+        let rollup_cutoff = Utc::now() - Duration::days(i64::from(rollup_days));
+        let force = self.force;
         let mut ok = true;
         for (name, pc) in &mut self.providers {
-            if !pc.dirty {
+            if !pc.dirty || (!pc.needs_write && !force) {
                 continue;
             }
             let Some(path) = paths::bitcode_cache_file(name) else {
@@ -620,30 +645,44 @@ impl Storage for BitcodeStorage {
                 }
             };
             let changes = std::mem::take(&mut pc.changes);
-            merge_from_disk(pc, disk, &changes);
-            let Some(data) = serialize_within(pc, max_bytes, name) else {
+            let was_legacy = pc.legacy;
+            pc.legacy = write_legacy(pc.legacy, disk.as_ref());
+            merge_from_disk(pc, disk.unwrap_or_default(), &changes);
+            let mut undo = if pc.legacy {
+                Vec::new()
+            } else {
+                rollup::rollup(&mut pc.files, rollup_cutoff)
+            };
+            let Some(data) = serialize_within(pc, max_bytes, name, &mut undo) else {
+                restore(pc, undo);
                 pc.changes = changes;
+                pc.legacy = was_legacy;
                 ok = false;
                 continue;
             };
             if let Err(e) = atomic_write(&path, &data, None) {
                 eprintln!("tku: failed to write {name} cache: {e}");
+                restore(pc, undo);
                 pc.changes = changes;
+                pc.legacy = was_legacy;
                 ok = false;
                 continue;
             }
             pc.dirty = false;
+            pc.needs_write = false;
             // Only the approaching-the-ceiling case: once it is actually
             // exceeded, `serialize_within` has already said what it did.
             let used = data.len() as u64;
             if used <= max_bytes && used as f64 >= max_bytes as f64 * WARN_FRACTION {
                 eprintln!(
                     "tku: {name} cache at {:.0}% of the {} ceiling ({}). \
-                     Past the ceiling, records older than 180 days are compacted to daily totals \
-                     (totals are kept, intra-day detail is not); raise cache_max_bytes to keep full detail.",
+                     Files older than {} days are kept as daily totals; past the ceiling, files \
+                     down to 30 days old are rolled up too (totals are kept, intra-day detail is not). \
+                     Raise cache_max_bytes to keep full detail.",
                     used as f64 / max_bytes as f64 * 100.0,
                     human(max_bytes),
-                    human(used)
+                    human(used),
+                    rollup_days
                 );
             }
         }
@@ -655,11 +694,11 @@ impl Storage for BitcodeStorage {
         for p in Provider::iter() {
             self.provider_cache(p.as_str());
         }
+        let mut providers: Vec<(String, ProviderCache)> = self.providers.drain().collect();
+        providers.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         let mut all = Vec::new();
-        for (_, mut pc) in self.providers.drain() {
-            for (_, cf) in pc.files.drain() {
-                all.extend(cf.records);
-            }
+        for (_, pc) in providers {
+            drain_sorted(pc, &mut all);
         }
         all
     }
@@ -703,6 +742,11 @@ impl Storage for BitcodeStorage {
         });
         // Dirty even when nothing changed here, so the flush replays the rekey on disk entries.
         pc.dirty = true;
+        pc.needs_write = true;
+    }
+
+    fn force_write(&mut self) {
+        self.force = true;
     }
 }
 
@@ -726,6 +770,7 @@ mod tests {
             cache_read_input_tokens: 3,
             fast_mode: false,
             account_uuid: None,
+            aggregate: false,
         }
     }
 
@@ -734,103 +779,19 @@ mod tests {
             mtime_secs: 0,
             size: 0,
             records,
+            sealed: Vec::new(),
         }
     }
 
-    #[test]
-    fn compaction_preserves_daily_totals() {
-        let mut cf = file(vec![
-            rec("2020-01-01T01:00:00Z", "opus", 10),
-            rec("2020-01-01T02:00:00Z", "opus", 5),
-            rec("2020-01-02T01:00:00Z", "opus", 7),
-        ]);
-        assert!(compact_file(&mut cf, Utc::now()));
-
-        assert_eq!(cf.records.len(), 2);
-        let day1 = &cf.records[0];
-        assert_eq!(day1.output_tokens, 15);
-        assert_eq!(day1.input_tokens, 2);
-        assert_eq!(day1.cache_read_input_tokens, 6);
-        // Earliest timestamp of the group, so the record stays in its own day.
-        assert_eq!(day1.timestamp.to_rfc3339(), "2020-01-01T01:00:00+00:00");
-        assert_eq!(cf.records[1].output_tokens, 7);
+    /// `cf` rolled up as the only file of a store.
+    fn rolled(cf: CachedFile) -> CachedFile {
+        let mut files = HashMap::from([(String::new(), cf)]);
+        assert!(!rollup::rollup(&mut files, Utc::now()).is_empty());
+        files.remove("").unwrap()
     }
 
-    #[test]
-    fn compaction_splits_by_model() {
-        let mut cf = file(vec![
-            rec("2020-01-01T01:00:00Z", "opus", 10),
-            rec("2020-01-01T02:00:00Z", "sonnet", 5),
-        ]);
-        assert!(compact_file(&mut cf, Utc::now()));
-        assert_eq!(cf.records.len(), 2);
-    }
-
-    /// The whole point of the ceiling path: it must be safe to run twice.
-    #[test]
-    fn compaction_is_idempotent() {
-        let mut cf = file(vec![
-            rec("2020-01-01T01:00:00Z", "opus", 10),
-            rec("2020-01-01T02:00:00Z", "opus", 5),
-        ]);
-        compact_file(&mut cf, Utc::now());
-        let first: Vec<_> = cf.records.iter().map(|r| r.message_id.clone()).collect();
-        let total = cf.records[0].output_tokens;
-
-        compact_file(&mut cf, Utc::now());
-        let second: Vec<_> = cf.records.iter().map(|r| r.message_id.clone()).collect();
-        assert_eq!(first, second);
-        assert_eq!(cf.records[0].output_tokens, total);
-    }
-
-    /// Aggregates must survive `dedup`, which keys on message_id + request_id.
-    #[test]
-    fn compacted_records_survive_dedup() {
-        let mut cf = file(vec![
-            rec("2020-01-01T01:00:00Z", "opus", 10),
-            rec("2020-01-02T01:00:00Z", "opus", 5),
-        ]);
-        compact_file(&mut cf, Utc::now());
-        let deduped = crate::dedup::dedup(cf.records.clone());
-        assert_eq!(deduped.len(), 2);
-    }
-
-    #[test]
-    fn a_file_with_live_records_is_left_alone() {
-        let mut cf = file(vec![
-            rec("2020-01-01T01:00:00Z", "opus", 10),
-            rec("2020-01-01T02:00:00Z", "opus", 5),
-        ]);
-        let cutoff = "2019-01-01T00:00:00Z".parse().unwrap();
-        assert!(!compact_file(&mut cf, cutoff));
-        assert_eq!(cf.records.len(), 2);
-    }
-
-    /// A resumed session replays earlier messages into a new transcript, so the
-    /// same record sits in two files and reporting collapses them. Compaction
-    /// replaces message ids, so the duplicate must be gone *before* it runs or
-    /// its tokens get counted twice and can never be collapsed again.
-    #[test]
-    fn duplicates_are_dropped_before_compaction_can_bake_them_in() {
-        let shared = rec("2020-01-01T01:00:00Z", "opus", 10);
-        let mut pc = ProviderCache::default();
-        pc.files
-            .insert("/a.jsonl".into(), file(vec![shared.clone()]));
-        pc.files.insert(
-            "/b.jsonl".into(),
-            file(vec![shared.clone(), rec("2020-01-01T03:00:00Z", "opus", 4)]),
-        );
-
-        assert_eq!(dedup_cache(&mut pc), 1);
-        compact(&mut pc, Utc::now());
-
-        let total: u64 = pc
-            .files
-            .values()
-            .flat_map(|cf| &cf.records)
-            .map(|r| r.output_tokens)
-            .sum();
-        assert_eq!(total, 14, "the shared record must be counted once");
+    fn total_output(records: &[UsageRecord]) -> u64 {
+        records.iter().map(|r| r.output_tokens).sum()
     }
 
     #[test]
@@ -854,22 +815,25 @@ mod tests {
         };
         let before = sum(&pc);
 
-        let data = serialize_within(&mut pc, 64, "claude").unwrap();
+        let data = serialize_within(&mut pc, 64, "claude", &mut Vec::new()).unwrap();
         assert!(
             data.len() > 64,
             "compacted payload must still exceed the ceiling"
         );
 
-        let decoded = decode_cache(&data).unwrap();
+        let decoded = decode(&data).unwrap();
         assert_eq!(decoded.files.keys().cloned().collect::<HashSet<_>>(), keys);
         assert_eq!(sum(&decoded), before);
     }
 
     #[test]
     fn unrecognized_payload_decodes_to_nothing_rather_than_garbage() {
-        assert!(decode_cache(b"not a cache").is_none());
-        let wrong = bitcode::serialize(&(0u32, ProviderCache::default())).unwrap();
-        assert!(decode_cache(&wrong).is_none());
+        assert!(decode(b"not a cache").is_none());
+        let wrong = bitcode::serialize(&(0u32, Vec::<u64>::new())).unwrap();
+        assert!(decode(&wrong).is_none());
+        let mut future = format::encode(&ProviderCache::default());
+        future[8] = 3;
+        assert!(decode(&future).is_none());
     }
 
     /// An undecodable file is renamed, not replaced: the bytes stay recoverable.
@@ -921,8 +885,9 @@ mod tests {
                     tagged("2020-01-02T01:00:00Z", 7, Some("old")),
                 ],
             );
-            let cf = storage.provider_cache("claude").files.get_mut(key).unwrap();
-            assert!(compact_file(cf, Utc::now()));
+            assert!(
+                !rollup::rollup(&mut storage.provider_cache("claude").files, Utc::now()).is_empty()
+            );
             storage.provider_cache("claude").dirty = false;
 
             storage.rekey_account("old", "new", None, None);
@@ -931,16 +896,14 @@ mod tests {
             let rekeyed = records_of(&mut storage, key);
             for r in &rekeyed {
                 assert_eq!(r.account_uuid.as_deref(), Some("new"));
-                assert!(r.message_id.ends_with(":new:false"), "{}", r.message_id);
+                assert!(r.aggregate);
+                assert_eq!(r.message_id, types::aggregate_id(r));
             }
 
-            let cf = storage.provider_cache("claude").files.get_mut(key).unwrap();
-            compact_file(cf, Utc::now());
-            let recompacted = records_of(&mut storage, key);
-            let ids =
-                |rs: &[UsageRecord]| rs.iter().map(|r| r.message_id.clone()).collect::<Vec<_>>();
-            assert_eq!(ids(&rekeyed), ids(&recompacted));
-            assert_eq!(recompacted[0].output_tokens, 15);
+            assert_eq!(rekeyed[0].output_tokens, 15);
+            assert!(
+                rollup::rollup(&mut storage.provider_cache("claude").files, Utc::now()).is_empty()
+            );
         });
     }
 
@@ -958,12 +921,9 @@ mod tests {
                     tagged("2020-01-01T02:00:00Z", 2, Some("other")),
                 ],
             );
-            let cf = storage
-                .provider_cache("claude")
-                .files
-                .get_mut("/proj/other.jsonl")
-                .unwrap();
-            compact_file(cf, Utc::now());
+            assert!(
+                !rollup::rollup(&mut storage.provider_cache("claude").files, Utc::now()).is_empty()
+            );
             storage.insert(
                 "claude",
                 Path::new("/proj/mixed.jsonl"),
@@ -1174,6 +1134,7 @@ mod tests {
     fn flush_keeps_another_instances_compaction() {
         super::super::with_scratch_home("bitcode-merge-compact", || {
             let mut seed = loaded();
+            seed.rollup_days = NEVER;
             insert_at(
                 &mut seed,
                 "/x.jsonl",
@@ -1188,7 +1149,10 @@ mod tests {
             let mut a = loaded();
             let mut b = loaded();
             a.max_bytes = 64;
+            a.rollup_days = NEVER;
+            b.rollup_days = NEVER;
             a.provider_cache("claude").dirty = true;
+            a.force_write();
             assert!(a.flush());
             insert_at(
                 &mut b,
@@ -1201,7 +1165,7 @@ mod tests {
             let x = records_of(&mut loaded(), "/x.jsonl");
             assert_eq!(x.len(), 1);
             assert_eq!(x[0].output_tokens, 3);
-            assert!(x[0].message_id.starts_with(AGG_MARKER));
+            assert!(x[0].aggregate);
         });
     }
 
@@ -1247,6 +1211,369 @@ mod tests {
         });
     }
 
+    const LEGACY_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/legacy-claude.bin"
+    );
+    const FIXTURE_DIR: &str = "/home/user/.claude/projects/-home-user-git-app";
+    const ACCT: &str = "3f2a9c1e-7b4d-4e8a-9c21-5d6e7f8a9b0c";
+
+    #[allow(clippy::too_many_arguments)]
+    fn claude(
+        session: &str,
+        ts: &str,
+        msg: &str,
+        req: &str,
+        input: u64,
+        out: u64,
+        account: Option<&str>,
+        fast: bool,
+    ) -> UsageRecord {
+        UsageRecord {
+            provider: Provider::Claude,
+            session_id: session.into(),
+            timestamp: ts.parse().unwrap(),
+            project: "app".into(),
+            model: "claude-opus-4-1-20250805".into(),
+            message_id: msg.into(),
+            request_id: req.into(),
+            input_tokens: input,
+            output_tokens: out,
+            cache_creation_input_tokens: 1200,
+            cache_creation_1h_input_tokens: 0,
+            cache_read_input_tokens: 18000,
+            fast_mode: fast,
+            account_uuid: account.map(str::to_string),
+            aggregate: false,
+        }
+    }
+
+    fn fixture_file(
+        session: &str,
+        mtime_secs: i64,
+        records: Vec<UsageRecord>,
+    ) -> (String, CachedFile) {
+        (
+            format!("{FIXTURE_DIR}/{session}.jsonl"),
+            CachedFile {
+                mtime_secs,
+                size: 4096 * records.len() as u64,
+                records,
+                sealed: Vec::new(),
+            },
+        )
+    }
+
+    /// The legacy store pinned by `tests/fixtures/legacy-claude.bin`.
+    fn legacy_fixture_cache() -> ProviderCache {
+        let acct = Some(ACCT);
+        let mut pc = ProviderCache::default();
+
+        // Streaming lines: one message per content block, partial output on all but the last.
+        let (k, cf) = fixture_file(
+            "a1b2c3d4-0001-4000-8000-000000000001",
+            1_790_000_000,
+            vec![
+                claude(
+                    "a1b2c3d4-0001-4000-8000-000000000001",
+                    "2026-10-01T09:00:00.123Z",
+                    "msg_01StreamAAAAAAAAAAAAAAA",
+                    "req_011StreamAAAAAAAAAAAAA",
+                    3,
+                    6,
+                    acct,
+                    false,
+                ),
+                claude(
+                    "a1b2c3d4-0001-4000-8000-000000000001",
+                    "2026-10-01T09:00:01.456Z",
+                    "msg_01StreamAAAAAAAAAAAAAAA",
+                    "req_011StreamAAAAAAAAAAAAA",
+                    3,
+                    6,
+                    acct,
+                    false,
+                ),
+                claude(
+                    "a1b2c3d4-0001-4000-8000-000000000001",
+                    "2026-10-01T09:00:02.789Z",
+                    "msg_01StreamAAAAAAAAAAAAAAA",
+                    "req_011StreamAAAAAAAAAAAAA",
+                    3,
+                    410,
+                    acct,
+                    false,
+                ),
+                claude(
+                    "a1b2c3d4-0001-4000-8000-000000000001",
+                    "2026-10-01T09:05:00Z",
+                    "msg_01SharedBBBBBBBBBBBBBBB",
+                    "req_011SharedBBBBBBBBBBBBB",
+                    5,
+                    120,
+                    acct,
+                    false,
+                ),
+                claude(
+                    "a1b2c3d4-0001-4000-8000-000000000001",
+                    "2026-10-01T09:10:00Z",
+                    "msg_01FastCCCCCCCCCCCCCCCCC",
+                    "req_011FastCCCCCCCCCCCCCCC",
+                    7,
+                    90,
+                    acct,
+                    true,
+                ),
+            ],
+        );
+        pc.files.insert(k, cf);
+
+        // A resumed session replaying one message of the first.
+        let (k, cf) = fixture_file(
+            "a1b2c3d4-0002-4000-8000-000000000002",
+            1_790_001_000,
+            vec![
+                claude(
+                    "a1b2c3d4-0002-4000-8000-000000000002",
+                    "2026-10-01T09:05:00Z",
+                    "msg_01SharedBBBBBBBBBBBBBBB",
+                    "req_011SharedBBBBBBBBBBBBB",
+                    5,
+                    120,
+                    acct,
+                    false,
+                ),
+                claude(
+                    "a1b2c3d4-0002-4000-8000-000000000002",
+                    "2026-10-02T14:00:00Z",
+                    "msg_01ResumeDDDDDDDDDDDDDDD",
+                    "req_011ResumeDDDDDDDDDDDDD",
+                    4,
+                    300,
+                    None,
+                    false,
+                ),
+            ],
+        );
+        pc.files.insert(k, cf);
+
+        // An old file compacted to daily aggregates.
+        let (k, cf) = fixture_file(
+            "a1b2c3d4-0003-4000-8000-000000000003",
+            1_736_000_000,
+            vec![
+                claude(
+                    "a1b2c3d4-0003-4000-8000-000000000003",
+                    "2025-01-10T08:00:00Z",
+                    "msg_01OldEEEEEEEEEEEEEEEEE1",
+                    "req_011OldEEEEEEEEEEEEEEE1",
+                    10,
+                    100,
+                    acct,
+                    false,
+                ),
+                claude(
+                    "a1b2c3d4-0003-4000-8000-000000000003",
+                    "2025-01-10T09:00:00Z",
+                    "msg_01OldEEEEEEEEEEEEEEEEE2",
+                    "req_011OldEEEEEEEEEEEEEEE2",
+                    20,
+                    200,
+                    acct,
+                    false,
+                ),
+                claude(
+                    "a1b2c3d4-0003-4000-8000-000000000003",
+                    "2025-01-11T08:00:00Z",
+                    "msg_01OldEEEEEEEEEEEEEEEEE3",
+                    "req_011OldEEEEEEEEEEEEEEE3",
+                    30,
+                    300,
+                    None,
+                    false,
+                ),
+            ],
+        );
+        let old = cf.records;
+        let cf = CachedFile {
+            records: vec![summed(&old[..2]), summed(&old[2..])],
+            ..cf
+        };
+        pc.files.insert(k, cf);
+
+        // Ceiling case: the earlier file keeps the shared message, the later one
+        // keeps only its first partial streaming line, and is then compacted.
+        let (k, cf) = fixture_file(
+            "a1b2c3d4-0004-4000-8000-000000000004",
+            1_737_000_000,
+            vec![
+                claude(
+                    "a1b2c3d4-0004-4000-8000-000000000004",
+                    "2025-01-20T10:00:00Z",
+                    "msg_01CeilFFFFFFFFFFFFFFFF1",
+                    "req_011CeilFFFFFFFFFFFFFFF1",
+                    8,
+                    80,
+                    acct,
+                    false,
+                ),
+                claude(
+                    "a1b2c3d4-0004-4000-8000-000000000004",
+                    "2026-10-03T10:00:00Z",
+                    "msg_01CeilFFFFFFFFFFFFFFFF2",
+                    "req_011CeilFFFFFFFFFFFFFFF2",
+                    9,
+                    90,
+                    acct,
+                    false,
+                ),
+            ],
+        );
+        pc.files.insert(k, cf);
+        let (k, cf) = fixture_file(
+            "a1b2c3d4-0005-4000-8000-000000000005",
+            1_737_100_000,
+            vec![
+                claude(
+                    "a1b2c3d4-0005-4000-8000-000000000005",
+                    "2025-01-20T10:00:00Z",
+                    "msg_01CeilFFFFFFFFFFFFFFFF1",
+                    "req_011CeilFFFFFFFFFFFFFFF1",
+                    8,
+                    80,
+                    acct,
+                    false,
+                ),
+                claude(
+                    "a1b2c3d4-0005-4000-8000-000000000005",
+                    "2025-01-21T11:00:00Z",
+                    "msg_01CeilGGGGGGGGGGGGGGGGG",
+                    "req_011CeilGGGGGGGGGGGGGGG",
+                    2,
+                    6,
+                    acct,
+                    false,
+                ),
+                claude(
+                    "a1b2c3d4-0005-4000-8000-000000000005",
+                    "2025-01-21T11:00:01Z",
+                    "msg_01CeilGGGGGGGGGGGGGGGGG",
+                    "req_011CeilGGGGGGGGGGGGGGG",
+                    2,
+                    6,
+                    acct,
+                    false,
+                ),
+                claude(
+                    "a1b2c3d4-0005-4000-8000-000000000005",
+                    "2025-01-21T11:00:02Z",
+                    "msg_01CeilGGGGGGGGGGGGGGGGG",
+                    "req_011CeilGGGGGGGGGGGGGGG",
+                    2,
+                    410,
+                    acct,
+                    false,
+                ),
+                claude(
+                    "a1b2c3d4-0005-4000-8000-000000000005",
+                    "2025-01-21T12:00:00Z",
+                    "msg_01CeilHHHHHHHHHHHHHHHHH",
+                    "req_011CeilHHHHHHHHHHHHHHH",
+                    6,
+                    60,
+                    None,
+                    false,
+                ),
+            ],
+        );
+        let trimmed = cf.records;
+        let cf = CachedFile {
+            records: vec![summed(&trimmed[1..2]), summed(&trimmed[4..])],
+            ..cf
+        };
+        pc.files.insert(k, cf);
+        pc
+    }
+
+    /// A legacy-encoder aggregate of `group`, which shares one aggregate id.
+    fn summed(group: &[UsageRecord]) -> UsageRecord {
+        let mut agg = group[0].clone();
+        for r in &group[1..] {
+            agg.input_tokens += r.input_tokens;
+            agg.output_tokens += r.output_tokens;
+            agg.cache_creation_input_tokens += r.cache_creation_input_tokens;
+            agg.cache_creation_1h_input_tokens += r.cache_creation_1h_input_tokens;
+            agg.cache_read_input_tokens += r.cache_read_input_tokens;
+            agg.timestamp = agg.timestamp.min(r.timestamp);
+        }
+        agg.aggregate = true;
+        agg.message_id = types::aggregate_id(&agg);
+        agg.request_id = types::AGG_MARKER.into();
+        agg
+    }
+
+    /// Writes the fixture once; regenerating it is never part of a normal run.
+    #[test]
+    #[ignore]
+    fn generate_legacy_fixture() {
+        let data = legacy::encode(&legacy_fixture_cache()).unwrap();
+        fs::create_dir_all(Path::new(LEGACY_FIXTURE).parent().unwrap()).unwrap();
+        fs::write(LEGACY_FIXTURE, data).unwrap();
+    }
+
+    #[test]
+    fn legacy_fixture_decodes_with_expected_records() {
+        let pc = decode(include_bytes!("../../tests/fixtures/legacy-claude.bin")).unwrap();
+        assert!(pc.legacy);
+        let expected = legacy_fixture_cache();
+
+        let summary = |pc: &ProviderCache| {
+            let mut files: Vec<(String, i64, u64, usize, u64, u64, usize)> = pc
+                .files
+                .iter()
+                .map(|(k, cf)| {
+                    (
+                        k.clone(),
+                        cf.mtime_secs,
+                        cf.size,
+                        cf.records.len(),
+                        cf.records.iter().map(|r| r.input_tokens).sum(),
+                        cf.records.iter().map(|r| r.output_tokens).sum(),
+                        cf.records.iter().filter(|r| r.aggregate).count(),
+                    )
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let session =
+            |n: u8| format!("{FIXTURE_DIR}/a1b2c3d4-000{n}-4000-8000-00000000000{n}.jsonl");
+        assert_eq!(
+            summary(&pc),
+            [
+                (session(1), 1_790_000_000, 20480, 5, 21, 632, 0),
+                (session(2), 1_790_001_000, 8192, 2, 9, 420, 0),
+                (session(3), 1_736_000_000, 12288, 2, 60, 600, 2),
+                (session(4), 1_737_000_000, 8192, 2, 17, 170, 0),
+                (session(5), 1_737_100_000, 20480, 2, 8, 66, 2),
+            ]
+        );
+        assert_eq!(summary(&pc), summary(&expected));
+
+        let all: Vec<&UsageRecord> = pc.files.values().flat_map(|cf| &cf.records).collect();
+        assert_eq!(all.len(), 13);
+        assert_eq!(all.iter().filter(|r| r.fast_mode).count(), 1);
+        assert_eq!(all.iter().filter(|r| r.account_uuid.is_none()).count(), 3);
+    }
+
+    /// Record for record what the encoder that wrote the fixture was given,
+    /// with aggregates flagged.
+    #[test]
+    fn legacy_fixture_decodes_to_the_generator_input() {
+        let pc = decode(include_bytes!("../../tests/fixtures/legacy-claude.bin")).unwrap();
+        assert_eq!(pc.snapshot(), legacy_fixture_cache().snapshot());
+    }
+
     #[test]
     fn merge_with_no_changes_lets_disk_win() {
         let mut mem = ProviderCache::default();
@@ -1268,5 +1595,715 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(keys, ["/both.jsonl", "/disk.jsonl", "/mem.jsonl"]);
         assert_eq!(mem.files["/both.jsonl"].records[0].output_tokens, 2);
+    }
+
+    fn store_path() -> PathBuf {
+        let path = paths::bitcode_cache_file("claude").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
+    }
+
+    fn compacted(key: &str) -> ProviderCache {
+        let cf = rolled(file(vec![
+            tagged("2020-01-01T01:00:00Z", 10, Some("old")),
+            tagged("2020-01-01T02:00:00Z", 5, Some("old")),
+        ]));
+        let mut pc = ProviderCache::default();
+        pc.files.insert(key.into(), cf);
+        pc
+    }
+
+    #[test]
+    fn a_legacy_store_is_flushed_in_the_legacy_format() {
+        super::super::with_scratch_home("bitcode-legacy-guard", || {
+            let path = store_path();
+            fs::write(&path, legacy::encode(&compacted("/old.jsonl")).unwrap()).unwrap();
+
+            let mut storage = loaded();
+            assert!(storage.provider_cache("claude").legacy);
+            insert_at(
+                &mut storage,
+                "/new.jsonl",
+                1,
+                vec![rec("2020-01-02T01:00:00Z", "opus", 7)],
+            );
+            assert!(storage.flush());
+
+            let data = fs::read(&path).unwrap();
+            assert!(!format::is_native(&data));
+            let disk = legacy::decode(&data).unwrap();
+            assert_eq!(disk.snapshot().len(), 2);
+            assert_eq!(disk.files["/new.jsonl"].records[0].output_tokens, 7);
+            let agg = &disk.files["/old.jsonl"].records;
+            assert_eq!(agg.len(), 1);
+            assert!(agg[0].aggregate);
+            assert_eq!(agg[0].output_tokens, 15);
+        });
+    }
+
+    /// Another process migrated the store after this one loaded it as legacy.
+    #[test]
+    fn a_legacy_instance_writes_native_over_a_native_disk_copy() {
+        super::super::with_scratch_home("bitcode-legacy-migrated", || {
+            let path = store_path();
+            fs::write(&path, legacy::encode(&compacted("/old.jsonl")).unwrap()).unwrap();
+            let mut storage = loaded();
+            fs::write(&path, format::encode(&compacted("/old.jsonl"))).unwrap();
+
+            insert_at(
+                &mut storage,
+                "/new.jsonl",
+                1,
+                vec![rec("2020-01-02T01:00:00Z", "opus", 7)],
+            );
+            assert!(storage.flush());
+            assert!(!storage.provider_cache("claude").legacy);
+
+            let data = fs::read(&path).unwrap();
+            assert!(format::is_native(&data));
+            assert_eq!(sorted_keys(&mut loaded()), ["/new.jsonl", "/old.jsonl"]);
+        });
+    }
+
+    #[test]
+    fn a_legacy_instance_writes_native_over_an_empty_native_store() {
+        super::super::with_scratch_home("bitcode-legacy-empty-native", || {
+            let path = store_path();
+            fs::write(&path, legacy::encode(&compacted("/old.jsonl")).unwrap()).unwrap();
+            let mut storage = loaded();
+            fs::write(&path, format::encode(&ProviderCache::default())).unwrap();
+
+            insert_at(
+                &mut storage,
+                "/new.jsonl",
+                1,
+                vec![rec("2020-01-02T01:00:00Z", "opus", 7)],
+            );
+            assert!(storage.flush());
+            assert!(format::is_native(&fs::read(&path).unwrap()));
+        });
+    }
+
+    /// An older binary rewrote the store in the legacy format after this one loaded it.
+    #[test]
+    fn a_native_instance_writes_legacy_over_a_legacy_disk_copy() {
+        super::super::with_scratch_home("bitcode-native-then-legacy", || {
+            let path = store_path();
+            fs::write(&path, format::encode(&compacted("/old.jsonl"))).unwrap();
+            let mut storage = loaded();
+            assert!(!storage.provider_cache("claude").legacy);
+            fs::write(&path, legacy::encode(&compacted("/old.jsonl")).unwrap()).unwrap();
+
+            insert_at(
+                &mut storage,
+                "/new.jsonl",
+                1,
+                vec![rec("2020-01-02T01:00:00Z", "opus", 7)],
+            );
+            assert!(storage.flush());
+            let data = fs::read(&path).unwrap();
+            assert!(!format::is_native(&data));
+            assert_eq!(legacy::decode(&data).unwrap().files.len(), 2);
+        });
+    }
+
+    #[test]
+    fn a_legacy_instance_writes_legacy_when_the_file_is_gone() {
+        super::super::with_scratch_home("bitcode-legacy-removed", || {
+            let path = store_path();
+            fs::write(&path, legacy::encode(&compacted("/old.jsonl")).unwrap()).unwrap();
+            let mut storage = loaded();
+            fs::remove_file(&path).unwrap();
+
+            insert_at(
+                &mut storage,
+                "/new.jsonl",
+                1,
+                vec![rec("2020-01-02T01:00:00Z", "opus", 7)],
+            );
+            assert!(storage.flush());
+            let data = fs::read(&path).unwrap();
+            assert!(!format::is_native(&data));
+            assert_eq!(legacy::decode(&data).unwrap().files.len(), 2);
+        });
+    }
+
+    #[test]
+    fn a_native_store_survives_flush_and_merge_between_instances() {
+        super::super::with_scratch_home("bitcode-native-merge", || {
+            let mut seed = loaded();
+            let mut pc = compacted("/agg.jsonl");
+            pc.files.get_mut("/agg.jsonl").unwrap().sealed = vec![1, 2];
+            seed.providers.insert("claude".into(), pc);
+            seed.provider_cache("claude").dirty = true;
+            seed.force_write();
+            assert!(seed.flush());
+            assert!(format::is_native(&fs::read(store_path()).unwrap()));
+
+            let mut a = loaded();
+            let mut b = loaded();
+            assert!(!a.provider_cache("claude").legacy);
+            insert_at(
+                &mut a,
+                "/a.jsonl",
+                1,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 1)],
+            );
+            insert_at(
+                &mut b,
+                "/b.jsonl",
+                1,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 2)],
+            );
+            assert!(a.flush());
+            assert!(b.flush());
+
+            let data = fs::read(store_path()).unwrap();
+            assert!(format::is_native(&data));
+            let mut c = loaded();
+            assert_eq!(sorted_keys(&mut c), ["/a.jsonl", "/agg.jsonl", "/b.jsonl"]);
+            let agg = &c.provider_cache("claude").files["/agg.jsonl"];
+            assert_eq!(agg.sealed, [1, 2]);
+            assert!(agg.records[0].aggregate);
+            assert_eq!(
+                agg.records[0].message_id,
+                types::aggregate_id(&agg.records[0])
+            );
+        });
+    }
+
+    #[test]
+    fn a_new_store_is_written_native() {
+        super::super::with_scratch_home("bitcode-new-native", || {
+            let mut storage = loaded();
+            insert_at(
+                &mut storage,
+                "/a.jsonl",
+                1,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 1)],
+            );
+            assert!(storage.flush());
+            assert!(format::is_native(&fs::read(store_path()).unwrap()));
+        });
+    }
+
+    #[test]
+    fn a_garbage_store_is_quarantined_and_replaced_natively() {
+        super::super::with_scratch_home("bitcode-garbage", || {
+            let path = store_path();
+            fs::write(&path, b"garbage").unwrap();
+
+            let mut storage = loaded();
+            assert!(storage.provider_cache("claude").files.is_empty());
+            let aside: Vec<_> = fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains("quarantine"))
+                .collect();
+            assert_eq!(aside.len(), 1);
+            assert_eq!(fs::read(aside[0].path()).unwrap(), b"garbage");
+
+            insert_at(
+                &mut storage,
+                "/a.jsonl",
+                1,
+                vec![rec("2020-01-01T01:00:00Z", "opus", 1)],
+            );
+            assert!(storage.flush());
+            assert!(format::is_native(&fs::read(&path).unwrap()));
+        });
+    }
+
+    #[test]
+    fn drain_is_sorted_and_drops_messages_sealed_elsewhere() {
+        super::super::with_scratch_home("bitcode-drain-sealed", || {
+            let fp = |r: &UsageRecord| {
+                crate::dedup::stable_fingerprint(r.provider, &r.message_id, &r.request_id)
+            };
+            let sealed_msg = rec("2020-01-01T01:00:00Z", "opus", 1);
+            let kept_msg = rec("2020-01-01T02:00:00Z", "opus", 2);
+            let keyless = UsageRecord {
+                message_id: String::new(),
+                request_id: String::new(),
+                ..rec("2020-01-01T03:00:00Z", "opus", 3)
+            };
+
+            let mut pc = compacted("/b.jsonl");
+            let owner = pc.files.get_mut("/b.jsonl").unwrap();
+            owner.sealed = vec![fp(&sealed_msg), fp(&keyless)];
+            // A raw copy in the sealing file itself is not filtered.
+            owner.records.push(sealed_msg.clone());
+            pc.files.insert(
+                "/a.jsonl".into(),
+                file(vec![sealed_msg.clone(), kept_msg.clone(), keyless.clone()]),
+            );
+            pc.files
+                .insert("/c.jsonl".into(), file(vec![sealed_msg.clone()]));
+
+            let mut storage = BitcodeStorage::new();
+            storage.providers.insert("claude".into(), pc);
+            let out: Vec<u64> = storage
+                .drain_all()
+                .iter()
+                .map(|r| r.output_tokens)
+                .collect();
+            assert_eq!(out, [2, 3, 15, 1]);
+        });
+    }
+
+    /// A rollup age no test record reaches.
+    const NEVER: u32 = 100_000;
+
+    fn msg(id: &str, ts: &str, out: u64) -> UsageRecord {
+        UsageRecord {
+            message_id: id.into(),
+            request_id: format!("req-{id}"),
+            ..rec(ts, "opus", out)
+        }
+    }
+
+    fn sealed_fp(r: &UsageRecord) -> u64 {
+        crate::dedup::stable_fingerprint(r.provider, &r.message_id, &r.request_id)
+    }
+
+    /// What a report sees: drained, then deduplicated as at read time.
+    fn report(mut storage: BitcodeStorage) -> Vec<UsageRecord> {
+        crate::dedup::dedup(storage.drain_all())
+    }
+
+    #[test]
+    fn flush_rolls_up_files_older_than_the_configured_age() {
+        super::super::with_scratch_home("bitcode-rollup-eager", || {
+            let mut storage = loaded();
+            storage.rollup_days = 30;
+            let old = (Utc::now() - Duration::days(31)).to_rfc3339();
+            let recent = (Utc::now() - Duration::days(29)).to_rfc3339();
+            insert_at(&mut storage, "/old.jsonl", 1, vec![msg("m1", &old, 4)]);
+            insert_at(
+                &mut storage,
+                "/recent.jsonl",
+                1,
+                vec![msg("m2", &recent, 5)],
+            );
+            assert!(storage.flush());
+
+            let mut c = loaded();
+            let files = &c.provider_cache("claude").files;
+            assert!(files["/old.jsonl"].records[0].aggregate);
+            assert_eq!(files["/old.jsonl"].sealed.len(), 1);
+            assert!(!files["/recent.jsonl"].records[0].aggregate);
+        });
+    }
+
+    #[test]
+    fn a_legacy_store_flush_leaves_its_files_unrolled() {
+        super::super::with_scratch_home("bitcode-legacy-unrolled", || {
+            let path = store_path();
+            let mut pc = ProviderCache::default();
+            pc.files.insert(
+                "/old.jsonl".into(),
+                file(vec![
+                    msg("m1", "2020-01-01T01:00:00Z", 1),
+                    msg("m2", "2020-01-01T02:00:00Z", 2),
+                ]),
+            );
+            fs::write(&path, legacy::encode(&pc).unwrap()).unwrap();
+
+            let mut storage = loaded();
+            storage.max_bytes = 64;
+            insert_at(
+                &mut storage,
+                "/new.jsonl",
+                1,
+                vec![msg("m3", "2020-01-02T01:00:00Z", 3)],
+            );
+            assert!(storage.flush());
+
+            let disk = legacy::decode(&fs::read(&path).unwrap()).unwrap();
+            assert!(disk.legacy);
+            assert_eq!(disk.files["/old.jsonl"].records.len(), 2);
+            assert_eq!(disk.files["/new.jsonl"].records.len(), 1);
+            assert!(disk
+                .files
+                .values()
+                .flat_map(|cf| &cf.records)
+                .all(|r| !r.aggregate));
+        });
+    }
+
+    /// Each instance rolls up what it saw under the lock, so the order of the
+    /// flushes decides which file seals a shared message, never the totals.
+    #[test]
+    fn two_instances_flushing_converge() {
+        let run = |a_first: bool| {
+            super::super::with_scratch_home("bitcode-rollup-converge", || {
+                let mut a = loaded();
+                let mut b = loaded();
+                insert_at(
+                    &mut a,
+                    "/a.jsonl",
+                    1,
+                    vec![
+                        msg("shared", "2020-01-01T01:00:00Z", 410),
+                        msg("a", "2020-01-01T02:00:00Z", 1),
+                    ],
+                );
+                insert_at(
+                    &mut b,
+                    "/b.jsonl",
+                    1,
+                    vec![
+                        msg("shared", "2020-01-01T01:00:00Z", 410),
+                        msg("b", "2020-01-01T03:00:00Z", 2),
+                    ],
+                );
+                if a_first {
+                    assert!(a.flush());
+                    assert!(b.flush());
+                } else {
+                    assert!(b.flush());
+                    assert!(a.flush());
+                }
+
+                let mut c = loaded();
+                let files = &c.provider_cache("claude").files;
+                let shared = sealed_fp(&msg("shared", "2020-01-01T01:00:00Z", 0));
+                let owners = files
+                    .values()
+                    .filter(|cf| cf.sealed.contains(&shared))
+                    .count();
+                assert_eq!(owners, 1);
+                c.provider_cache("claude").dirty = true;
+                c.force_write();
+                assert!(c.flush());
+                let bytes = fs::read(store_path()).unwrap();
+                c = loaded();
+                c.provider_cache("claude").dirty = true;
+                c.force_write();
+                assert!(c.flush());
+                assert_eq!(fs::read(store_path()).unwrap(), bytes);
+                total_output(&report(loaded()))
+            })
+        };
+        assert_eq!(run(true), 413);
+        assert_eq!(run(false), 413);
+    }
+
+    #[test]
+    fn files_sharing_a_session_with_overlapping_messages_sum_at_read_time() {
+        super::super::with_scratch_home("bitcode-rollup-shared-session", || {
+            let mut storage = loaded();
+            insert_at(
+                &mut storage,
+                "/proj-a/s1.jsonl",
+                1,
+                vec![
+                    msg("m1", "2020-01-01T01:00:00Z", 1),
+                    msg("m2", "2020-01-01T02:00:00Z", 10),
+                ],
+            );
+            insert_at(
+                &mut storage,
+                "/proj-b/s1.jsonl",
+                1,
+                vec![
+                    msg("m2", "2020-01-01T02:00:00Z", 10),
+                    msg("m3", "2020-01-01T03:00:00Z", 100),
+                ],
+            );
+            assert!(storage.flush());
+
+            let records = report(loaded());
+            assert_eq!(records.len(), 2);
+            assert!(records.iter().all(|r| r.aggregate));
+            assert_eq!(records[0].message_id, records[1].message_id);
+            assert_eq!(total_output(&records), 111);
+        });
+    }
+
+    #[test]
+    fn a_resumed_file_replaying_sealed_messages_is_filtered_at_read_time() {
+        super::super::with_scratch_home("bitcode-rollup-resume", || {
+            let mut storage = loaded();
+            insert_at(
+                &mut storage,
+                "/old.jsonl",
+                1,
+                vec![msg("m1", "2020-01-01T01:00:00Z", 10)],
+            );
+            assert!(storage.flush());
+
+            let mut storage = loaded();
+            let now = Utc::now().to_rfc3339();
+            insert_at(
+                &mut storage,
+                "/resumed.jsonl",
+                2,
+                vec![msg("m1", "2020-01-01T01:00:00Z", 10), msg("m2", &now, 5)],
+            );
+            assert!(storage.flush());
+
+            assert_eq!(total_output(&report(loaded())), 15);
+        });
+    }
+
+    #[test]
+    fn a_compacted_file_whose_source_changes_replaces_its_entry() {
+        super::super::with_scratch_home("bitcode-rollup-reparse", || {
+            let mut storage = loaded();
+            insert_at(
+                &mut storage,
+                "/s.jsonl",
+                1,
+                vec![msg("m1", "2020-01-01T01:00:00Z", 10)],
+            );
+            assert!(storage.flush());
+
+            let mut storage = loaded();
+            assert!(storage.provider_cache("claude").files["/s.jsonl"].records[0].aggregate);
+            assert!(!storage.is_cached("claude", Path::new("/s.jsonl"), 2, 0));
+            let now = Utc::now().to_rfc3339();
+            insert_at(
+                &mut storage,
+                "/s.jsonl",
+                2,
+                vec![msg("m1", "2020-01-01T01:00:00Z", 10), msg("m2", &now, 5)],
+            );
+            assert!(storage.flush());
+
+            let mut c = loaded();
+            let cf = &c.provider_cache("claude").files["/s.jsonl"];
+            assert_eq!(cf.mtime_secs, 2);
+            assert!(cf.sealed.is_empty());
+            assert!(cf.records.iter().all(|r| !r.aggregate));
+            assert_eq!(total_output(&report(c)), 15);
+        });
+    }
+
+    /// `/a` and `/b`, both old and sharing `shared`, flushed once: `/a` seals
+    /// it and `/b` keeps a raw copy.
+    fn shared_and_rolled() -> UsageRecord {
+        let shared = msg("shared", "2020-01-01T01:00:00Z", 100);
+        let mut storage = loaded();
+        insert_at(
+            &mut storage,
+            "/a.jsonl",
+            1,
+            vec![shared.clone(), msg("a", "2020-01-01T02:00:00Z", 1)],
+        );
+        insert_at(
+            &mut storage,
+            "/b.jsonl",
+            1,
+            vec![shared.clone(), msg("b", "2020-01-01T03:00:00Z", 2)],
+        );
+        assert!(storage.flush());
+        let mut c = loaded();
+        let files = &c.provider_cache("claude").files;
+        assert!(files["/a.jsonl"].sealed.contains(&sealed_fp(&shared)));
+        assert!(files["/b.jsonl"].records.iter().any(|r| !r.aggregate));
+        assert_eq!(total_output(&report(c)), 103);
+        shared
+    }
+
+    fn owners_of(storage: &mut BitcodeStorage, fp: u64) -> Vec<String> {
+        let mut owners: Vec<String> = storage
+            .provider_cache("claude")
+            .files
+            .iter()
+            .filter(|(_, cf)| cf.sealed.contains(&fp))
+            .map(|(k, _)| k.clone())
+            .collect();
+        owners.sort_unstable();
+        owners
+    }
+
+    #[test]
+    fn pruning_the_sealing_file_brings_back_the_other_copy_once() {
+        super::super::with_scratch_home("bitcode-rollup-prune-owner", || {
+            let shared = shared_and_rolled();
+            let mut storage = loaded();
+            storage.prune("claude", &[PathBuf::from("/b.jsonl")]);
+            assert!(storage.flush());
+
+            let mut c = loaded();
+            assert_eq!(owners_of(&mut c, sealed_fp(&shared)), ["/b.jsonl"]);
+            assert!(c.provider_cache("claude").files["/b.jsonl"]
+                .records
+                .iter()
+                .all(|r| r.aggregate));
+            assert_eq!(total_output(&report(c)), 102);
+        });
+    }
+
+    #[test]
+    fn re_parsing_the_sealing_file_still_counts_the_message_once() {
+        for extra in ["2020-01-01T04:00:00Z".to_string(), Utc::now().to_rfc3339()] {
+            super::super::with_scratch_home("bitcode-rollup-reparse-owner", || {
+                let shared = shared_and_rolled();
+                let mut storage = loaded();
+                insert_at(
+                    &mut storage,
+                    "/a.jsonl",
+                    2,
+                    vec![shared.clone(), msg("a2", &extra, 10)],
+                );
+                assert!(storage.flush());
+
+                let mut c = loaded();
+                assert!(owners_of(&mut c, sealed_fp(&shared)).len() <= 1);
+                assert_eq!(total_output(&report(c)), 112, "extra at {extra}");
+            });
+        }
+    }
+
+    /// A failed write must not leave a seal in memory that the disk copy lacks,
+    /// or another instance can seal the same message in a different file.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_write_undoes_the_rollup() {
+        use std::os::unix::fs::PermissionsExt;
+        super::super::with_scratch_home("bitcode-rollup-undo", || {
+            let shared = msg("shared", "2020-01-01T01:00:00Z", 100);
+            let mut seed = loaded();
+            seed.rollup_days = NEVER;
+            insert_at(&mut seed, "/b.jsonl", 1, vec![shared.clone()]);
+            assert!(seed.flush());
+
+            let mut a = loaded();
+            insert_at(&mut a, "/a.jsonl", 1, vec![shared.clone()]);
+            let dir = store_path().parent().unwrap().to_path_buf();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+            let failed = !a.flush();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(failed);
+            let files = &a.provider_cache("claude").files;
+            assert!(files.values().all(|cf| cf.sealed.is_empty()));
+            assert!(files
+                .values()
+                .flat_map(|cf| &cf.records)
+                .all(|r| !r.aggregate));
+
+            let mut c = loaded();
+            insert_at(
+                &mut c,
+                "/c.jsonl",
+                1,
+                vec![msg("c", "2020-01-02T01:00:00Z", 1)],
+            );
+            assert!(c.flush());
+            assert_eq!(owners_of(&mut loaded(), sealed_fp(&shared)), ["/b.jsonl"]);
+
+            assert!(a.flush());
+            let mut d = loaded();
+            assert_eq!(owners_of(&mut d, sealed_fp(&shared)), ["/b.jsonl"]);
+            assert_eq!(total_output(&report(d)), 101);
+        });
+    }
+
+    fn store_state() -> (Vec<u8>, std::time::SystemTime) {
+        let path = store_path();
+        (
+            fs::read(&path).unwrap(),
+            fs::metadata(&path).unwrap().modified().unwrap(),
+        )
+    }
+
+    fn seeded() -> (Vec<u8>, std::time::SystemTime) {
+        let mut seed = loaded();
+        insert_at(
+            &mut seed,
+            "/old.jsonl",
+            1,
+            vec![tagged("2020-01-01T01:00:00Z", 1, Some("old"))],
+        );
+        insert_at(
+            &mut seed,
+            "/older.jsonl",
+            1,
+            vec![rec("2020-01-01T02:00:00Z", "opus", 2)],
+        );
+        assert!(seed.flush());
+        store_state()
+    }
+
+    #[test]
+    fn live_only_inserts_leave_the_store_untouched_until_forced() {
+        super::super::with_scratch_home("bitcode-skip-live", || {
+            let before = seeded();
+            let mut a = loaded();
+            let now = Utc::now().timestamp();
+            insert_at(
+                &mut a,
+                "/live.jsonl",
+                now,
+                vec![rec("2020-01-03T01:00:00Z", "opus", 3)],
+            );
+            insert_at(
+                &mut a,
+                "/edge.jsonl",
+                now - LIVE_WINDOW_SECS + 5,
+                vec![rec("2020-01-03T02:00:00Z", "opus", 4)],
+            );
+            assert!(a.flush());
+            assert!(store_state() == before);
+            assert_eq!(sorted_keys(&mut loaded()), ["/old.jsonl", "/older.jsonl"]);
+
+            a.force_write();
+            assert!(a.flush());
+            assert_eq!(
+                sorted_keys(&mut loaded()),
+                ["/edge.jsonl", "/live.jsonl", "/old.jsonl", "/older.jsonl"]
+            );
+        });
+    }
+
+    #[test]
+    fn a_non_live_insert_writes() {
+        super::super::with_scratch_home("bitcode-skip-live-old", || {
+            seeded();
+            let mut a = loaded();
+            let now = Utc::now().timestamp();
+            insert_at(
+                &mut a,
+                "/live.jsonl",
+                now,
+                vec![rec("2020-01-03T01:00:00Z", "opus", 3)],
+            );
+            insert_at(
+                &mut a,
+                "/stale.jsonl",
+                now - LIVE_WINDOW_SECS - 5,
+                vec![rec("2020-01-03T02:00:00Z", "opus", 4)],
+            );
+            assert!(a.flush());
+            assert_eq!(
+                sorted_keys(&mut loaded()),
+                ["/live.jsonl", "/old.jsonl", "/older.jsonl", "/stale.jsonl"]
+            );
+        });
+    }
+
+    #[test]
+    fn prune_and_rekey_write_without_a_non_live_insert() {
+        super::super::with_scratch_home("bitcode-skip-live-prune", || {
+            seeded();
+            let mut a = loaded();
+            a.prune("claude", &[PathBuf::from("/old.jsonl")]);
+            assert!(a.flush());
+            assert_eq!(sorted_keys(&mut loaded()), ["/old.jsonl"]);
+
+            let before = store_state();
+            let mut b = loaded();
+            b.prune("claude", &[PathBuf::from("/old.jsonl")]);
+            assert!(b.flush());
+            assert!(store_state() == before);
+
+            let mut c = loaded();
+            c.rekey_account("old", "new", None, None);
+            assert!(c.flush());
+            let r = records_of(&mut loaded(), "/old.jsonl");
+            assert_eq!(r[0].account_uuid.as_deref(), Some("new"));
+        });
     }
 }
