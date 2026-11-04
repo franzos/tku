@@ -1,3 +1,22 @@
+## [0.2.0] - 2026-11-04
+
+Reported output tokens and cost go up after this upgrade: earlier versions undercounted subagent replies.
+
+### Added
+- `rollup_after_days` config, default 180
+
+### Changed
+- Startup stays fast as history grows
+- Old sessions are kept as daily totals per project and model
+- Smaller store format; first run upgrades it, keeping `.legacy` backup
+- No store rewrite while only live sessions changed
+- `bar` and `watch` skip a held upgrade lock instead of waiting
+- sqlite version 4 databases are upgraded in place
+
+### Fixed
+- Subagent output tokens undercounted, often by over 40%
+- Rolled-up messages replayed under a second account counted again
+
 ## [0.1.29] - 2026-11-01
 
 ### Added
